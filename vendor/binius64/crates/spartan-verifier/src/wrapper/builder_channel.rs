@@ -1,0 +1,179 @@
+// Copyright 2026 The Binius Developers
+
+//! [`IronSpartanBuilderChannel`]: an [`IPVerifierChannel`] that symbolically executes a verifier
+//! and records the computation as constraints on a [`ConstraintBuilder`].
+
+use std::{
+	cell::RefCell,
+	rc::{Rc, Weak},
+};
+
+use binius_core::word::Word;
+use binius_field::{BinaryField, Field};
+use binius_iop::channel::{IOPVerifierChannel, OracleSpec, TransparentEvalFn};
+use binius_ip::channel::{
+	IPVerifierChannel, WordIPVerifierChannel, n_packed_elems, select_word, subset_sum_word,
+};
+use binius_spartan_frontend::circuit_builder::{CircuitBuilder, ConstraintBuilder};
+
+use super::circuit_elem::CircuitElem;
+
+/// A channel that symbolically executes a verifier, building up an IronSpartan constraint system.
+///
+/// Instead of performing actual verification, this channel records all operations as constraints
+/// in a [`ConstraintBuilder`]. The typical usage pattern is:
+///
+/// 1. Construct a fresh [`IronSpartanBuilderChannel`] via [`Self::new`]
+/// 2. Run the verifier on the channel (e.g., `verify_iop`)
+/// 3. The channel's `finish()` method returns the [`ConstraintBuilder`] with all recorded
+///    constraints
+pub struct IronSpartanBuilderChannel<F: Field> {
+	builder: Rc<RefCell<ConstraintBuilder<F>>>,
+}
+
+impl<F: Field> Default for IronSpartanBuilderChannel<F> {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl<F: Field> IronSpartanBuilderChannel<F> {
+	/// Creates a new builder channel backed by a fresh [`ConstraintBuilder`].
+	pub fn new() -> Self {
+		Self {
+			builder: Rc::new(RefCell::new(ConstraintBuilder::new())),
+		}
+	}
+
+	fn alloc_inout_elem(&self) -> CircuitElem<F, ConstraintBuilder<F>> {
+		let wire = self.builder.borrow_mut().alloc_inout();
+		CircuitElem::wire(&self.builder, wire)
+	}
+
+	fn alloc_precommit_elem(&self) -> CircuitElem<F, ConstraintBuilder<F>> {
+		let wire = self.builder.borrow_mut().alloc_precommit();
+		CircuitElem::wire(&self.builder, wire)
+	}
+
+	/// Consumes the channel and returns the underlying [`ConstraintBuilder`].
+	///
+	/// This must be called after all `CircuitElem` values derived from this channel have been
+	/// dropped, as it requires sole ownership of the builder via `Rc::try_unwrap`.
+	pub fn finish(self) -> ConstraintBuilder<F> {
+		Rc::try_unwrap(self.builder)
+			.expect("CircuitElem values should only hold Weak references")
+			.into_inner()
+	}
+}
+
+impl<F: Field> IPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
+	type Elem = CircuitElem<F, ConstraintBuilder<F>>;
+
+	fn recv_one(&mut self) -> Result<Self::Elem, binius_ip::channel::Error> {
+		// For each element that the inner prover sends, the wrapped prover allocates a one-time-pad
+		// encryption key in the precommit segment and encrypts the underlying value before sending.
+		// Here the verifier gets the encryption key from the precommit segment and decrypts.
+		let inout = self.alloc_inout_elem();
+		let key = self.alloc_precommit_elem();
+		Ok(inout - key)
+	}
+
+	fn recv_public_claim(&mut self) -> Result<Self::Elem, binius_ip::channel::Error> {
+		// A claim is public, so the wrapped prover sends it unencrypted: one inout wire, no
+		// precommit key. What it leaves behind is a public-derivable wire, which is what the
+		// checks reading it need it to be.
+		Ok(self.alloc_inout_elem())
+	}
+
+	fn sample(&mut self) -> Self::Elem {
+		self.alloc_inout_elem()
+	}
+
+	fn observe_one(&mut self, _val: F) -> Self::Elem {
+		self.alloc_inout_elem()
+	}
+
+	fn assert_zero(&mut self, val: Self::Elem) -> Result<(), binius_ip::channel::Error> {
+		match val {
+			// A compile-time constant is checked here; a non-zero one is an unsatisfiable
+			// assertion.
+			CircuitElem::Constant(c) => {
+				if c == F::ZERO {
+					Ok(())
+				} else {
+					Err(binius_ip::channel::Error::InvalidAssert)
+				}
+			}
+			// Record the assertion as a constraint over the wire (whether public-derivable or
+			// private). The outer verifier enforces it; with derived wires there is no need to
+			// special-case public values out of the constraint system.
+			CircuitElem::Wire { builder, wire } => {
+				assert!(Weak::ptr_eq(&Rc::downgrade(&self.builder), &builder));
+				self.builder.borrow_mut().assert_zero(wire);
+				Ok(())
+			}
+		}
+	}
+}
+
+impl<F: BinaryField> WordIPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
+	type Word = Word;
+
+	// The outer verifier rebinds the public inputs, so the wrapper records no Fiat-Shamir state.
+	fn observe_words(&mut self, words: &[Word]) -> Vec<Word> {
+		words.to_vec()
+	}
+
+	fn subset_sum(&mut self, elems: &[Self::Elem], word: &Word) -> Self::Elem {
+		// The word is concrete, so which elements the sum runs over is settled while building.
+		subset_sum_word(elems, *word)
+	}
+
+	fn select(&mut self, elems: &[Self::Elem], word: &Word) -> Self::Elem {
+		select_word(elems, *word)
+	}
+
+	fn sample_bits(&mut self, _bits: usize) -> Word {
+		Word::ZERO
+	}
+
+	fn pack_words(&mut self, words: &[Word]) -> Vec<Self::Elem> {
+		// The words are the statement, and this circuit is built once to be reused across every
+		// statement, so the packed elements cannot be settled here: a constant would fix the
+		// statement it was built against into the circuit. They enter as inout wires instead, which
+		// `ZKWrappedVerifierChannel` and `ReplayChannel` fill with the concrete packing.
+		(0..n_packed_elems::<F>(words.len()))
+			.map(|_| self.alloc_inout_elem())
+			.collect()
+	}
+}
+
+impl<F: Field> IOPVerifierChannel<F> for IronSpartanBuilderChannel<F> {
+	type Oracle = ();
+
+	fn remaining_oracle_specs(&self) -> &[OracleSpec] {
+		&[]
+	}
+
+	fn recv_oracle(
+		&mut self,
+		_log_msg_len: usize,
+		_is_witness_dependent: bool,
+	) -> Result<Self::Oracle, binius_iop::channel::Error> {
+		Ok(())
+	}
+
+	fn verify_oracle_relation(
+		&mut self,
+		_oracle: Self::Oracle,
+		_transparent: TransparentEvalFn<Self::Elem>,
+		claim: Self::Elem,
+	) -> Result<(), binius_iop::channel::Error> {
+		// For each oracle opening, the prover sends the decrypted evaluation. The outer verifier
+		// checks in the circuit equality of this value with the expected expression over encrypted
+		// values.
+		let decrypted_claim = self.alloc_inout_elem();
+		self.assert_zero(claim - decrypted_claim)?;
+		Ok(())
+	}
+}

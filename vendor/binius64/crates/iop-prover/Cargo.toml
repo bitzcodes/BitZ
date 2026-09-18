@@ -1,0 +1,41 @@
+[package]
+name = "binius-iop-prover"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+binius-compute = { path = "../compute" }
+binius-core = { path = "../core" }
+binius-field = { path = "../field" }
+binius-hash = { path = "../hash" }
+binius-hash-prover = { path = "../hash-prover" }
+binius-iop = { path = "../iop" }
+binius-ip = { path = "../ip" }
+binius-ip-prover = { path = "../ip-prover" }
+binius-math = { path = "../math" }
+binius-transcript = { path = "../transcript" }
+binius-utils = { path = "../utils" }
+digest.workspace = true
+getset.workspace = true
+itertools.workspace = true
+rand.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+binius-math = { path = "../math", features = ["test-utils"] }
+criterion.workspace = true
+proptest.workspace = true
+rand = { workspace = true, features = ["thread_rng"] }
+sha2.workspace = true
+
+[features]
+default = []
+
+[[bench]]
+name = "binary_merkle_tree"
+harness = false

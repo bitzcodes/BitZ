@@ -1,0 +1,93 @@
+[package]
+name = "binius-prover"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+binius-compute = { path = "../compute" }
+binius-core = { path = "../core" }
+binius-field = { path = "../field" }
+binius-hash = { path = "../hash" }
+binius-hash-prover = { path = "../hash-prover" }
+binius-ip = { path = "../ip" }
+binius-iop = { path = "../iop" }
+binius-iop-prover = { path = "../iop-prover", default-features = false }
+binius-ip-prover = { path = "../ip-prover", default-features = false }
+binius-math = { path = "../math" }
+binius-spartan-frontend = { path = "../spartan-frontend" }
+binius-spartan-prover = { path = "../spartan-prover", default-features = false }
+binius-transcript = { path = "../transcript" }
+binius-verifier = { path = "../verifier" }
+binius-utils = { path = "../utils" }
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
+bytes.workspace = true
+digest.workspace = true
+either.workspace = true
+getset.workspace = true
+itertools.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+binius-circuits = { path = "../circuits" }
+binius-frontend = { path = "../frontend" }
+binius-math = { path = "../math", features = ["test-utils"] }
+criterion.workspace = true
+proptest.workspace = true
+rand = { workspace = true, features = ["thread_rng"] }
+sha2.workspace = true
+
+[lib]
+bench = false
+
+[[bench]]
+name = "sumcheck"
+harness = false
+
+[[bench]]
+name = "batch_quadratic_mle"
+harness = false
+
+[[bench]]
+name = "bitand"
+harness = false
+
+[[bench]]
+name = "shift_reduction"
+harness = false
+
+[[bench]]
+name = "intmul"
+harness = false
+
+[[bench]]
+name = "binmul"
+harness = false
+
+[[bench]]
+name = "fold_words"
+harness = false
+
+[[bench]]
+name = "fold_across_words"
+harness = false
+
+[[bench]]
+name = "ring_switch"
+harness = false
+
+[[bench]]
+name = "prodcheck"
+harness = false
+
+[[bench]]
+name = "fracaddcheck"
+harness = false
+
+[features]
+default = []

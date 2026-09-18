@@ -1,0 +1,1344 @@
+//! Various simple utilities.
+
+#![no_std]
+
+extern crate alloc;
+
+use alloc::slice;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::any::type_name;
+use core::hint::assert_unchecked;
+use core::mem::{ManuallyDrop, MaybeUninit};
+use core::{iter, mem};
+
+use crate::transpose::transpose_in_place_square;
+
+pub mod array_serialization;
+pub mod linear_map;
+pub mod transpose;
+pub mod zip_eq;
+
+/// Computes `ceil(log_2(n))`.
+#[must_use]
+pub const fn log2_ceil_usize(n: usize) -> usize {
+    (usize::BITS - n.saturating_sub(1).leading_zeros()) as usize
+}
+
+/// Computes `floor(log_2(n))`.
+///
+/// Returns `0` for `n == 0` (matching `log2_ceil_usize(0) == 0`); `floor(log2(0))`
+/// is undefined mathematically and the saturating behaviour is the convention used
+/// elsewhere in the workspace.
+#[must_use]
+pub const fn log2_floor_usize(n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    (usize::BITS - 1 - n.leading_zeros()) as usize
+}
+
+#[must_use]
+pub const fn log2_ceil_u64(n: u64) -> u64 {
+    (u64::BITS - n.saturating_sub(1).leading_zeros()) as u64
+}
+
+/// Returns `2^log_degree` if it can be represented by `usize`.
+#[must_use]
+pub const fn checked_pow2(log_degree: usize) -> Option<usize> {
+    if log_degree < usize::BITS as usize {
+        Some(1usize << log_degree)
+    } else {
+        None
+    }
+}
+
+/// Adds two log-sizes and computes the resulting power of two.
+///
+/// Returns:
+/// - `(a + b, 2^(a + b))` when the sum fits in a `usize` shift,
+/// - `None` if the addition overflows or the resulting power exceeds the representable range.
+#[must_use]
+pub const fn checked_log_size_sum(a: usize, b: usize) -> Option<(usize, usize)> {
+    match a.checked_add(b) {
+        Some(sum) => match checked_pow2(sum) {
+            Some(size) => Some((sum, size)),
+            None => None,
+        },
+        None => None,
+    }
+}
+
+/// Computes `log_2(n)`
+///
+/// # Panics
+/// Panics if `n` is not a power of two.
+#[must_use]
+#[inline]
+pub const fn log2_strict_usize(n: usize) -> usize {
+    let res = n.trailing_zeros();
+    assert!(n.wrapping_shr(res) == 1, "Not a power of two");
+    // Tell the optimizer about the semantics of `log2_strict`. i.e. it can replace `n` with
+    // `1 << res` and vice versa.
+    unsafe {
+        assert_unchecked(n == 1 << res);
+    }
+    res as usize
+}
+
+/// Precomputed table of all powers of 3 that fit in a `u64`.
+///
+/// The maximum power is `3^40 = 12_157_665_459_056_928_801`.
+///
+/// We use `u64` instead of `usize` so the table compiles safely on 32-bit targets,
+/// where `3^40` would overflow a 32-bit `usize`.
+const POWERS_OF_3: [u64; 41] = {
+    // Start with 3^0 = 1.
+    let mut table = [0u64; 41];
+    table[0] = 1;
+
+    // Fill iteratively: each entry is 3 times the previous one.
+    let mut i = 1;
+    while i < 41 {
+        table[i] = table[i - 1] * 3;
+        i += 1;
+    }
+    table
+};
+
+/// Maps a bit-position (i.e. `floor(log2(n))`) to the corresponding base-3 exponent.
+///
+/// Because `3^k` grows faster than `2^k`, every power of 3 has a unique highest set
+/// bit position. This lets us use `leading_zeros()` to jump straight to the answer
+/// in O(1) without any loop or binary search.
+///
+/// Entries that don't correspond to any power of 3 are unused (left as 0).
+const LOG2_TO_EXP: [u8; 64] = {
+    // Initialize every slot to 0.
+    let mut table = [0u8; 64];
+
+    // For each power of 3, record which log2 bucket it falls into.
+    let mut i = 0;
+    while i < 41 {
+        // Compute floor(log2(3^i)) via the highest set bit.
+        let log2 = (u64::BITS - 1 - POWERS_OF_3[i].leading_zeros()) as usize;
+
+        // Store the exponent i at the corresponding bit-position.
+        table[log2] = i as u8;
+        i += 1;
+    }
+    table
+};
+
+/// Computes the strict base-3 logarithm of `n`.
+///
+/// Returns `k` such that `3^k == n`. Panics if `n` is not a power of 3.
+///
+/// This is the base-3 analogue of [`log2_strict_usize`].
+///
+/// # Arguments
+///
+/// * `n` - A positive integer that must be a power of 3 (i.e., 1, 3, 9, 27, 81, ...).
+///
+/// # Returns
+///
+/// The exponent `k` where `3^k == n`.
+///
+/// # Panics
+///
+/// Panics if:
+/// - `n` is zero
+/// - `n` is not a power of 3
+#[must_use]
+#[inline]
+pub const fn log3_strict_usize(n: usize) -> usize {
+    // Zero has no logarithm - check explicitly for a clear error message.
+    assert!(n != 0, "log3_strict_usize: input must be non-zero");
+
+    // Instantly find the candidate exponent via the highest set bit.
+    //
+    // Because every power of 3 occupies a unique log2 bucket, this single
+    // lookup gives us the answer in O(1) with zero branches.
+    let log2 = (usize::BITS - 1 - n.leading_zeros()) as usize;
+    let res = LOG2_TO_EXP[log2] as usize;
+
+    // Verify the result: catches non-powers of 3 in a single O(1) check.
+    assert!(
+        POWERS_OF_3[res] as usize == n,
+        "log3_strict_usize: input is not a power of 3"
+    );
+
+    res
+}
+
+/// Returns `[0, ..., N - 1]`.
+#[must_use]
+pub const fn indices_arr<const N: usize>() -> [usize; N] {
+    let mut indices_arr = [0; N];
+    let mut i = 0;
+    while i < N {
+        indices_arr[i] = i;
+        i += 1;
+    }
+    indices_arr
+}
+
+/// Statically asserts that `T` implements [`Clone`].
+pub const fn assert_clone<T: Clone>() {}
+
+/// Statically asserts that `T` implements [`Send`].
+pub const fn assert_send<T: Send>() {}
+
+/// Statically asserts that `T` implements [`Sync`].
+pub const fn assert_sync<T: Sync>() {}
+
+#[inline]
+pub const fn reverse_bits(x: usize, n: usize) -> usize {
+    // Assert that n is a power of 2
+    debug_assert!(n.is_power_of_two());
+    reverse_bits_len(x, n.trailing_zeros() as usize)
+}
+
+#[inline]
+pub const fn reverse_bits_len(x: usize, bit_len: usize) -> usize {
+    // A `bit_len` wider than the word would underflow the shift below.
+    // That yields a wrong, non-panicking permutation in release, so reject it up front.
+    debug_assert!(bit_len <= usize::BITS as usize);
+    // NB: The only reason we need overflowing_shr() here as opposed
+    // to plain '>>' is to accommodate the case n == num_bits == 0,
+    // which would become `0 >> 64`. Rust thinks that any shift of 64
+    // bits causes overflow, even when the argument is zero.
+    x.reverse_bits()
+        .overflowing_shr(usize::BITS - bit_len as u32)
+        .0
+}
+
+// Lookup table of 6-bit reverses.
+// NB: 2^6=64 bytes is a cache line. A smaller table wastes cache space.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+#[rustfmt::skip]
+const BIT_REVERSE_6BIT: &[u8] = &[
+    0o00, 0o40, 0o20, 0o60, 0o10, 0o50, 0o30, 0o70,
+    0o04, 0o44, 0o24, 0o64, 0o14, 0o54, 0o34, 0o74,
+    0o02, 0o42, 0o22, 0o62, 0o12, 0o52, 0o32, 0o72,
+    0o06, 0o46, 0o26, 0o66, 0o16, 0o56, 0o36, 0o76,
+    0o01, 0o41, 0o21, 0o61, 0o11, 0o51, 0o31, 0o71,
+    0o05, 0o45, 0o25, 0o65, 0o15, 0o55, 0o35, 0o75,
+    0o03, 0o43, 0o23, 0o63, 0o13, 0o53, 0o33, 0o73,
+    0o07, 0o47, 0o27, 0o67, 0o17, 0o57, 0o37, 0o77,
+];
+
+const BIG_T_SIZE: usize = 1 << 14;
+const SMALL_ARR_SIZE: usize = 1 << 16;
+const _: () = assert!(SMALL_ARR_SIZE >= 4 * BIG_T_SIZE);
+
+/// Permutes `arr` such that each index is mapped to its reverse in binary.
+///
+/// If the whole array fits in fast cache, then the trivial algorithm is cache friendly. Also, if
+/// `T` is really big, then the trivial algorithm is cache-friendly, no matter the size of the array.
+pub fn reverse_slice_index_bits<F>(vals: &mut [F])
+where
+    F: Copy + Send + Sync,
+{
+    let n = vals.len();
+    if n == 0 {
+        return;
+    }
+    let log_n = log2_strict_usize(n);
+
+    // If the whole array fits in fast cache, then the trivial algorithm is cache friendly. Also, if
+    // `T` is really big, then the trivial algorithm is cache-friendly, no matter the size of the array.
+    if core::mem::size_of::<F>() << log_n <= SMALL_ARR_SIZE
+        || core::mem::size_of::<F>() >= BIG_T_SIZE
+    {
+        reverse_slice_index_bits_small(vals, log_n);
+    } else {
+        debug_assert!(n >= 4); // By our choice of `BIG_T_SIZE` and `SMALL_ARR_SIZE`.
+
+        // Algorithm:
+        //
+        // Treat `arr` as a `sqrt(n)` by `sqrt(n)` row-major matrix. (Assume for now that `lb_n` is
+        // even, i.e., `n` is a square number.) To perform bit-order reversal we:
+        //  1. Bit-reverse the order of the rows. (They are contiguous in memory, so this is
+        //     basically a series of large `memcpy`s.)
+        //  2. Transpose the matrix.
+        //  3. Bit-reverse the order of the rows.
+        //
+        // This is equivalent to, for every index `0 <= i < n`:
+        //  1. bit-reversing `i[lb_n / 2..lb_n]`,
+        //  2. swapping `i[0..lb_n / 2]` and `i[lb_n / 2..lb_n]`,
+        //  3. bit-reversing `i[lb_n / 2..lb_n]`.
+        //
+        // If `lb_n` is odd, i.e., `n` is not a square number, then the above procedure requires
+        // slight modification. At steps 1 and 3 we bit-reverse bits `ceil(lb_n / 2)..lb_n`, of the
+        // index (shuffling `floor(lb_n / 2)` chunks of length `ceil(lb_n / 2)`). At step 2, we
+        // perform _two_ transposes. We treat `arr` as two matrices, one where the middle bit of the
+        // index is `0` and another, where the middle bit is `1`; we transpose each individually.
+
+        let lb_num_chunks = log_n >> 1;
+        let lb_chunk_size = log_n - lb_num_chunks;
+        unsafe {
+            reverse_slice_index_bits_chunks(vals, lb_num_chunks, lb_chunk_size);
+            transpose_in_place_square(vals, lb_chunk_size, lb_num_chunks, 0);
+            if lb_num_chunks != lb_chunk_size {
+                // `arr` cannot be interpreted as a square matrix. We instead interpret it as a
+                // `1 << lb_num_chunks` by `2` by `1 << lb_num_chunks` tensor, in row-major order.
+                // The above transpose acted on `tensor[..., 0, ...]` (all indices with middle bit
+                // `0`). We still need to transpose `tensor[..., 1, ...]`. To do so, we advance
+                // arr by `1 << lb_num_chunks` effectively, adding that to every index.
+                let vals_with_offset = &mut vals[1 << lb_num_chunks..];
+                transpose_in_place_square(vals_with_offset, lb_chunk_size, lb_num_chunks, 0);
+            }
+            reverse_slice_index_bits_chunks(vals, lb_num_chunks, lb_chunk_size);
+        }
+    }
+}
+
+// Both functions below are semantically equivalent to:
+//     for i in 0..n {
+//         result.push(arr[reverse_bits(i, n_power)]);
+//     }
+// where reverse_bits(i, n_power) computes the n_power-bit reverse. The complications are there
+// to guide the compiler to generate optimal assembly.
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+fn reverse_slice_index_bits_small<F>(vals: &mut [F], lb_n: usize) {
+    if lb_n <= 6 {
+        // BIT_REVERSE_6BIT holds 6-bit reverses. This shift makes them lb_n-bit reverses.
+        let dst_shr_amt = 6 - lb_n as u32;
+        for (src, &br) in BIT_REVERSE_6BIT.iter().enumerate().take(vals.len()) {
+            let dst = (br as usize).wrapping_shr(dst_shr_amt);
+            if src < dst {
+                vals.swap(src, dst);
+            }
+        }
+    } else {
+        // LLVM does not know that it does not need to reverse src at each iteration (which is
+        // expensive on x86). We take advantage of the fact that the low bits of dst change rarely and the high
+        // bits of dst are dependent only on the low bits of src.
+        let dst_lo_shr_amt = usize::BITS - (lb_n - 6) as u32;
+        let dst_hi_shl_amt = lb_n - 6;
+        for src_chunk in 0..(vals.len() >> 6) {
+            let src_hi = src_chunk << 6;
+            let dst_lo = src_chunk.reverse_bits().wrapping_shr(dst_lo_shr_amt);
+            for (src_lo, &br) in BIT_REVERSE_6BIT.iter().enumerate() {
+                let dst_hi = (br as usize) << dst_hi_shl_amt;
+                let src = src_hi + src_lo;
+                let dst = dst_hi + dst_lo;
+                if src < dst {
+                    vals.swap(src, dst);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+const fn reverse_slice_index_bits_small<F>(vals: &mut [F], lb_n: usize) {
+    // Aarch64 can reverse bits in one instruction, so the trivial version works best.
+    let mut src = 0;
+    while src < vals.len() {
+        let dst = src.reverse_bits().wrapping_shr(usize::BITS - lb_n as u32);
+        if src < dst {
+            vals.swap(src, dst);
+        }
+
+        src += 1;
+    }
+}
+
+/// Split `arr` chunks and bit-reverse the order of the chunks. There are `1 << lb_num_chunks`
+/// chunks, each of length `1 << lb_chunk_size`.
+/// SAFETY: ensure that `arr.len() == 1 << lb_num_chunks + lb_chunk_size`.
+unsafe fn reverse_slice_index_bits_chunks<F>(
+    vals: &mut [F],
+    lb_num_chunks: usize,
+    lb_chunk_size: usize,
+) {
+    for i in 0..1usize << lb_num_chunks {
+        // `wrapping_shr` handles the silly case when `lb_num_chunks == 0`.
+        let j = i
+            .reverse_bits()
+            .wrapping_shr(usize::BITS - lb_num_chunks as u32);
+        if i < j {
+            unsafe {
+                core::ptr::swap_nonoverlapping(
+                    vals.get_unchecked_mut(i << lb_chunk_size),
+                    vals.get_unchecked_mut(j << lb_chunk_size),
+                    1 << lb_chunk_size,
+                );
+            }
+        }
+    }
+}
+
+/// Try to force Rust to emit a branch. Example:
+///
+/// ```no_run
+/// let x = 100;
+/// if x > 20 {
+///     println!("x is big!");
+///     p3_util::branch_hint();
+/// } else {
+///     println!("x is small!");
+/// }
+/// ```
+///
+/// This function has no semantics. It is a hint only.
+#[inline(always)]
+pub fn branch_hint() {
+    // NOTE: These are the currently supported assembly architectures. See the
+    // [nightly reference](https://doc.rust-lang.org/nightly/reference/inline-assembly.html) for
+    // the most up-to-date list.
+    #[cfg(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "x86",
+        target_arch = "x86_64",
+    ))]
+    unsafe {
+        core::arch::asm!("", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Return a String containing the name of T but with all the crate
+/// and module prefixes removed.
+pub fn pretty_name<T>() -> String {
+    let name = type_name::<T>();
+    let mut result = String::new();
+    for qual in name.split_inclusive(&['<', '>', ',']) {
+        result.push_str(qual.split("::").last().unwrap());
+    }
+    result
+}
+
+/// A C-style buffered input reader, similar to
+/// `core::iter::Iterator::next_chunk()` from nightly.
+///
+/// Returns an array of `MaybeUninit<T>` and the number of items in the
+/// array which have been correctly initialized.
+#[inline]
+fn iter_next_chunk_erased<const BUFLEN: usize, I: Iterator>(
+    iter: &mut I,
+) -> ([MaybeUninit<I::Item>; BUFLEN], usize)
+where
+    I::Item: Copy,
+{
+    let mut buf = [const { MaybeUninit::<I::Item>::uninit() }; BUFLEN];
+    let mut i = 0;
+
+    while i < BUFLEN {
+        if let Some(c) = iter.next() {
+            // Copy the next Item into `buf`.
+            unsafe {
+                buf.get_unchecked_mut(i).write(c);
+                i = i.unchecked_add(1);
+            }
+        } else {
+            // No more items in the iterator.
+            break;
+        }
+    }
+    (buf, i)
+}
+
+/// Split an iterator into small arrays and apply `func` to each.
+///
+/// Repeatedly read `BUFLEN` elements from `input` into an array and
+/// pass the array to `func` as a slice. If less than `BUFLEN`
+/// elements are remaining, that smaller slice is passed to `func` (if
+/// it is non-empty) and the function returns.
+#[inline]
+pub fn apply_to_chunks<const BUFLEN: usize, I, H>(input: I, mut func: H)
+where
+    I: IntoIterator<Item = u8>,
+    H: FnMut(&[u8]),
+{
+    let mut iter = input.into_iter();
+    loop {
+        let (buf, n) = iter_next_chunk_erased::<BUFLEN, _>(&mut iter);
+        if n == 0 {
+            break;
+        }
+        func(unsafe { buf.get_unchecked(..n).assume_init_ref() });
+    }
+}
+
+/// Pulls `N` items from `iter` and returns them as an array. If the iterator
+/// yields fewer than `N` items (but more than `0`), pads by the given default value.
+///
+/// Since the iterator is passed as a mutable reference and this function calls
+/// `next` at most `N` times, the iterator can still be used afterwards to
+/// retrieve the remaining items.
+///
+/// If `iter.next()` panics, all items already yielded by the iterator are
+/// dropped.
+#[inline]
+fn iter_next_chunk_padded<T: Copy, const N: usize>(
+    iter: &mut impl Iterator<Item = T>,
+    default: T, // Needed due to [T; M] not always implementing Default. Can probably be dropped if const generics stabilize.
+) -> Option<[T; N]> {
+    let (mut arr, n) = iter_next_chunk_erased::<N, _>(iter);
+    (n != 0).then(|| {
+        // Fill the rest of the array with default values.
+        arr[n..].fill(MaybeUninit::new(default));
+        unsafe { mem::transmute_copy::<_, [T; N]>(&arr) }
+    })
+}
+
+/// Returns an iterator over `N` elements of the iterator at a time.
+///
+/// The chunks do not overlap. If `N` does not divide the length of the
+/// iterator, then the last chunk is padded with up to `N-1` copies of the given default value.
+///
+/// This is essentially a copy pasted version of the nightly `array_chunks` function.
+/// <https://doc.rust-lang.org/std/iter/trait.Iterator.html#method.array_chunks>
+/// Once that is stabilized this and the functions above it should be removed.
+#[inline]
+pub fn iter_array_chunks_padded<T: Copy, const N: usize>(
+    iter: impl IntoIterator<Item = T>,
+    default: T, // Needed due to [T; M] not always implementing Default. Can probably be dropped if const generics stabilize.
+) -> impl Iterator<Item = [T; N]> {
+    let mut iter = iter.into_iter();
+    iter::from_fn(move || iter_next_chunk_padded(&mut iter, default))
+}
+
+/// Reinterpret a slice of `BaseArray` elements as a slice of `Base` elements
+///
+/// This is useful to convert `&[F; N]` to `&[F]` or `&[A]` to `&[F]` where
+/// `A` has the same size, alignment and memory layout as `[F; N]` for some `N`.
+///
+/// # Safety
+///
+/// This is assumes that `BaseArray` has the same alignment and memory layout as `[Base; N]`.
+/// As Rust guarantees that arrays elements are contiguous in memory and the alignment of
+/// the array is the same as the alignment of its elements, this means that `BaseArray`
+/// must have the same alignment as `Base`.
+///
+/// # Panics
+///
+/// This panics if the size of `BaseArray` is not a multiple of the size of `Base`.
+#[inline]
+pub const unsafe fn as_base_slice<Base, BaseArray>(buf: &[BaseArray]) -> &[Base] {
+    const {
+        assert!(align_of::<Base>() == align_of::<BaseArray>());
+        assert!(size_of::<BaseArray>().is_multiple_of(size_of::<Base>()));
+    }
+
+    let d = size_of::<BaseArray>() / size_of::<Base>();
+
+    let buf_ptr = buf.as_ptr().cast::<Base>();
+    let n = buf.len() * d;
+    unsafe { slice::from_raw_parts(buf_ptr, n) }
+}
+
+/// Reinterpret a mutable slice of `BaseArray` elements as a slice of `Base` elements
+///
+/// This is useful to convert `&[F; N]` to `&[F]` or `&[A]` to `&[F]` where
+/// `A` has the same size, alignment and memory layout as `[F; N]` for some `N`.
+///
+/// # Safety
+///
+/// This is assumes that `BaseArray` has the same alignment and memory layout as `[Base; N]`.
+/// As Rust guarantees that arrays elements are contiguous in memory and the alignment of
+/// the array is the same as the alignment of its elements, this means that `BaseArray`
+/// must have the same alignment as `Base`.
+///
+/// # Panics
+///
+/// This panics if the size of `BaseArray` is not a multiple of the size of `Base`.
+#[inline]
+pub const unsafe fn as_base_slice_mut<Base, BaseArray>(buf: &mut [BaseArray]) -> &mut [Base] {
+    const {
+        assert!(align_of::<Base>() == align_of::<BaseArray>());
+        assert!(size_of::<BaseArray>().is_multiple_of(size_of::<Base>()));
+    }
+
+    let d = size_of::<BaseArray>() / size_of::<Base>();
+
+    let buf_ptr = buf.as_mut_ptr().cast::<Base>();
+    let n = buf.len() * d;
+    unsafe { slice::from_raw_parts_mut(buf_ptr, n) }
+}
+
+/// Convert a vector of `BaseArray` elements to a vector of `Base` elements without any
+/// reallocations.
+///
+/// This is useful to convert `Vec<[F; N]>` to `Vec<F>` or `Vec<A>` to `Vec<F>` where
+/// `A` has the same size, alignment and memory layout as `[F; N]` for some `N`. It can also,
+/// be used to safely convert `Vec<u32>` to `Vec<F>` if `F` is a `32` bit field
+/// or `Vec<u64>` to `Vec<F>` if `F` is a `64` bit field.
+///
+/// # Safety
+///
+/// This is assumes that `BaseArray` has the same alignment and memory layout as `[Base; N]`.
+/// As Rust guarantees that arrays elements are contiguous in memory and the alignment of
+/// the array is the same as the alignment of its elements, this means that `BaseArray`
+/// must have the same alignment as `Base`.
+///
+/// # Panics
+///
+/// This panics if the size of `BaseArray` is not a multiple of the size of `Base`.
+#[inline]
+pub unsafe fn flatten_to_base<Base, BaseArray>(vec: Vec<BaseArray>) -> Vec<Base> {
+    const {
+        assert!(align_of::<Base>() == align_of::<BaseArray>());
+        assert!(size_of::<BaseArray>().is_multiple_of(size_of::<Base>()));
+    }
+
+    let d = size_of::<BaseArray>() / size_of::<Base>();
+    // Prevent running `vec`'s destructor so we are in complete control
+    // of the allocation.
+    let mut values = ManuallyDrop::new(vec);
+
+    // Each `Self` is an array of `d` elements, so the length and capacity of
+    // the new vector will be multiplied by `d`.
+    let new_len = values.len() * d;
+    let new_cap = values.capacity() * d;
+
+    // Safe as BaseArray and Base have the same alignment.
+    let ptr = values.as_mut_ptr() as *mut Base;
+
+    unsafe {
+        // Safety:
+        // - BaseArray and Base have the same alignment.
+        // - As size_of::<BaseArray>() == size_of::<Base>() * d:
+        //      -- The capacity of the new vector is equal to the capacity of the old vector.
+        //      -- The first new_len elements of the new vector correspond to the first
+        //         len elements of the old vector and so are properly initialized.
+        Vec::from_raw_parts(ptr, new_len, new_cap)
+    }
+}
+
+/// Convert a vector of `Base` elements to a vector of `BaseArray` elements ideally without any
+/// reallocations.
+///
+/// This is an inverse of `flatten_to_base`. Unfortunately, unlike `flatten_to_base`, it may not be
+/// possible to avoid allocations. This issue is that there is not way to guarantee that the capacity
+/// of the vector is a multiple of `d`.
+///
+/// # Safety
+///
+/// This is assumes that `BaseArray` has the same alignment and memory layout as `[Base; N]`.
+/// As Rust guarantees that arrays elements are contiguous in memory and the alignment of
+/// the array is the same as the alignment of its elements, this means that `BaseArray`
+/// must have the same alignment as `Base`.
+///
+/// # Panics
+///
+/// This panics if the size of `BaseArray` is not a multiple of the size of `Base`.
+/// This panics if the length of the vector is not a multiple of the ratio of the sizes.
+#[inline]
+pub unsafe fn reconstitute_from_base<Base, BaseArray: Clone>(mut vec: Vec<Base>) -> Vec<BaseArray> {
+    const {
+        assert!(align_of::<Base>() == align_of::<BaseArray>());
+        assert!(size_of::<BaseArray>().is_multiple_of(size_of::<Base>()));
+    }
+
+    let d = size_of::<BaseArray>() / size_of::<Base>();
+
+    assert!(
+        vec.len().is_multiple_of(d),
+        "Vector length (got {}) must be a multiple of the extension field dimension ({}).",
+        vec.len(),
+        d
+    );
+
+    let new_len = vec.len() / d;
+
+    // We could call vec.shrink_to_fit() here to try and increase the probability that
+    // the capacity is a multiple of d. That might cause a reallocation though which
+    // would defeat the whole purpose.
+    let cap = vec.capacity();
+
+    // The assumption is that basically all callers of `reconstitute_from_base_vec` will be calling it
+    // with a vector constructed from `flatten_to_base` and so the capacity should be a multiple of `d`.
+    // But capacities can do strange things so we need to support both possibilities.
+    // Note that the `else` branch would also work if the capacity is a multiple of `d` but it is slower.
+    if cap.is_multiple_of(d) {
+        // Prevent running `vec`'s destructor so we are in complete control
+        // of the allocation.
+        let mut values = ManuallyDrop::new(vec);
+
+        // If we are on this branch then the capacity is a multiple of `d`.
+        let new_cap = cap / d;
+
+        // Safe as BaseArray and Base have the same alignment.
+        let ptr = values.as_mut_ptr() as *mut BaseArray;
+
+        unsafe {
+            // Safety:
+            // - BaseArray and Base have the same alignment.
+            // - As size_of::<Base>() == size_of::<BaseArray>() / d:
+            //      -- If we have reached this point, the length and capacity are both divisible by `d`.
+            //      -- The capacity of the new vector is equal to the capacity of the old vector.
+            //      -- The first new_len elements of the new vector correspond to the first
+            //         len elements of the old vector and so are properly initialized.
+            Vec::from_raw_parts(ptr, new_len, new_cap)
+        }
+    } else {
+        // If the capacity is not a multiple of `D`, we go via slices.
+
+        let buf_ptr = vec.as_mut_ptr().cast::<BaseArray>();
+        let slice = unsafe {
+            // Safety:
+            // - BaseArray and Base have the same alignment.
+            // - As size_of::<Base>() == size_of::<BaseArray>() / D:
+            //      -- If we have reached this point, the length is divisible by `D`.
+            //      -- The first new_len elements of the slice correspond to the first
+            //         len elements of the old slice and so are properly initialized.
+            slice::from_raw_parts(buf_ptr, new_len)
+        };
+
+        // Ideally the compiler could optimize this away to avoid the copy but it appears not to.
+        slice.to_vec()
+    }
+}
+
+#[inline(always)]
+pub const fn relatively_prime_u64(mut u: u64, mut v: u64) -> bool {
+    // Check that neither input is 0.
+    if u == 0 || v == 0 {
+        return false;
+    }
+
+    // Check divisibility by 2.
+    if (u | v) & 1 == 0 {
+        return false;
+    }
+
+    // Remove factors of 2 from `u` and `v`
+    u >>= u.trailing_zeros();
+    if u == 1 {
+        return true;
+    }
+
+    while v != 0 {
+        v >>= v.trailing_zeros();
+        if v == 1 {
+            return true;
+        }
+
+        // Ensure u <= v
+        if u > v {
+            core::mem::swap(&mut u, &mut v);
+        }
+
+        // This looks inefficient for v >> u but thanks to the fact that we remove
+        // trailing_zeros of v in every iteration, it ends up much more performative
+        // than first glance implies.
+        v -= u;
+    }
+    // If we made it through the loop, at no point is u or v equal to 1 and so the gcd
+    // must be greater than 1.
+    false
+}
+
+/// Inner loop of the deferred GCD algorithm.
+///
+/// See: <https://eprint.iacr.org/2020/972.pdf> for more information.
+///
+/// This is basically a mini GCD algorithm which builds up a transformation to apply to the larger
+/// numbers in the main loop. The key point is that this small loop only uses u64s, subtractions and
+/// bit shifts, which are very fast operations.
+///
+/// The bottom `NUM_ROUNDS` bits of `a` and `b` should match the bottom `NUM_ROUNDS` bits of
+/// the corresponding big-ints and the top `NUM_ROUNDS + 2` should match the top bits including
+/// zeroes if the original numbers have different sizes.
+#[inline]
+pub const fn gcd_inner<const NUM_ROUNDS: usize>(a: &mut u64, b: &mut u64) -> (i64, i64, i64, i64) {
+    // Initialise update factors.
+    // At the start of round 0: -1 < f0, g0, f1, g1 <= 1
+    let (mut f0, mut g0, mut f1, mut g1) = (1, 0, 0, 1);
+
+    // If at the start of a round: -2^i < f0, g0, f1, g1 <= 2^i
+    // Then, at the end of the round: -2^{i + 1} < f0, g0, f1, g1 <= 2^{i + 1}
+    // use manual `while` loop to enable `const`
+    let mut round = 0;
+    while round < NUM_ROUNDS {
+        if *a & 1 == 0 {
+            *a >>= 1;
+        } else {
+            if *a < *b {
+                core::mem::swap(a, b);
+                (f0, f1) = (f1, f0);
+                (g0, g1) = (g1, g0);
+            }
+            *a -= *b;
+            *a >>= 1;
+            f0 -= f1;
+            g0 -= g1;
+        }
+        f1 <<= 1;
+        g1 <<= 1;
+
+        round += 1;
+    }
+
+    // -2^NUM_ROUNDS < f0, g0, f1, g1 <= 2^NUM_ROUNDS
+    // Hence provided NUM_ROUNDS <= 62, we will not get any overflow.
+    // Additionally, if NUM_ROUNDS <= 63, then the only source of overflow will be
+    // if a variable is meant to equal 2^{63} in which case it will overflow to -2^{63}.
+    (f0, g0, f1, g1)
+}
+
+/// Inverts elements inside the prime field `F_P` with `P < 2^FIELD_BITS`.
+///
+/// Arguments:
+///  - a: The value we want to invert. It must be < P.
+///  - b: The value of the prime `P > 2`.
+///
+/// Output:
+/// - A `64-bit` signed integer `v` equal to `2^{2 * FIELD_BITS - 2} a^{-1} mod P` with
+///   size `|v| < 2^{2 * FIELD_BITS - 2}`.
+///
+/// It is up to the user to ensure that `b` is an odd prime with at most `FIELD_BITS` bits and
+/// `a < b`. If either of these assumptions break, the output is undefined.
+#[inline]
+pub const fn gcd_inversion_prime_field_32<const FIELD_BITS: u32>(mut a: u32, mut b: u32) -> i64 {
+    const {
+        assert!(FIELD_BITS <= 32);
+    }
+    debug_assert!(((1_u64 << FIELD_BITS) - 1) >= b as u64);
+
+    // Initialise u, v. Note that |u|, |v| <= 2^0
+    let (mut u, mut v) = (1_i64, 0_i64);
+
+    // Let a0 and P denote the initial values of a and b. Observe:
+    // `a = u * a0 mod P`
+    // `b = v * a0 mod P`
+    // `len(a) + len(b) <= 2 * len(P) <= 2 * FIELD_BITS`
+
+    // use manual `while` loop to enable `const`
+    let mut i = 0;
+    while i < 2 * FIELD_BITS - 2 {
+        // Assume at the start of the loop i:
+        // (1) `|u|, |v| <= 2^{i}`
+        // (2) `2^i * a = u * a0 mod P`
+        // (3) `2^i * b = v * a0 mod P`
+        // (4) `gcd(a, b) = 1`
+        // (5) `b` is odd.
+        // (6) `len(a) + len(b) <= max(n - i, 1)`
+
+        if a & 1 != 0 {
+            if a < b {
+                (a, b) = (b, a);
+                (u, v) = (v, u);
+            }
+            // As b < a, this subtraction cannot increase `len(a) + len(b)`
+            a -= b;
+            // Observe |u'| = |u - v| <= |u| + |v| <= 2^{i + 1}
+            u -= v;
+
+            // As (1) and (2) hold, we have
+            // `2^i a' = 2^i * (a - b) = (u - v) * a0 mod P = u' * a0 mod P`
+        }
+        // As b is odd, a must now be even.
+        // This reduces `len(a) + len(b)` by 1 (unless `a = 0` in which case `b = 1` and the sum of the lengths is always 1)
+        a >>= 1;
+
+        // Observe |v'| = 2|v| <= 2^{i + 1}
+        v <<= 1;
+
+        // Thus as the end of loop i:
+        // (1) `|u|, |v| <= 2^{i + 1}`
+        // (2) `2^{i + 1} * a = u * a0 mod P`  (As we have halved a)
+        // (3) `2^{i + 1} * b = v * a0 mod P`  (As we have doubled v)
+        // (4) `gcd(a, b) = 1`
+        // (5) `b` is odd.
+        // (6) `len(a) + len(b) <= max(n - i - 1, 1)`
+
+        i += 1;
+    }
+
+    // After the loops, we see that:
+    // |u|, |v| <= 2^{2 * FIELD_BITS - 2}: Hence for FIELD_BITS <= 32 we will not overflow an i64.
+    // `2^{2 * FIELD_BITS - 2} * b = v * a0 mod P`
+    // `len(a) + len(b) <= 2` with `gcd(a, b) = 1` and `b` odd.
+    // This implies that `b` must be `1` and so `v = 2^{2 * FIELD_BITS - 2} a0^{-1} mod P` as desired.
+    v
+}
+
+/// A raw mutable pointer wrapper that implements [`Send`] and [`Sync`].
+///
+/// Used to enable parallel writes to disjoint slices of a pre-allocated buffer
+/// from within closures that require `Send + Sync` (e.g. `rayon::ParallelIterator::for_each_init`).
+///
+/// # Safety
+///
+/// The caller must ensure that concurrent accesses through this pointer always
+/// target **non-overlapping** memory regions.
+#[derive(Clone, Copy)]
+pub struct DisjointMutPtr<T>(*mut T);
+
+// SAFETY: The contract of DisjointMutPtr guarantees that each thread writes to
+// a disjoint region, so sharing the pointer across threads is safe.
+unsafe impl<T> Send for DisjointMutPtr<T> {}
+unsafe impl<T> Sync for DisjointMutPtr<T> {}
+
+impl<T> DisjointMutPtr<T> {
+    /// Create a new `DisjointMutPtr` from a mutable slice.
+    #[inline]
+    pub const fn new(slice: &mut [T]) -> Self {
+        Self(slice.as_mut_ptr())
+    }
+
+    /// Get a mutable slice starting at `offset` with `len` elements.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the range `[offset, offset+len)` is within bounds
+    /// and does not overlap with any other concurrent access. The returned
+    /// slice must not outlive the buffer passed to [`Self::new`].
+    #[inline]
+    pub const unsafe fn slice_mut<'a>(self, offset: usize, len: usize) -> &'a mut [T] {
+        unsafe { core::slice::from_raw_parts_mut(self.0.add(offset), len) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use proptest::prelude::*;
+    use rand::rngs::SmallRng;
+    use rand::{RngExt, SeedableRng};
+
+    use super::*;
+
+    #[test]
+    fn test_reverse_bits_len() {
+        assert_eq!(reverse_bits_len(0b0000000000, 10), 0b0000000000);
+        assert_eq!(reverse_bits_len(0b0000000001, 10), 0b1000000000);
+        assert_eq!(reverse_bits_len(0b1000000000, 10), 0b0000000001);
+        assert_eq!(reverse_bits_len(0b00000, 5), 0b00000);
+        assert_eq!(reverse_bits_len(0b01011, 5), 0b11010);
+    }
+
+    #[test]
+    fn test_reverse_bits_len_full_width() {
+        // A full-width reversal is the largest valid bit length and must reverse every bit.
+        let bits = usize::BITS as usize;
+        assert_eq!(reverse_bits_len(1, bits), 1 << (bits - 1));
+        assert_eq!(reverse_bits_len(1 << (bits - 1), bits), 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "bit_len <= usize::BITS")]
+    fn test_reverse_bits_len_rejects_oversized_bit_len() {
+        // One bit past the word width: the shift would underflow into a wrong permutation.
+        // The expected message pins the guard, not the incidental subtraction-overflow panic.
+        let _ = reverse_bits_len(0, usize::BITS as usize + 1);
+    }
+
+    #[test]
+    fn test_reverse_index_bits() {
+        let mut arg = vec![10, 20, 30, 40];
+        reverse_slice_index_bits(&mut arg);
+        assert_eq!(arg, vec![10, 30, 20, 40]);
+
+        let mut input256: Vec<u64> = (0..256).collect();
+        #[rustfmt::skip]
+        let output256: Vec<u64> = vec![
+            0x00, 0x80, 0x40, 0xc0, 0x20, 0xa0, 0x60, 0xe0, 0x10, 0x90, 0x50, 0xd0, 0x30, 0xb0, 0x70, 0xf0,
+            0x08, 0x88, 0x48, 0xc8, 0x28, 0xa8, 0x68, 0xe8, 0x18, 0x98, 0x58, 0xd8, 0x38, 0xb8, 0x78, 0xf8,
+            0x04, 0x84, 0x44, 0xc4, 0x24, 0xa4, 0x64, 0xe4, 0x14, 0x94, 0x54, 0xd4, 0x34, 0xb4, 0x74, 0xf4,
+            0x0c, 0x8c, 0x4c, 0xcc, 0x2c, 0xac, 0x6c, 0xec, 0x1c, 0x9c, 0x5c, 0xdc, 0x3c, 0xbc, 0x7c, 0xfc,
+            0x02, 0x82, 0x42, 0xc2, 0x22, 0xa2, 0x62, 0xe2, 0x12, 0x92, 0x52, 0xd2, 0x32, 0xb2, 0x72, 0xf2,
+            0x0a, 0x8a, 0x4a, 0xca, 0x2a, 0xaa, 0x6a, 0xea, 0x1a, 0x9a, 0x5a, 0xda, 0x3a, 0xba, 0x7a, 0xfa,
+            0x06, 0x86, 0x46, 0xc6, 0x26, 0xa6, 0x66, 0xe6, 0x16, 0x96, 0x56, 0xd6, 0x36, 0xb6, 0x76, 0xf6,
+            0x0e, 0x8e, 0x4e, 0xce, 0x2e, 0xae, 0x6e, 0xee, 0x1e, 0x9e, 0x5e, 0xde, 0x3e, 0xbe, 0x7e, 0xfe,
+            0x01, 0x81, 0x41, 0xc1, 0x21, 0xa1, 0x61, 0xe1, 0x11, 0x91, 0x51, 0xd1, 0x31, 0xb1, 0x71, 0xf1,
+            0x09, 0x89, 0x49, 0xc9, 0x29, 0xa9, 0x69, 0xe9, 0x19, 0x99, 0x59, 0xd9, 0x39, 0xb9, 0x79, 0xf9,
+            0x05, 0x85, 0x45, 0xc5, 0x25, 0xa5, 0x65, 0xe5, 0x15, 0x95, 0x55, 0xd5, 0x35, 0xb5, 0x75, 0xf5,
+            0x0d, 0x8d, 0x4d, 0xcd, 0x2d, 0xad, 0x6d, 0xed, 0x1d, 0x9d, 0x5d, 0xdd, 0x3d, 0xbd, 0x7d, 0xfd,
+            0x03, 0x83, 0x43, 0xc3, 0x23, 0xa3, 0x63, 0xe3, 0x13, 0x93, 0x53, 0xd3, 0x33, 0xb3, 0x73, 0xf3,
+            0x0b, 0x8b, 0x4b, 0xcb, 0x2b, 0xab, 0x6b, 0xeb, 0x1b, 0x9b, 0x5b, 0xdb, 0x3b, 0xbb, 0x7b, 0xfb,
+            0x07, 0x87, 0x47, 0xc7, 0x27, 0xa7, 0x67, 0xe7, 0x17, 0x97, 0x57, 0xd7, 0x37, 0xb7, 0x77, 0xf7,
+            0x0f, 0x8f, 0x4f, 0xcf, 0x2f, 0xaf, 0x6f, 0xef, 0x1f, 0x9f, 0x5f, 0xdf, 0x3f, 0xbf, 0x7f, 0xff,
+        ];
+        reverse_slice_index_bits(&mut input256[..]);
+        assert_eq!(input256, output256);
+    }
+
+    #[test]
+    fn test_apply_to_chunks_exact_fit() {
+        const CHUNK_SIZE: usize = 4;
+        let input: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut results: Vec<Vec<u8>> = Vec::new();
+
+        apply_to_chunks::<CHUNK_SIZE, _, _>(input, |chunk| {
+            results.push(chunk.to_vec());
+        });
+
+        assert_eq!(results, vec![vec![1, 2, 3, 4], vec![5, 6, 7, 8]]);
+    }
+
+    #[test]
+    fn test_apply_to_chunks_with_remainder() {
+        const CHUNK_SIZE: usize = 3;
+        let input: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7];
+        let mut results: Vec<Vec<u8>> = Vec::new();
+
+        apply_to_chunks::<CHUNK_SIZE, _, _>(input, |chunk| {
+            results.push(chunk.to_vec());
+        });
+
+        assert_eq!(results, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+    }
+
+    #[test]
+    fn test_apply_to_chunks_empty_input() {
+        const CHUNK_SIZE: usize = 4;
+        let input: Vec<u8> = vec![];
+        let mut results: Vec<Vec<u8>> = Vec::new();
+
+        apply_to_chunks::<CHUNK_SIZE, _, _>(input, |chunk| {
+            results.push(chunk.to_vec());
+        });
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_apply_to_chunks_single_chunk() {
+        const CHUNK_SIZE: usize = 10;
+        let input: Vec<u8> = vec![1, 2, 3, 4, 5];
+        let mut results: Vec<Vec<u8>> = Vec::new();
+
+        apply_to_chunks::<CHUNK_SIZE, _, _>(input, |chunk| {
+            results.push(chunk.to_vec());
+        });
+
+        assert_eq!(results, vec![vec![1, 2, 3, 4, 5]]);
+    }
+
+    #[test]
+    fn test_apply_to_chunks_large_chunk_size() {
+        const CHUNK_SIZE: usize = 100;
+        let input: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let mut results: Vec<Vec<u8>> = Vec::new();
+
+        apply_to_chunks::<CHUNK_SIZE, _, _>(input, |chunk| {
+            results.push(chunk.to_vec());
+        });
+
+        assert_eq!(results, vec![vec![1, 2, 3, 4, 5, 6, 7, 8]]);
+    }
+
+    #[test]
+    fn test_apply_to_chunks_large_input() {
+        const CHUNK_SIZE: usize = 5;
+        let input: Vec<u8> = (1..=20).collect();
+        let mut results: Vec<Vec<u8>> = Vec::new();
+
+        apply_to_chunks::<CHUNK_SIZE, _, _>(input, |chunk| {
+            results.push(chunk.to_vec());
+        });
+
+        assert_eq!(
+            results,
+            vec![
+                vec![1, 2, 3, 4, 5],
+                vec![6, 7, 8, 9, 10],
+                vec![11, 12, 13, 14, 15],
+                vec![16, 17, 18, 19, 20]
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reverse_slice_index_bits_random() {
+        let lengths = [32, 128, 1 << 16];
+        let mut rng = SmallRng::seed_from_u64(1);
+        for _ in 0..32 {
+            for &length in &lengths {
+                let mut rand_list: Vec<u32> = Vec::with_capacity(length);
+                rand_list.resize_with(length, || rng.random());
+                let expect = reverse_index_bits_naive(&rand_list);
+
+                let mut actual = rand_list.clone();
+                reverse_slice_index_bits(&mut actual);
+
+                assert_eq!(actual, expect);
+            }
+        }
+    }
+
+    #[test]
+    fn test_log2_strict_usize_edge_cases() {
+        assert_eq!(log2_strict_usize(1), 0);
+        assert_eq!(log2_strict_usize(2), 1);
+        assert_eq!(log2_strict_usize(1 << 18), 18);
+        assert_eq!(log2_strict_usize(1 << 31), 31);
+        assert_eq!(
+            log2_strict_usize(1 << (usize::BITS - 1)),
+            usize::BITS as usize - 1
+        );
+    }
+
+    #[test]
+    fn test_checked_pow2() {
+        // 2^0 = 1, the smallest valid exponent.
+        assert_eq!(checked_pow2(0), Some(1));
+
+        // 2^1 = 2.
+        assert_eq!(checked_pow2(1), Some(2));
+
+        // 2^5 = 32, a typical small power.
+        assert_eq!(checked_pow2(5), Some(32));
+
+        // 2^10 = 1024, commonly used as a domain size in FRI.
+        assert_eq!(checked_pow2(10), Some(1024));
+
+        // 2^20 = 1_048_576, a realistic large trace length.
+        assert_eq!(checked_pow2(20), Some(1_048_576));
+
+        // Largest representable power: 2^(BITS - 1).
+        // On a 64-bit platform this is 2^63 = 0x8000_0000_0000_0000.
+        let max_exp = usize::BITS as usize - 1;
+        assert_eq!(checked_pow2(max_exp), Some(1usize << max_exp));
+
+        // Exponent equal to the bit width would shift 1 out of range.
+        //
+        //     1_usize << 64  (on 64-bit)  →  overflow
+        //
+        // Must return `None`.
+        assert_eq!(checked_pow2(usize::BITS as usize), None);
+
+        // One past the maximum: also out of range.
+        assert_eq!(checked_pow2(usize::BITS as usize + 1), None);
+
+        // Extreme exponent: usize::MAX is astronomically beyond
+        // representable range — must return `None`.
+        assert_eq!(checked_pow2(usize::MAX), None);
+    }
+
+    #[test]
+    fn test_checked_log_size_sum() {
+        // Both zero: 0 + 0 = 0, 2^0 = 1.
+        assert_eq!(checked_log_size_sum(0, 0), Some((0, 1)));
+
+        // Identity cases: adding zero to either side is a no-op.
+        assert_eq!(checked_log_size_sum(5, 0), Some((5, 32)));
+        assert_eq!(checked_log_size_sum(0, 10), Some((10, 1024)));
+
+        // Typical FRI scenario: degree_bits=10, log_quotient_chunks=2.
+        //
+        //     10 + 2 = 12,  2^12 = 4096
+        assert_eq!(checked_log_size_sum(10, 2), Some((12, 4096)));
+
+        // Commutativity: order of operands must not matter.
+        assert_eq!(checked_log_size_sum(2, 10), Some((12, 4096)));
+
+        // Large realistic case: degree_bits=20, log_chunks=3.
+        //
+        //     20 + 3 = 23,  2^23 = 8_388_608
+        assert_eq!(checked_log_size_sum(20, 3), Some((23, 8_388_608)));
+
+        // Largest representable sum: (BITS - 2) + 1 = BITS - 1.
+        let almost_max = usize::BITS as usize - 2;
+        let max_exp = usize::BITS as usize - 1;
+        assert_eq!(
+            checked_log_size_sum(almost_max, 1),
+            Some((max_exp, 1usize << max_exp))
+        );
+
+        // Sum exactly at the bit width: overflows the shift.
+        //
+        //     (BITS - 1) + 1 = BITS  →  2^BITS is unrepresentable  →  None
+        assert_eq!(checked_log_size_sum(max_exp, 1), None);
+
+        // Both operands large but sum still within range.
+        //
+        //     32 + 31 = 63  (on 64-bit)  →  2^63 is representable
+        let half = usize::BITS as usize / 2;
+        let other_half = max_exp - half;
+        assert_eq!(
+            checked_log_size_sum(half, other_half),
+            Some((max_exp, 1usize << max_exp))
+        );
+
+        // Addition itself overflows usize, not just the shift.
+        //
+        //     usize::MAX + 1  →  checked_add returns None  →  None
+        assert_eq!(checked_log_size_sum(usize::MAX, 1), None);
+
+        // Both operands at usize::MAX: addition doubly overflows.
+        assert_eq!(checked_log_size_sum(usize::MAX, usize::MAX), None);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_log2_strict_usize_zero() {
+        let _ = log2_strict_usize(0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_log2_strict_usize_nonpower_2() {
+        let _ = log2_strict_usize(0x78c341c65ae6d262);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_log2_strict_usize_max() {
+        let _ = log2_strict_usize(usize::MAX);
+    }
+
+    #[test]
+    fn test_log3_strict_powers_of_3() {
+        // Test all powers of 3 up to 3^12 = 531441.
+        assert_eq!(log3_strict_usize(1), 0);
+        assert_eq!(log3_strict_usize(3), 1);
+        assert_eq!(log3_strict_usize(9), 2);
+        assert_eq!(log3_strict_usize(27), 3);
+        assert_eq!(log3_strict_usize(81), 4);
+        assert_eq!(log3_strict_usize(243), 5);
+        assert_eq!(log3_strict_usize(729), 6);
+        assert_eq!(log3_strict_usize(2187), 7);
+        assert_eq!(log3_strict_usize(6561), 8);
+        assert_eq!(log3_strict_usize(19683), 9);
+        assert_eq!(log3_strict_usize(59049), 10);
+        assert_eq!(log3_strict_usize(177_147), 11);
+        assert_eq!(log3_strict_usize(531_441), 12);
+    }
+
+    #[test]
+    #[should_panic(expected = "input must be non-zero")]
+    fn test_log3_strict_panics_on_zero() {
+        let _ = log3_strict_usize(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a power of 3")]
+    fn test_log3_strict_panics_on_non_power_of_3() {
+        // 2 is not a power of 3.
+        let _ = log3_strict_usize(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a power of 3")]
+    fn test_log3_strict_panics_on_power_of_2() {
+        // 8 = 2^3 is not a power of 3.
+        let _ = log3_strict_usize(8);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a power of 3")]
+    fn test_log3_strict_panics_on_product_with_other_primes() {
+        // 6 = 2 * 3 is not a power of 3.
+        let _ = log3_strict_usize(6);
+    }
+
+    proptest! {
+        #[test]
+        fn test_log3_strict_roundtrip(k in 0u32..25u32) {
+            // Roundtrip: 3^k -> log3_strict_usize -> k
+            let n = 3usize.pow(k);
+            assert_eq!(log3_strict_usize(n), k as usize);
+        }
+    }
+
+    #[test]
+    fn test_log2_ceil_usize_comprehensive() {
+        // Powers of 2
+        assert_eq!(log2_ceil_usize(0), 0);
+        assert_eq!(log2_ceil_usize(1), 0);
+        assert_eq!(log2_ceil_usize(2), 1);
+        assert_eq!(log2_ceil_usize(1 << 18), 18);
+        assert_eq!(log2_ceil_usize(1 << 31), 31);
+        assert_eq!(
+            log2_ceil_usize(1 << (usize::BITS - 1)),
+            usize::BITS as usize - 1
+        );
+
+        // Nonpowers; want to round up
+        assert_eq!(log2_ceil_usize(3), 2);
+        assert_eq!(log2_ceil_usize(0x14fe901b), 29);
+        assert_eq!(
+            log2_ceil_usize((1 << (usize::BITS - 1)) + 1),
+            usize::BITS as usize
+        );
+        assert_eq!(log2_ceil_usize(usize::MAX - 1), usize::BITS as usize);
+        assert_eq!(log2_ceil_usize(usize::MAX), usize::BITS as usize);
+    }
+
+    fn reverse_index_bits_naive<T: Copy>(arr: &[T]) -> Vec<T> {
+        let n = arr.len();
+        let n_power = log2_strict_usize(n);
+
+        let mut out = vec![None; n];
+        for (i, v) in arr.iter().enumerate() {
+            let dst = i.reverse_bits() >> (usize::BITS - n_power as u32);
+            out[dst] = Some(*v);
+        }
+
+        out.into_iter().map(|x| x.unwrap()).collect()
+    }
+
+    #[test]
+    fn test_relatively_prime_u64() {
+        // Zero cases (should always return false)
+        assert!(!relatively_prime_u64(0, 0));
+        assert!(!relatively_prime_u64(10, 0));
+        assert!(!relatively_prime_u64(0, 10));
+        assert!(!relatively_prime_u64(0, 123456789));
+
+        // Number with itself (if greater than 1, not relatively prime)
+        assert!(relatively_prime_u64(1, 1));
+        assert!(!relatively_prime_u64(10, 10));
+        assert!(!relatively_prime_u64(99999, 99999));
+
+        // Powers of 2 (always false since they share factor 2)
+        assert!(!relatively_prime_u64(2, 4));
+        assert!(!relatively_prime_u64(16, 32));
+        assert!(!relatively_prime_u64(64, 128));
+        assert!(!relatively_prime_u64(1024, 4096));
+        assert!(!relatively_prime_u64(u64::MAX, u64::MAX));
+
+        // One number is a multiple of the other (always false)
+        assert!(!relatively_prime_u64(5, 10));
+        assert!(!relatively_prime_u64(12, 36));
+        assert!(!relatively_prime_u64(15, 45));
+        assert!(!relatively_prime_u64(100, 500));
+
+        // Co-prime numbers (should be true)
+        assert!(relatively_prime_u64(17, 31));
+        assert!(relatively_prime_u64(97, 43));
+        assert!(relatively_prime_u64(7919, 65537));
+        assert!(relatively_prime_u64(15485863, 32452843));
+
+        // Small prime numbers (should be true)
+        assert!(relatively_prime_u64(13, 17));
+        assert!(relatively_prime_u64(101, 103));
+        assert!(relatively_prime_u64(1009, 1013));
+
+        // Large numbers (some cases where they are relatively prime or not)
+        assert!(!relatively_prime_u64(
+            190266297176832000,
+            10430732356495263744
+        ));
+        assert!(!relatively_prime_u64(
+            2040134905096275968,
+            5701159354248194048
+        ));
+        assert!(!relatively_prime_u64(
+            16611311494648745984,
+            7514969329383038976
+        ));
+        assert!(!relatively_prime_u64(
+            14863931409971066880,
+            7911906750992527360
+        ));
+
+        // Max values
+        assert!(relatively_prime_u64(u64::MAX, 1));
+        assert!(relatively_prime_u64(u64::MAX, u64::MAX - 1));
+        assert!(!relatively_prime_u64(u64::MAX, u64::MAX));
+    }
+}

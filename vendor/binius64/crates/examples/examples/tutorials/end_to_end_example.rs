@@ -1,0 +1,78 @@
+// Copyright 2025 Irreducible Inc.
+
+//! End-to-End Example
+//!
+//! A complete example showing circuit building, witness generation,
+//! constraint verification, proof generation, and proof verification.
+//!
+//! Guide: https://www.binius.xyz/building/
+
+use binius_circuits::{fixed_byte_vec::ByteVec, sha256::sha256_varlen};
+use binius_core::word::Word;
+use binius_frontend::CircuitBuilder;
+use binius_hash::StdHashSuite;
+use binius_prover::{OptimalPackedB128, Prover};
+use binius_transcript::{ProverTranscript, VerifierTranscript};
+use binius_verifier::{Verifier, config::StdChallenger};
+use sha2::{Digest, Sha256 as StdSha256};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let builder = CircuitBuilder::new();
+
+	// 4 witness words: the message the prover keeps secret.
+	let content: [_; 4] = core::array::from_fn(|_| builder.add_witness());
+	// 4 witness words: the nonce that blinds the content inside the hash.
+	let nonce: [_; 4] = core::array::from_fn(|_| builder.add_witness());
+	// 4 public words: the digest that prover and verifier both know.
+	let commitment: [_; 4] = core::array::from_fn(|_| builder.add_inout());
+
+	let data: Vec<_> = content.into_iter().chain(nonce).collect();
+	let len_bytes = builder.add_witness();
+	let message = ByteVec::new(data, len_bytes);
+	let computed = sha256_varlen(&builder, &message);
+	for i in 0..4 {
+		builder.assert_eq(format!("commitment[{i}]"), computed[i], commitment[i]);
+	}
+	let circuit = builder.build();
+
+	let mut witness = circuit.new_witness_filler();
+
+	let mut content_bytes = [0u8; 32];
+	content_bytes[..32].copy_from_slice(&b"A secret, exactly 32 bytes long."[..]);
+	let nonce_bytes: [u8; 32] = rand::random();
+	let mut message_bytes = [0u8; 64];
+	message_bytes[..32].copy_from_slice(&content_bytes);
+	message_bytes[32..].copy_from_slice(&nonce_bytes);
+	message.populate_data(&mut witness, &message_bytes);
+	message.populate_len_bytes(&mut witness, message_bytes.len());
+
+	let digest = StdSha256::digest(message_bytes);
+	for (i, chunk) in digest.chunks(8).enumerate() {
+		witness[commitment[i]] = Word(u64::from_be_bytes(chunk.try_into().unwrap()));
+	}
+
+	circuit.populate_wire_witness(&mut witness)?;
+
+	let cs = circuit.constraint_system();
+	let witness_vec = witness.into_value_vec();
+	cs.verify(&witness_vec)?;
+
+	println!("✓ the wire values you populated satisfy the circuit's constraints");
+
+	let verifier = Verifier::<StdHashSuite>::setup(cs.clone(), 1)?;
+	let prover = Prover::<OptimalPackedB128, StdHashSuite>::setup(verifier.clone())?;
+
+	let challenger = StdChallenger::default();
+	let mut prover_transcript = ProverTranscript::new(challenger.clone());
+	let inout_words = witness_vec.inout().to_vec();
+	prover.prove(&witness_vec, &mut prover_transcript)?;
+	let proof = prover_transcript.finalize();
+
+	let mut verifier_transcript = VerifierTranscript::new(challenger, proof);
+	verifier.verify(&inout_words, &mut verifier_transcript)?;
+	verifier_transcript.finalize()?;
+
+	println!("✓ proof successfully verified");
+
+	Ok(())
+}

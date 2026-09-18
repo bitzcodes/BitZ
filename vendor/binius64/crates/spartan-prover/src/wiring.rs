@@ -1,0 +1,541 @@
+// Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
+
+use binius_compute::{Allocator, CollectIntoAllocVec, VecLike};
+use binius_field::{Field, PackedField};
+use binius_math::{FieldBuffer, FieldSlice, FieldVec};
+use binius_spartan_frontend::constraint_system::{
+	MulConstraint, Operand, WitnessIndex, WitnessSegment,
+};
+use binius_utils::{checked_arithmetics::checked_log_2, rayon::prelude::*};
+
+/// Transpose of a wiring sparse matrix for a specific witness segment.
+///
+/// Indexes witness wires of a given segment. The segment's padded size determines
+/// the buffer dimensions.
+#[derive(Debug)]
+pub struct WiringTranspose {
+	flat_keys: Vec<Key>,
+	keys_start: Vec<u32>,
+	log_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Key {
+	pub operand_idx: u8,
+	pub constraint_idx: u32,
+}
+
+impl WiringTranspose {
+	/// Build a transposed wiring matrix for a specific witness segment.
+	pub fn transpose(
+		segment: WitnessSegment,
+		segment_size: usize,
+		mul_constraints: &[MulConstraint<WitnessIndex>],
+	) -> Self {
+		let mut keys_by_idx = vec![Vec::new(); segment_size];
+
+		let mut n_total_keys = 0;
+		for (i, MulConstraint { a, b, c }) in mul_constraints.iter().enumerate() {
+			for (operand_idx, operand) in [a, b, c].into_iter().enumerate() {
+				for &witness_idx in operand.wires() {
+					if witness_idx.segment == segment {
+						keys_by_idx[witness_idx.index as usize].push(Key {
+							operand_idx: operand_idx as u8,
+							constraint_idx: i as u32,
+						});
+						n_total_keys += 1;
+					}
+				}
+			}
+		}
+
+		// Flatten the sparse matrix representation.
+		let mut flat_keys = Vec::with_capacity(n_total_keys);
+		let mut keys_start = Vec::with_capacity(segment_size);
+		for keys in keys_by_idx {
+			let start = flat_keys.len() as u32;
+			flat_keys.extend(keys);
+			keys_start.push(start);
+		}
+
+		let log_size = checked_log_2(segment_size);
+
+		Self {
+			flat_keys,
+			keys_start,
+			log_size,
+		}
+	}
+
+	pub const fn log_size(&self) -> usize {
+		self.log_size
+	}
+
+	pub const fn size(&self) -> usize {
+		1 << self.log_size
+	}
+
+	/// Returns the keys for a specific witness index within the segment.
+	pub fn keys_for(&self, idx: usize) -> &[Key] {
+		let start = self.keys_start[idx] as usize;
+		let end = self
+			.keys_start
+			.get(idx + 1)
+			.map(|&x| x as usize)
+			.unwrap_or(self.flat_keys.len());
+		&self.flat_keys[start..end]
+	}
+}
+
+/// Folds the wiring matrix along the constraint axis by partially evaluating at r_x.
+///
+/// Also batches the three operands (a, b, c) using powers of lambda.
+/// Returns a multilinear polynomial over witness indices where each coefficient is the
+/// weighted sum of constraint contributions.
+/// `r_x_tensor` is the equality indicator expanded at r_x.
+/// Accepting it as a parameter avoids recomputing it for every segment sharing that r_x.
+///
+/// The folded polynomial is drawn from `alloc`: it is the transparent multilinear of an oracle
+/// relation, which the channel owns until the opening runs.
+pub fn fold_constraints<A: Allocator, F: Field, P: PackedField<Scalar = F>>(
+	alloc: &A,
+	transposed: &WiringTranspose,
+	lambda: F,
+	r_x_tensor: &[F],
+) -> FieldVec<P, A> {
+	// Batching powers for the three operands
+	let lambda_powers = [F::ONE, lambda, lambda.square()];
+
+	let segment_size = transposed.size();
+	let log_size = transposed.log_size();
+	let len = 1 << log_size.saturating_sub(P::LOG_WIDTH);
+
+	// Build the packed words in parallel, straight into a buffer drawn from the allocator.
+	let result = (0..len)
+		.into_par_iter()
+		.map(|packed_idx| {
+			let base_idx = packed_idx << P::LOG_WIDTH;
+
+			P::from_fn(|scalar_idx| {
+				let idx = base_idx + scalar_idx;
+				if idx >= segment_size {
+					return F::ZERO;
+				}
+
+				let mut acc = F::ZERO;
+				for key in transposed.keys_for(idx) {
+					let r_x_weight = r_x_tensor[key.constraint_idx as usize];
+					let lambda_weight = lambda_powers[key.operand_idx as usize];
+					acc += r_x_weight * lambda_weight;
+				}
+				acc
+			})
+		})
+		.collect_into_alloc_vec(alloc);
+
+	FieldBuffer::new(log_size, result)
+}
+
+/// Witness data for multiplication constraint checking.
+///
+/// Contains the evaluated operands a, b, and c for all multiplication constraints,
+/// packed into field buffers for efficient processing.
+pub struct MulCheckWitness<A: Allocator, P: PackedField> {
+	pub a: FieldVec<P, A>,
+	pub b: FieldVec<P, A>,
+	pub c: FieldVec<P, A>,
+}
+
+/// Evaluates an operand by XORing witness values at the specified indices.
+fn eval_operand<F: Field, P: PackedField<Scalar = F>>(
+	public: &[F],
+	precommit_packed: &FieldSlice<'_, P>,
+	private_packed: &FieldSlice<'_, P>,
+	operand: &Operand<WitnessIndex>,
+) -> F {
+	operand
+		.wires()
+		.iter()
+		.map(|idx| match idx.segment {
+			WitnessSegment::Public => public[idx.index as usize],
+			WitnessSegment::Precommit => precommit_packed.get(idx.index as usize),
+			WitnessSegment::Private => private_packed.get(idx.index as usize),
+		})
+		.sum()
+}
+
+/// Builds the witness for multiplication constraint checking.
+///
+/// Extracts and packs the a, b, and c operand values for each multiplication constraint.
+/// This is analogous to `build_bitand_witness` in binius-prover but works with B128
+/// field elements instead of word-level operations.
+#[tracing::instrument(skip_all, level = "debug")]
+pub fn build_mulcheck_witness<A: Allocator, F: Field, P: PackedField<Scalar = F>>(
+	alloc: &A,
+	mul_constraints: &[MulConstraint<WitnessIndex>],
+	public: &[F],
+	precommit_packed: FieldSlice<'_, P>,
+	private_packed: FieldSlice<'_, P>,
+) -> MulCheckWitness<A, P> {
+	const fn get_a(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
+		&c.a
+	}
+	const fn get_b(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
+		&c.b
+	}
+	const fn get_c(c: &MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex> {
+		&c.c
+	}
+
+	let n_constraints = mul_constraints.len();
+	assert!(n_constraints > 0, "mul_constraints must not be empty");
+
+	let log_n_constraints = checked_log_2(n_constraints);
+
+	let len = 1 << log_n_constraints.saturating_sub(P::LOG_WIDTH);
+	let mut a = alloc.alloc::<P>(len);
+	let mut b = alloc.alloc::<P>(len);
+	let mut c = alloc.alloc::<P>(len);
+
+	// Fill the packed words in parallel through the allocated buffers' spare capacity, then commit
+	// the lengths once every word has been written.
+	(
+		mul_constraints.par_chunks(P::WIDTH),
+		a.spare_capacity_mut(),
+		b.spare_capacity_mut(),
+		c.spare_capacity_mut(),
+	)
+		.into_par_iter()
+		.for_each(|(constraints_chunk, a_i, b_i, c_i)| {
+			for (dst, get_operand) in [
+				(a_i, get_a as fn(&MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex>),
+				(b_i, get_b as fn(&MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex>),
+				(c_i, get_c as fn(&MulConstraint<WitnessIndex>) -> &Operand<WitnessIndex>),
+			] {
+				let val = P::from_iter(constraints_chunk.iter().map(|constraint| {
+					eval_operand(
+						public,
+						&precommit_packed,
+						&private_packed,
+						get_operand(constraint),
+					)
+				}));
+				dst.write(val);
+			}
+		});
+
+	// SAFETY: the loop above initialized every one of the `len` spare words of each buffer.
+	unsafe {
+		a.set_len(len);
+		b.set_len(len);
+		c.set_len(len);
+	}
+
+	MulCheckWitness {
+		a: FieldBuffer::new(log_n_constraints, a),
+		b: FieldBuffer::new(log_n_constraints, b),
+		c: FieldBuffer::new(log_n_constraints, c),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use binius_compute::GlobalAllocator;
+	use binius_field::{Field, Ghash128b as B128, Random};
+	use binius_math::{
+		multilinear::{eq::eq_ind_partial_eval, evaluate::evaluate},
+		test_utils::{Packed128b, random_scalars},
+		univariate::evaluate_univariate,
+	};
+	use binius_spartan_frontend::constraint_system::{
+		MulConstraint, Operand, WitnessIndex, WitnessSegment,
+	};
+	use binius_spartan_verifier::wiring::evaluate_segment_wiring_mle;
+	use rand::prelude::*;
+	use smallvec::SmallVec;
+
+	use super::*;
+
+	/// Generate random MulConstraints for testing.
+	/// Each operand has 0-4 random wires.
+	fn generate_random_constraints(
+		rng: &mut StdRng,
+		n_constraints: usize,
+		public_size: usize,
+		private_size: usize,
+	) -> Vec<MulConstraint<WitnessIndex>> {
+		(0..n_constraints)
+			.map(|_| {
+				let a = generate_random_operand(rng, public_size, private_size);
+				let b = generate_random_operand(rng, public_size, private_size);
+				let c = generate_random_operand(rng, public_size, private_size);
+				MulConstraint { a, b, c }
+			})
+			.collect()
+	}
+
+	fn generate_random_operand(
+		rng: &mut StdRng,
+		public_size: usize,
+		private_size: usize,
+	) -> Operand<WitnessIndex> {
+		let total = public_size + private_size;
+		let n_wires = rng.random_range(0..=4);
+		let wires: SmallVec<[WitnessIndex; 4]> = (0..n_wires)
+			.map(|_| {
+				let flat = rng.random_range(0..total);
+				if flat < public_size {
+					WitnessIndex::public(flat as u32)
+				} else {
+					WitnessIndex::private((flat - public_size) as u32)
+				}
+			})
+			.collect();
+		Operand::new(wires)
+	}
+
+	/// Evaluate the wiring MLE using the transposed representation.
+	fn evaluate_wiring_mle_transposed<F: Field>(
+		transposed: &WiringTranspose,
+		lambda: F,
+		r_x_tensor: &[F],
+		r_y_tensor: &[F],
+	) -> F {
+		let mut acc = [F::ZERO; 3];
+
+		for idx in 0..transposed.size() {
+			let r_y_weight = r_y_tensor[idx];
+			for key in transposed.keys_for(idx) {
+				let r_x_weight = r_x_tensor[key.constraint_idx as usize];
+				acc[key.operand_idx as usize] += r_x_weight * r_y_weight;
+			}
+		}
+
+		evaluate_univariate(&acc, &lambda)
+	}
+
+	#[test]
+	fn test_wiring_transpose_equivalence() {
+		let mut rng = StdRng::seed_from_u64(0);
+
+		let log_n_constraints = 4;
+		let log_public = 3;
+		let log_private = 5;
+
+		let n_constraints = 1 << log_n_constraints;
+		let public_size = 1 << log_public;
+		let private_size = 1 << log_private;
+
+		let constraints =
+			generate_random_constraints(&mut rng, n_constraints, public_size, private_size);
+
+		// Sample random evaluation points
+		let r_x = random_scalars::<B128>(&mut rng, log_n_constraints);
+		let r_y = random_scalars::<B128>(&mut rng, log_private);
+		let lambda = B128::random(&mut rng);
+
+		// Compute the eq indicator tensors
+		let r_x_tensor = eq_ind_partial_eval::<B128>(&r_x);
+		let r_y_tensor = eq_ind_partial_eval::<B128>(&r_y);
+
+		// Compute expected result using the verifier's reference implementation
+		let expected = evaluate_segment_wiring_mle(
+			&constraints,
+			WitnessSegment::Private,
+			&lambda,
+			r_x_tensor.as_ref(),
+			&r_y,
+		);
+
+		// Compute result using the transposed representation
+		let transposed =
+			WiringTranspose::transpose(WitnessSegment::Private, private_size, &constraints);
+		let actual = evaluate_wiring_mle_transposed(
+			&transposed,
+			lambda,
+			r_x_tensor.as_ref(),
+			r_y_tensor.as_ref(),
+		);
+
+		assert_eq!(actual, expected, "Transposed evaluation does not match original evaluation");
+	}
+
+	#[test]
+	fn test_fold_constraints_equivalence() {
+		let mut rng = StdRng::seed_from_u64(0);
+
+		let log_n_constraints = 4;
+		let log_public = 3;
+		let log_private = 5;
+
+		let n_constraints = 1 << log_n_constraints;
+		let public_size = 1 << log_public;
+		let private_size = 1 << log_private;
+
+		let constraints =
+			generate_random_constraints(&mut rng, n_constraints, public_size, private_size);
+
+		// Sample random evaluation points
+		let r_x = random_scalars::<B128>(&mut rng, log_n_constraints);
+		let r_y = random_scalars::<B128>(&mut rng, log_private);
+		let lambda = B128::random(&mut rng);
+
+		let r_x_tensor = eq_ind_partial_eval::<B128>(&r_x);
+
+		// Method 1: Compute expected result using evaluate_segment_wiring_mle
+		let expected = evaluate_segment_wiring_mle(
+			&constraints,
+			WitnessSegment::Private,
+			&lambda,
+			r_x_tensor.as_ref(),
+			&r_y,
+		);
+
+		// Method 2: Use fold_constraints then evaluate at r_y
+		let transposed =
+			WiringTranspose::transpose(WitnessSegment::Private, private_size, &constraints);
+		let folded = fold_constraints::<_, _, Packed128b>(
+			&GlobalAllocator,
+			&transposed,
+			lambda,
+			r_x_tensor.as_ref(),
+		);
+		let actual = evaluate(&folded, &r_y);
+
+		assert_eq!(
+			actual, expected,
+			"fold_constraints + evaluate does not match evaluate_segment_wiring_mle"
+		);
+	}
+
+	#[test]
+	fn test_wiring_prove_verify() {
+		use binius_hash::StdDigest;
+		use binius_iop::channel::{IOPVerifierChannel, OracleSpec, naive::NaiveVerifierChannel};
+		use binius_iop_prover::channel::{IOPProverChannel, naive::NaiveProverChannel};
+		use binius_ip::channel::IPVerifierChannel;
+		use binius_ip_prover::channel::IPProverChannel;
+		use binius_math::{
+			inner_product::inner_product_buffers, multilinear::evaluate::evaluate,
+			test_utils::random_field_buffer,
+		};
+		use binius_spartan_verifier::wiring::evaluate_wiring_mle_public;
+		use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
+
+		type StdChallenger = HasherChallenger<StdDigest>;
+
+		let mut rng = StdRng::seed_from_u64(0);
+
+		// Parameters
+		let log_n_constraints = 4;
+		let log_public = 3;
+		let log_private = 5;
+
+		let n_constraints = 1 << log_n_constraints;
+		let public_size = 1 << log_public;
+		let private_size = 1 << log_private;
+
+		// Generate random constraints
+		let constraints =
+			generate_random_constraints(&mut rng, n_constraints, public_size, private_size);
+
+		// Create random public, precommit, and private witness buffers
+		let public = random_scalars::<B128>(&mut rng, public_size);
+		let precommit_buf = random_field_buffer::<Packed128b>(&mut rng, 0); // empty precommit
+		let private_buf = random_field_buffer::<Packed128b>(&mut rng, log_private);
+
+		// Compute mulcheck witness
+		let mulcheck_witness = build_mulcheck_witness(
+			&GlobalAllocator,
+			&constraints,
+			&public,
+			precommit_buf.as_view(),
+			private_buf.as_view(),
+		);
+
+		// Sample r_x (sumcheck evaluation point for constraint axis)
+		let r_x = random_scalars::<B128>(&mut rng, log_n_constraints);
+
+		// Compute mulcheck evaluations at r_x
+		let r_x_tensor = eq_ind_partial_eval::<Packed128b>(&r_x);
+		let mulcheck_evals = [
+			inner_product_buffers(&mulcheck_witness.a, &r_x_tensor),
+			inner_product_buffers(&mulcheck_witness.b, &r_x_tensor),
+			inner_product_buffers(&mulcheck_witness.c, &r_x_tensor),
+		];
+
+		// Create transposed wiring
+		let wiring_transpose =
+			WiringTranspose::transpose(WitnessSegment::Private, private_size, &constraints);
+
+		let oracle_specs = vec![OracleSpec::new_zk(log_private)];
+
+		// === PROVER SIDE ===
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		let mut prover_channel =
+			NaiveProverChannel::<B128, _>::new(&mut prover_transcript, oracle_specs.clone());
+
+		// Send private witness oracle
+		let witness_oracle = prover_channel.send_oracle(private_buf.as_view());
+
+		// Sample lambda
+		let lambda: B128 = prover_channel.sample();
+
+		// Compute r_x_tensor once
+		let r_x_tensor = eq_ind_partial_eval::<B128>(&r_x);
+
+		// Compute the batched sum and public contribution
+		let batched_sum = evaluate_univariate(&mulcheck_evals, &lambda);
+		let public_eval =
+			evaluate_wiring_mle_public(&constraints, &public, &lambda, r_x_tensor.as_ref());
+		let trace_claim = batched_sum - public_eval;
+
+		// Fold constraints to get the private wiring polynomial
+		let wiring_poly = fold_constraints::<_, _, Packed128b>(
+			&GlobalAllocator,
+			&wiring_transpose,
+			lambda,
+			r_x_tensor.as_ref(),
+		);
+
+		// Finish the IOP with the oracle relation
+		prover_channel.prove_oracle_relation(witness_oracle, wiring_poly.clone(), trace_claim);
+		prover_channel.finalize_oracle(witness_oracle, private_buf);
+
+		// === VERIFIER SIDE ===
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		let mut verifier_channel =
+			NaiveVerifierChannel::<B128, _>::new(&mut verifier_transcript, &oracle_specs);
+
+		// Receive witness oracle
+		let witness_oracle = verifier_channel
+			.recv_oracle(log_private, true)
+			.expect("recv_oracle should succeed");
+
+		// Sample the same lambda as prover
+		let verifier_lambda: B128 = verifier_channel.sample();
+
+		// Compute the same claim on the verifier side
+		let verifier_batched_sum = evaluate_univariate(&mulcheck_evals, &verifier_lambda);
+		let verifier_r_x_tensor = eq_ind_partial_eval::<B128>(&r_x);
+		let verifier_public_eval = evaluate_wiring_mle_public(
+			&constraints,
+			&public,
+			&verifier_lambda,
+			verifier_r_x_tensor.as_ref(),
+		);
+		let verifier_trace_claim = verifier_batched_sum - verifier_public_eval;
+
+		// Verify that prover and verifier computed the same trace_claim
+		assert_eq!(trace_claim, verifier_trace_claim, "Prover and verifier trace_claim mismatch");
+
+		// Build the transparent closure using the prover's wiring_poly for evaluation.
+		let transparent = Box::new(move |point: &[_]| evaluate(&wiring_poly, point));
+
+		// Finish verification.
+		verifier_channel
+			.verify_oracle_relation(witness_oracle, transparent, verifier_trace_claim)
+			.expect("verify_oracle_relation should succeed (inner product verified)");
+	}
+}

@@ -1,0 +1,904 @@
+// Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
+use std::{fs, path::Path};
+
+use anyhow::Result;
+use binius_core::constraint_system::{ConstraintSystem, Proof, ValueVec, ValuesData, ValuesRef};
+use binius_frontend::{CircuitBuilder, CircuitStat};
+use binius_hash::{Blake3HashSuite, StdHashSuite};
+use binius_hash_prover::ParallelHashSuite;
+use binius_utils::serialization::{DeserializeBytes, SerializeBytes};
+use clap::{Arg, ArgMatches, Args, Command, FromArgMatches};
+use digest::Output;
+
+use crate::{
+	ExampleCircuit, HashSuiteType, check_proof, check_proof_zk, create_proof, create_proof_zk,
+	prove_verify, setup, setup_verifier, setup_zk, setup_zk_verifier,
+};
+
+/// Write raw bytes to the given path, creating the parent directory if it is missing.
+///
+/// Naming an output under a directory that does not exist yet is the common case here.
+/// So the directory is created rather than reported as an error.
+fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
+	// A bare filename has an empty parent, which needs no directory created.
+	if let Some(parent) = Path::new(path).parent()
+		&& !parent.as_os_str().is_empty()
+	{
+		fs::create_dir_all(parent).map_err(|e| {
+			anyhow::anyhow!("Failed to create directory '{}': {}", parent.display(), e)
+		})?;
+	}
+	fs::write(path, bytes)
+		.map_err(|e| anyhow::anyhow!("Failed to write serialized data to '{}': {}", path, e))
+}
+
+/// Serialize a value implementing `SerializeBytes` and write it to the given path.
+fn write_serialized<T: SerializeBytes>(value: &T, path: &str) -> Result<()> {
+	let mut buf: Vec<u8> = Vec::new();
+	value.serialize(&mut buf)?;
+	write_file(path, &buf)
+}
+
+/// Deserialize a value implementing `DeserializeBytes` from the given path.
+fn read_deserialized<T: DeserializeBytes>(path: &str) -> Result<T> {
+	let buf =
+		fs::read(path).map_err(|e| anyhow::anyhow!("Failed to read file '{}': {}", path, e))?;
+	T::deserialize(buf.as_slice())
+		.map_err(|e| anyhow::anyhow!("Failed to deserialize data from '{}': {}", path, e))
+}
+
+/// Log the proof size and, if `output` is `Some`, serialize and write the proof to that path.
+fn maybe_write_proof(proof_bytes: &[u8], output: Option<&str>) -> Result<()> {
+	tracing::info!("Proof size: {} KiB", proof_bytes.len() / 1024);
+	if let Some(path) = output {
+		use binius_verifier::config::{ChallengerWithName, StdChallenger};
+		let proof = Proof::owned(proof_bytes.to_vec(), StdChallenger::NAME.to_string());
+		write_serialized(&proof, path)?;
+		tracing::info!("Proof written to '{}'", path);
+	}
+	Ok(())
+}
+
+/// Prove and verify with the given `HashSuite`, branching on `zk`.
+fn prove_with_hash_suite<H>(
+	cs: ConstraintSystem,
+	log_inv_rate: usize,
+	zk: bool,
+	message: Option<&[u8]>,
+	witness: &ValueVec,
+	output: Option<&str>,
+) -> Result<()>
+where
+	H: ParallelHashSuite + Clone,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	if zk {
+		let (verifier, prover) = setup_zk::<H>(cs, log_inv_rate)?;
+		let proof_bytes = create_proof_zk(&prover, witness, message)?;
+		maybe_write_proof(&proof_bytes, output)?;
+		check_proof_zk(&verifier, witness, proof_bytes, message)?;
+	} else {
+		let (verifier, prover) = setup::<H>(cs, log_inv_rate, None)?;
+		let proof_bytes = create_proof(&prover, witness)?;
+		maybe_write_proof(&proof_bytes, output)?;
+		check_proof(&verifier, witness, proof_bytes)?;
+	}
+	Ok(())
+}
+
+/// Verify a proof with the given `HashSuite`, branching on `zk`.
+fn verify_with_hash_suite<H>(
+	cs: ConstraintSystem,
+	log_inv_rate: usize,
+	zk: bool,
+	message: Option<&[u8]>,
+	witness: &ValueVec,
+	proof_bytes: Vec<u8>,
+) -> Result<()>
+where
+	H: ParallelHashSuite + Clone,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	if zk {
+		let verifier = setup_zk_verifier::<H>(cs, log_inv_rate)?;
+		check_proof_zk(&verifier, witness, proof_bytes, message)?;
+	} else {
+		let verifier = setup_verifier::<H>(cs, log_inv_rate)?;
+		check_proof(&verifier, witness, proof_bytes)?;
+	}
+	Ok(())
+}
+
+/// Prove and verify, with the Merkle hash suite chosen at run time.
+///
+/// This is deliberately not generic. A non-generic function is codegen'd once, in this library,
+/// so every example binary links one copy of the proving stack instead of instantiating its own.
+fn prove_dispatch(
+	cs: ConstraintSystem,
+	log_inv_rate: usize,
+	hash_suite: HashSuiteType,
+	zk: bool,
+	message: Option<&[u8]>,
+	witness: &ValueVec,
+	output: Option<&str>,
+) -> Result<()> {
+	match hash_suite {
+		HashSuiteType::Sha256 => {
+			tracing::info!("Using SHA-256 hash suite for Merkle tree");
+			prove_with_hash_suite::<StdHashSuite>(cs, log_inv_rate, zk, message, witness, output)
+		}
+		HashSuiteType::Blake3 => {
+			tracing::info!("Using Blake3 hash suite for Merkle tree");
+			prove_with_hash_suite::<Blake3HashSuite>(cs, log_inv_rate, zk, message, witness, output)
+		}
+	}
+}
+
+/// Verify a proof, with the Merkle hash suite chosen at run time.
+///
+/// Non-generic for the same reason as [`prove_dispatch`].
+fn verify_dispatch(
+	cs: ConstraintSystem,
+	log_inv_rate: usize,
+	hash_suite: HashSuiteType,
+	zk: bool,
+	message: Option<&[u8]>,
+	witness: &ValueVec,
+	proof_bytes: Vec<u8>,
+) -> Result<()> {
+	match hash_suite {
+		HashSuiteType::Sha256 => {
+			tracing::info!("Using SHA-256 hash suite for Merkle tree");
+			verify_with_hash_suite::<StdHashSuite>(
+				cs,
+				log_inv_rate,
+				zk,
+				message,
+				witness,
+				proof_bytes,
+			)
+		}
+		HashSuiteType::Blake3 => {
+			tracing::info!("Using Blake3 hash suite for Merkle tree");
+			verify_with_hash_suite::<Blake3HashSuite>(
+				cs,
+				log_inv_rate,
+				zk,
+				message,
+				witness,
+				proof_bytes,
+			)
+		}
+	}
+}
+
+/// Write whichever of the proving-job artifacts were given a path.
+///
+/// Non-generic for the same reason as [`prove_dispatch`].
+fn save_artifacts(
+	cs: &ConstraintSystem,
+	witness: &ValueVec,
+	cs_path: Option<&str>,
+	pub_witness_path: Option<&str>,
+	non_pub_data_path: Option<&str>,
+	key_collection_path: Option<&str>,
+) -> Result<()> {
+	if let Some(path) = cs_path {
+		write_serialized(cs, path)?;
+		tracing::info!("Constraint system saved to '{}'", path);
+	}
+
+	if let Some(path) = pub_witness_path {
+		// Only the inout values: the constants ride along in the constraint system.
+		write_serialized(&ValuesRef::new(witness.inout()), path)?;
+		tracing::info!("Inout witness saved to '{}'", path);
+	}
+
+	if let Some(path) = non_pub_data_path {
+		write_serialized(&ValuesRef::new(witness.non_public()), path)?;
+		tracing::info!("Non-public witness saved to '{}'", path);
+	}
+
+	if let Some(path) = key_collection_path {
+		let key_collection_scope = tracing::info_span!("Building key collection").entered();
+		let key_collection = binius_prover::protocols::shift::KeyCollection::build(
+			cs,
+			binius_core::constraint_system::InoutSegment::Public,
+		);
+		drop(key_collection_scope);
+		write_serialized(&key_collection, path)?;
+		tracing::info!("Key collection saved to '{}'", path);
+	}
+
+	Ok(())
+}
+
+/// Prove and verify a constraint system and witness read from files.
+///
+/// Nothing here depends on the example circuit, so it lives outside the generic
+/// [`Cli`] impl and is codegen'd once, in this library.
+fn run_load_prove(matches: &ArgMatches) -> Result<()> {
+	// Extract file paths and parameters
+	let cs_path = matches
+		.get_one::<String>("cs_path")
+		.expect("cs_path is required");
+	let pub_witness_path = matches
+		.get_one::<String>("pub_witness_path")
+		.expect("pub_witness_path is required");
+	let non_pub_data_path = matches
+		.get_one::<String>("non_pub_data_path")
+		.expect("non_pub_data_path is required");
+	let key_collection_path = matches.get_one::<String>("key_collection_path").cloned();
+	let log_inv_rate = *matches
+		.get_one::<u32>("log_inv_rate")
+		.expect("has default value");
+	let hash_suite = *matches
+		.get_one::<HashSuiteType>("hash_suite")
+		.expect("has default value");
+
+	// Load constraint system
+	let cs_load_scope = tracing::info_span!("Loading constraint system").entered();
+	let cs: ConstraintSystem = read_deserialized(cs_path)?;
+	tracing::info!("Constraint system loaded from '{}'", cs_path);
+	drop(cs_load_scope);
+
+	// Load pre-built KeyCollection if path provided
+	let maybe_key_collection = key_collection_path
+		.map(|kc_path| -> Result<_> {
+			let kc_load_scope = tracing::info_span!("Loading key collection").entered();
+			let key_collection: binius_prover::KeyCollection = read_deserialized(&kc_path)?;
+			tracing::info!("Key collection loaded from '{kc_path}'");
+			drop(kc_load_scope);
+			Ok(key_collection)
+		})
+		.transpose()?;
+
+	// Load witness data
+	let witness_load_scope = tracing::info_span!("Loading witness data").entered();
+	let inout: ValuesData = read_deserialized(pub_witness_path)?;
+	tracing::info!("Public inout values loaded from '{}'", pub_witness_path);
+
+	let non_pub_data: ValuesData = read_deserialized(non_pub_data_path)?;
+	tracing::info!("Non-public data loaded from '{}'", non_pub_data_path);
+
+	// Reconstruct the full witness from its two segments
+	let witness = cs.value_vec_from_data(&inout, &non_pub_data);
+	drop(witness_load_scope);
+
+	match hash_suite {
+		HashSuiteType::Sha256 => {
+			tracing::info!("Using SHA-256 hash suite for Merkle tree");
+			let (verifier, prover) =
+				setup::<StdHashSuite>(cs, log_inv_rate as usize, maybe_key_collection)?;
+			prove_verify(&verifier, &prover, &witness)?;
+		}
+		HashSuiteType::Blake3 => {
+			tracing::info!("Using Blake3 hash suite for Merkle tree");
+			let (verifier, prover) =
+				setup::<Blake3HashSuite>(cs, log_inv_rate as usize, maybe_key_collection)?;
+			prove_verify(&verifier, &prover, &witness)?;
+		}
+	};
+
+	Ok(())
+}
+
+/// The example-circuit CLI: one subcommand per circuit.
+///
+/// Each circuit is registered with [`Cli::circuit`], which gives it a subcommand carrying the
+/// full circuit CLI (`prove`, `stat`, `check-snapshot`, …) built from its `Params` and
+/// `Instance` types.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// fn main() -> Result<()> {
+///     Cli::new("binius-examples")
+///         .circuit::<MyExample>("my_circuit", "Description of my circuit")
+///         .run()
+/// }
+/// ```
+pub struct Cli {
+	command: Command,
+	runners: Vec<(&'static str, Runner)>,
+}
+
+/// Runs one circuit from the `ArgMatches` of its subcommand and that subcommand's name.
+type Runner = fn(&ArgMatches, &str) -> Result<()>;
+
+impl Cli {
+	/// Create a CLI with no circuits registered yet.
+	pub fn new(name: &'static str) -> Self {
+		Self {
+			command: Command::new(name)
+				.subcommand_required(true)
+				.arg_required_else_help(true),
+			runners: Vec::new(),
+		}
+	}
+
+	/// Register one circuit as a subcommand named `name`.
+	pub fn circuit<E: ExampleCircuit>(mut self, name: &'static str, about: &'static str) -> Self {
+		self.command = self
+			.command
+			.subcommand(build_command::<E>(name).about(about));
+		self.runners.push((name, run::<E>));
+		self
+	}
+
+	/// Parse the command line and run the selected circuit.
+	pub fn run(self) -> Result<()> {
+		let matches = self.command.get_matches();
+		let (name, sub_matches) = matches.subcommand().expect("subcommand is required");
+		let (_, run) = self
+			.runners
+			.iter()
+			.find(|(registered, _)| *registered == name)
+			.expect("clap only accepts a registered subcommand");
+		run(sub_matches, name)
+	}
+}
+
+/// Build the subcommand tree for one circuit.
+///
+/// The circuit's `Params` and `Instance` flags are also lifted onto the subcommand itself, so
+/// `<circuit> --flag` keeps meaning `<circuit> prove --flag`.
+fn build_command<E: ExampleCircuit>(name: &'static str) -> Command {
+	let command = Command::new(name)
+		.subcommand_required(false)
+		.arg_required_else_help(false);
+
+	// Build subcommands
+	let prove_cmd = build_prove_subcommand::<E>();
+	let stat_cmd = build_stat_subcommand::<E>();
+	let composition_cmd = build_composition_subcommand::<E>();
+	let check_snapshot_cmd = build_check_snapshot_subcommand::<E>();
+	let bless_snapshot_cmd = build_bless_snapshot_subcommand::<E>();
+	let save_cmd = build_save_subcommand::<E>();
+	let load_prove_cmd = build_load_prove_subcommand();
+	let verify_cmd = build_verify_subcommand::<E>();
+
+	let command = command
+		.subcommand(prove_cmd)
+		.subcommand(stat_cmd)
+		.subcommand(composition_cmd)
+		.subcommand(check_snapshot_cmd)
+		.subcommand(bless_snapshot_cmd)
+		.subcommand(save_cmd)
+		.subcommand(load_prove_cmd)
+		.subcommand(verify_cmd);
+
+	// Add top-level args for default prove behavior (when no subcommand specified)
+	let command = command
+		.arg(
+			Arg::new("log_inv_rate")
+				.short('l')
+				.long("log-inv-rate")
+				.value_name("RATE")
+				.help("Log of the inverse rate for the proof system")
+				.default_value("1")
+				.value_parser(clap::value_parser!(u32).range(1..)),
+		)
+		.arg(
+			Arg::new("hash_suite")
+				.short('c')
+				.long("hash-suite")
+				.alias("compression")
+				.value_name("SUITE")
+				.help("Merkle hash suite to use (leaf hash + inner-node compression)")
+				.value_parser(clap::value_parser!(HashSuiteType))
+				.default_value("sha256"),
+		)
+		.arg(
+			Arg::new("zk")
+				.long("zk")
+				.help("Use the zero-knowledge proving config")
+				.action(clap::ArgAction::SetTrue),
+		)
+		.arg(
+			Arg::new("sign_message")
+				.long("sign-message")
+				.value_name("MESSAGE")
+				.requires("zk")
+				.help(
+					"Produce a zero-knowledge signature of knowledge over this message \
+					 instead of a plain proof of knowledge (requires --zk)",
+				),
+		)
+		.arg(
+			Arg::new("output")
+				.short('o')
+				.long("output")
+				.value_name("PATH")
+				.help("Write the serialized proof to this file"),
+		);
+
+	// Augment with Params arguments at top level for default behavior
+	let command = E::Params::augment_args(command);
+	E::Instance::augment_args(command)
+}
+
+fn build_prove_subcommand<E: ExampleCircuit>() -> Command {
+	let mut cmd = Command::new("prove")
+		.about("Generate and verify a proof")
+		.arg(
+			Arg::new("log_inv_rate")
+				.short('l')
+				.long("log-inv-rate")
+				.value_name("RATE")
+				.help("Log of the inverse rate for the proof system")
+				.default_value("1")
+				.value_parser(clap::value_parser!(u32).range(1..)),
+		)
+		.arg(
+			Arg::new("hash_suite")
+				.short('c')
+				.long("hash-suite")
+				.alias("compression")
+				.value_name("SUITE")
+				.help("Merkle hash suite to use (leaf hash + inner-node compression)")
+				.value_parser(clap::value_parser!(HashSuiteType))
+				.default_value("sha256"),
+		)
+		.arg(
+			Arg::new("zk")
+				.long("zk")
+				.help("Use the zero-knowledge proving config")
+				.action(clap::ArgAction::SetTrue),
+		)
+		.arg(
+			Arg::new("sign_message")
+				.long("sign-message")
+				.value_name("MESSAGE")
+				.requires("zk")
+				.help(
+					"Produce a zero-knowledge signature of knowledge over this message \
+					 instead of a plain proof of knowledge (requires --zk)",
+				),
+		)
+		.arg(
+			Arg::new("output")
+				.short('o')
+				.long("output")
+				.value_name("PATH")
+				.help("Write the serialized proof to this file"),
+		);
+	cmd = E::Params::augment_args(cmd);
+	cmd = E::Instance::augment_args(cmd);
+	cmd
+}
+
+fn build_stat_subcommand<E: ExampleCircuit>() -> Command {
+	let cmd = Command::new("stat").about("Display circuit statistics");
+	E::Params::augment_args(cmd)
+}
+
+fn build_composition_subcommand<E: ExampleCircuit>() -> Command {
+	let cmd = Command::new("composition").about("Output circuit composition in JSON format");
+	E::Params::augment_args(cmd)
+}
+
+fn build_check_snapshot_subcommand<E: ExampleCircuit>() -> Command {
+	let cmd = Command::new("check-snapshot").about("Verify circuit statistics against a snapshot");
+	E::Params::augment_args(cmd)
+}
+
+fn build_bless_snapshot_subcommand<E: ExampleCircuit>() -> Command {
+	let cmd = Command::new("bless-snapshot").about("Update the snapshot with current statistics");
+	E::Params::augment_args(cmd)
+}
+
+fn build_save_subcommand<E: ExampleCircuit>() -> Command {
+	let mut cmd = Command::new("save").about(
+		"Save constraint system, public inout values, non-public data, and key collection to files if paths are provided",
+	);
+	cmd = cmd
+		.arg(
+			Arg::new("cs_path")
+				.long("cs-path")
+				.value_name("PATH")
+				.help("Output path for the constraint system binary"),
+		)
+		.arg(
+			Arg::new("pub_witness_path")
+				.long("pub-witness-path")
+				.value_name("PATH")
+				.help("Output path for the public inout values binary"),
+		)
+		.arg(
+			Arg::new("non_pub_data_path")
+				.long("non-pub-data-path")
+				.value_name("PATH")
+				.help("Output path for the non-public data (witness + internal) binary"),
+		)
+		.arg(
+			Arg::new("key_collection_path")
+				.long("key-collection-path")
+				.value_name("PATH")
+				.help("Output path for the key collection binary (for fast prover setup)"),
+		);
+	cmd = E::Params::augment_args(cmd);
+	cmd = E::Instance::augment_args(cmd);
+	cmd
+}
+
+fn build_load_prove_subcommand() -> Command {
+	Command::new("load-prove")
+		.about("Load constraint system, witness data, and optionally key collection from files and generate/verify proof")
+		.arg(
+			Arg::new("cs_path")
+				.long("cs-path")
+				.value_name("PATH")
+				.help("Input path for the constraint system binary")
+				.required(true),
+		)
+		.arg(
+			Arg::new("pub_witness_path")
+				.long("pub-witness-path")
+				.value_name("PATH")
+				.help("Input path for the public inout values binary")
+				.required(true),
+		)
+		.arg(
+			Arg::new("non_pub_data_path")
+				.long("non-pub-data-path")
+				.value_name("PATH")
+				.help("Input path for the non-public data (witness + internal) binary")
+				.required(true),
+		)
+		.arg(
+			Arg::new("key_collection_path")
+				.long("key-collection-path")
+				.value_name("PATH")
+				.help("Input path for the key collection binary (optional, for fast prover setup)"),
+		)
+		.arg(
+			Arg::new("log_inv_rate")
+				.short('l')
+				.long("log-inv-rate")
+				.value_name("RATE")
+				.help("Log of the inverse rate for the proof system")
+				.default_value("1")
+				.value_parser(clap::value_parser!(u32).range(1..)),
+		)
+		.arg(
+			Arg::new("hash_suite")
+				.short('c')
+				.long("hash-suite")
+				.alias("compression")
+				.value_name("SUITE")
+				.help("Merkle hash suite to use (leaf hash + inner-node compression)")
+				.value_parser(clap::value_parser!(HashSuiteType))
+				.default_value("sha256"),
+		)
+}
+
+fn build_verify_subcommand<E: ExampleCircuit>() -> Command {
+	let mut cmd = Command::new("verify")
+		.about("Verify a proof read from a file")
+		.arg(
+			Arg::new("proof_file")
+				.value_name("PROOF_FILE")
+				.help("Path to the proof file to verify")
+				.required(true),
+		)
+		.arg(
+			Arg::new("log_inv_rate")
+				.short('l')
+				.long("log-inv-rate")
+				.value_name("RATE")
+				.help("Log of the inverse rate for the proof system")
+				.default_value("1")
+				.value_parser(clap::value_parser!(u32).range(1..)),
+		)
+		.arg(
+			Arg::new("hash_suite")
+				.short('c')
+				.long("hash-suite")
+				.alias("compression")
+				.value_name("SUITE")
+				.help("Merkle hash suite to use (leaf hash + inner-node compression)")
+				.value_parser(clap::value_parser!(HashSuiteType))
+				.default_value("sha256"),
+		)
+		.arg(
+			Arg::new("zk")
+				.long("zk")
+				.help("Use the zero-knowledge verifier config")
+				.action(clap::ArgAction::SetTrue),
+		)
+		.arg(
+			Arg::new("sign_message")
+				.long("sign-message")
+				.value_name("MESSAGE")
+				.requires("zk")
+				.help(
+					"Verify a zero-knowledge signature of knowledge over this message \
+					 (requires --zk)",
+				),
+		);
+	cmd = E::Params::augment_args(cmd);
+	cmd = E::Instance::augment_args(cmd);
+	cmd
+}
+/// Run one circuit from the `ArgMatches` of its subcommand.
+#[allow(unused_variables)]
+fn run<E: ExampleCircuit>(matches: &ArgMatches, circuit_name: &str) -> Result<()> {
+	// Honour `RAYON_NUM_THREADS=1` by pinning the pool to this thread, which keeps profiles
+	// free of worker frames. This must run before anything else touches the pool, because the
+	// first use builds it and it can only be built once — `current_num_threads` below is one
+	// such use. The outcome is reported once tracing is up.
+	let thread_pool_result = binius_utils::rayon::config::adjust_thread_pool();
+
+	// Initialize tracing once at the beginning for all commands. In perfetto mode the
+	// returned guard must be held for the duration of the program to flush the trace.
+	#[cfg(feature = "perfetto")]
+	let _tracing_guard = {
+		// Detect threading information
+		let thread_count = binius_utils::rayon::current_num_threads();
+		let thread_mode = if thread_count == 1 { "st" } else { "mt" };
+
+		let mut builder = tracing_profile::TraceFilenameBuilder::for_benchmark(circuit_name)
+			.output_dir("perfetto_traces")
+			.timestamp() // Add timestamp for uniqueness
+			.git_info() // Include git status
+			.platform() // Include OS info
+			.thread_mode(thread_mode);
+
+		// Try to extract params from the appropriate matches for richer context
+		// This will succeed for most commands (prove, stat, save, etc.)
+		// and fail gracefully for commands without params (like load-prove)
+		let matches_for_params = matches.subcommand().map(|(_, sub)| sub).unwrap_or(matches);
+
+		if let Ok(params) = E::Params::from_arg_matches(matches_for_params)
+			&& let Some(param_summary) = E::param_summary(&params)
+		{
+			builder = builder.add("params", param_summary);
+		}
+
+		tracing_profile::init_tracing_with_builder(builder)?
+	};
+	#[cfg(not(feature = "perfetto"))]
+	crate::init_tracing();
+
+	// A failure costs only the cleaner call stacks, so it is not fatal.
+	if let Err(err) = thread_pool_result {
+		tracing::warn!("could not pin the rayon thread pool to one thread: {err}");
+	}
+
+	// Check if a subcommand was used
+	match matches.subcommand() {
+		Some(("prove", sub_matches)) => run_prove::<E>(sub_matches),
+		Some(("stat", sub_matches)) => run_stat::<E>(sub_matches),
+		Some(("composition", sub_matches)) => run_composition::<E>(sub_matches),
+		Some(("check-snapshot", sub_matches)) => run_check_snapshot::<E>(sub_matches, circuit_name),
+		Some(("bless-snapshot", sub_matches)) => run_bless_snapshot::<E>(sub_matches, circuit_name),
+		Some(("save", sub_matches)) => run_save::<E>(sub_matches),
+		Some(("load-prove", sub_matches)) => run_load_prove(sub_matches),
+		Some(("verify", sub_matches)) => run_verify::<E>(sub_matches),
+		Some((cmd, _)) => anyhow::bail!("Unknown subcommand: {}", cmd),
+		None => {
+			// No subcommand - default to prove behavior for backward compatibility
+			run_prove::<E>(matches)
+		}
+	}
+}
+
+fn run_prove<E: ExampleCircuit>(matches: &ArgMatches) -> Result<()> {
+	// Extract common arguments
+	let log_inv_rate = *matches
+		.get_one::<u32>("log_inv_rate")
+		.expect("has default value");
+	let hash_suite = *matches
+		.get_one::<HashSuiteType>("hash_suite")
+		.expect("has default value");
+	let zk = matches.get_flag("zk");
+	let sign_message = matches.get_one::<String>("sign_message").cloned();
+	let output = matches.get_one::<String>("output").cloned();
+	tracing::info!("Parsed hash suite: {hash_suite:?}");
+	if zk {
+		tracing::info!("Using zero-knowledge proving config");
+	}
+	if sign_message.is_some() {
+		tracing::info!("Producing a signature of knowledge over the provided message");
+	}
+	let message = sign_message.as_deref().map(str::as_bytes);
+
+	// Parse Params and Instance from matches
+	let params = E::Params::from_arg_matches(matches)?;
+	let instance = E::Instance::from_arg_matches(matches)?;
+
+	// Build the circuit
+	let build_scope = tracing::info_span!("Building circuit").entered();
+	let mut builder = CircuitBuilder::new();
+	let example = E::build(params, &mut builder)?;
+	let circuit = builder.build();
+	drop(build_scope);
+
+	// Set up prover and verifier
+	let cs = circuit.constraint_system().clone();
+
+	// Population of the input to the witness and then evaluating the circuit.
+	let witness_population = tracing::info_span!(
+		"Generating witness",
+		operation = "witness_generation",
+		perfetto_category = "operation",
+		component = "witness_generation",
+		scope_kind = "operation",
+		tag_witness_generation = true,
+		tag_preparation = true,
+	)
+	.entered();
+	let mut filler = circuit.new_witness_filler();
+	tracing::info_span!(
+		"Input population",
+		component = "input_population",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_witness_generation = true,
+		tag_preparation = true,
+	)
+	.in_scope(|| example.populate_witness(instance, &mut filler))?;
+	tracing::info_span!(
+		"Circuit evaluation",
+		component = "circuit_evaluation",
+		scope_kind = "procedure",
+		perfetto_category = "component",
+		tag_witness_generation = true,
+		tag_preparation = true,
+	)
+	.in_scope(|| circuit.populate_wire_witness(&mut filler))?;
+	let witness = filler.into_value_vec();
+	drop(witness_population);
+
+	prove_dispatch(cs, log_inv_rate as usize, hash_suite, zk, message, &witness, output.as_deref())
+}
+
+fn run_stat<E: ExampleCircuit>(matches: &ArgMatches) -> Result<()> {
+	// Parse Params from matches
+	let params = E::Params::from_arg_matches(matches)?;
+
+	// Build the circuit
+	let mut builder = CircuitBuilder::new();
+	let _example = E::build(params, &mut builder)?;
+	let circuit = builder.build();
+
+	// Print statistics
+	let stat = CircuitStat::collect(&circuit);
+	print!("{}", stat);
+
+	Ok(())
+}
+
+fn run_composition<E: ExampleCircuit>(matches: &ArgMatches) -> Result<()> {
+	// Parse Params from matches
+	let params = E::Params::from_arg_matches(matches)?;
+
+	// Build the circuit
+	let mut builder = CircuitBuilder::new();
+	let _example = E::build(params, &mut builder)?;
+	let circuit = builder.build();
+
+	// Print composition
+	let dump = circuit.simple_json_dump();
+	println!("{}", dump);
+
+	Ok(())
+}
+
+fn run_check_snapshot<E: ExampleCircuit>(matches: &ArgMatches, circuit_name: &str) -> Result<()> {
+	// Parse Params from matches
+	let params = E::Params::from_arg_matches(matches)?;
+
+	// Build the circuit
+	let mut builder = CircuitBuilder::new();
+	let _example = E::build(params, &mut builder)?;
+	let circuit = builder.build();
+
+	// Check snapshot
+	crate::snapshot::check_snapshot(circuit_name, &circuit)?;
+
+	Ok(())
+}
+
+fn run_bless_snapshot<E: ExampleCircuit>(matches: &ArgMatches, circuit_name: &str) -> Result<()> {
+	// Parse Params from matches
+	let params = E::Params::from_arg_matches(matches)?;
+
+	// Build the circuit
+	let mut builder = CircuitBuilder::new();
+	let _example = E::build(params, &mut builder)?;
+	let circuit = builder.build();
+
+	// Bless snapshot
+	crate::snapshot::bless_snapshot(circuit_name, &circuit)?;
+
+	Ok(())
+}
+
+fn run_save<E: ExampleCircuit>(matches: &ArgMatches) -> Result<()> {
+	// Extract optional output paths
+	let cs_path = matches.get_one::<String>("cs_path").cloned();
+	let pub_witness_path = matches.get_one::<String>("pub_witness_path").cloned();
+	let non_pub_data_path = matches.get_one::<String>("non_pub_data_path").cloned();
+	let key_collection_path = matches.get_one::<String>("key_collection_path").cloned();
+
+	// If nothing to save, exit early
+	if cs_path.is_none()
+		&& pub_witness_path.is_none()
+		&& non_pub_data_path.is_none()
+		&& key_collection_path.is_none()
+	{
+		tracing::info!("No output paths provided; nothing to save");
+		return Ok(());
+	}
+
+	// Parse Params and Instance
+	let params = E::Params::from_arg_matches(matches)?;
+	let instance = E::Instance::from_arg_matches(matches)?;
+
+	// Build circuit
+	let mut builder = CircuitBuilder::new();
+	let example = E::build(params, &mut builder)?;
+	let circuit = builder.build();
+
+	// Generate witness
+	let mut filler = circuit.new_witness_filler();
+	example.populate_witness(instance, &mut filler)?;
+	circuit.populate_wire_witness(&mut filler)?;
+	let witness: ValueVec = filler.into_value_vec();
+
+	save_artifacts(
+		circuit.constraint_system(),
+		&witness,
+		cs_path.as_deref(),
+		pub_witness_path.as_deref(),
+		non_pub_data_path.as_deref(),
+		key_collection_path.as_deref(),
+	)
+}
+
+fn run_verify<E: ExampleCircuit>(matches: &ArgMatches) -> Result<()> {
+	let proof_file = matches
+		.get_one::<String>("proof_file")
+		.expect("proof_file is required");
+	let log_inv_rate = *matches
+		.get_one::<u32>("log_inv_rate")
+		.expect("has default value");
+	let hash_suite = *matches
+		.get_one::<HashSuiteType>("hash_suite")
+		.expect("has default value");
+	let zk = matches.get_flag("zk");
+	let sign_message = matches.get_one::<String>("sign_message").cloned();
+	let message = sign_message.as_deref().map(str::as_bytes);
+
+	// Read proof from file
+	let proof: Proof<'static> = read_deserialized(proof_file)?;
+	let (proof_bytes, _) = proof.into_owned();
+
+	// Parse Params and Instance from matches
+	let params = E::Params::from_arg_matches(matches)?;
+	let instance = E::Instance::from_arg_matches(matches)?;
+
+	// Build the circuit
+	let build_scope = tracing::info_span!("Building circuit").entered();
+	let mut builder = CircuitBuilder::new();
+	let example = E::build(params, &mut builder)?;
+	let circuit = builder.build();
+	drop(build_scope);
+
+	// Set up verifier
+	let cs = circuit.constraint_system().clone();
+
+	// Populate witness (needed to supply public inputs for verification)
+	let mut filler = circuit.new_witness_filler();
+	example.populate_witness(instance, &mut filler)?;
+	circuit.populate_wire_witness(&mut filler)?;
+	let witness = filler.into_value_vec();
+
+	verify_dispatch(cs, log_inv_rate as usize, hash_suite, zk, message, &witness, proof_bytes)?;
+
+	tracing::info!("Proof verified successfully.");
+	Ok(())
+}

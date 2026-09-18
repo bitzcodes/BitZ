@@ -1,0 +1,25 @@
+[package]
+name = "binius-utils"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+array-util.workspace = true
+bytes.workspace = true
+hybrid-array.workspace = true
+rand.workspace = true
+rayon.workspace = true
+regex = { workspace = true, optional = true }
+thiserror.workspace = true
+trait-set.workspace = true
+
+[dev-dependencies]
+
+[features]
+default = []
+platform-diagnostics = ["dep:regex"]

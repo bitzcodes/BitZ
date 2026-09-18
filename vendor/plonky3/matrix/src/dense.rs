@@ -1,0 +1,2140 @@
+use alloc::borrow::Cow;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::borrow::{Borrow, BorrowMut};
+use core::marker::PhantomData;
+use core::ops::Deref;
+
+use p3_field::{
+    ExtensionField, Field, PackedValue, par_scale_slice_in_place, scale_slice_in_place_single_core,
+};
+use p3_maybe_rayon::prelude::*;
+use rand::distr::{Distribution, StandardUniform};
+use rand::{Rng, RngExt};
+use serde::{Deserialize, Serialize};
+use tracing::instrument;
+
+use crate::Matrix;
+
+/// A dense matrix in row-major format, with customizable backing storage.
+///
+/// The data is stored as a flat buffer, where rows are laid out consecutively.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DenseMatrix<T, V = Vec<T>> {
+    /// Flat buffer of matrix values in row-major order.
+    pub values: V,
+    /// Number of columns in the matrix.
+    ///
+    /// The number of rows is implicitly determined as `values.len() / width`.
+    pub width: usize,
+    /// Marker for the element type `T`, unused directly.
+    ///
+    /// Required to retain type information when `V` does not own or contain `T`.
+    _phantom: PhantomData<T>,
+}
+
+pub type RowMajorMatrix<T> = DenseMatrix<T>;
+pub type RowMajorMatrixView<'a, T> = DenseMatrix<T, &'a [T]>;
+pub type RowMajorMatrixViewMut<'a, T> = DenseMatrix<T, &'a mut [T]>;
+pub type RowMajorMatrixCow<'a, T> = DenseMatrix<T, Cow<'a, [T]>>;
+
+pub trait DenseStorage<T>: Borrow<[T]> + Send + Sync {
+    fn to_vec(self) -> Vec<T>;
+}
+
+// Cow doesn't impl IntoOwned so we can't blanket it
+impl<T: Clone + Send + Sync> DenseStorage<T> for Vec<T> {
+    fn to_vec(self) -> Self {
+        self
+    }
+}
+
+impl<T: Clone + Send + Sync> DenseStorage<T> for &[T] {
+    fn to_vec(self) -> Vec<T> {
+        <[T]>::to_vec(self)
+    }
+}
+
+impl<T: Clone + Send + Sync> DenseStorage<T> for &mut [T] {
+    fn to_vec(self) -> Vec<T> {
+        <[T]>::to_vec(self)
+    }
+}
+
+impl<T: Clone + Send + Sync> DenseStorage<T> for Cow<'_, [T]> {
+    fn to_vec(self) -> Vec<T> {
+        self.into_owned()
+    }
+}
+
+impl<T: Clone + Send + Sync + Default> DenseMatrix<T> {
+    /// Create a new dense matrix of the given dimensions, backed by a `Vec`, and filled with
+    /// default values.
+    #[must_use]
+    pub fn default(width: usize, height: usize) -> Self {
+        Self::new(vec![T::default(); width * height], width)
+    }
+}
+
+impl<T: Clone + Send + Sync, S: DenseStorage<T>> DenseMatrix<T, S> {
+    /// Create a new dense matrix of the given dimensions, backed by the given storage.
+    ///
+    /// # Panics
+    /// Panics in debug builds if `values.len() % width != 0`. Release builds silently
+    /// construct a matrix whose row/column indexing is inconsistent with the storage —
+    /// callers must validate dimensions before calling.
+    #[must_use]
+    pub fn new(values: S, width: usize) -> Self {
+        debug_assert!(values.borrow().len().is_multiple_of(width));
+        Self {
+            values,
+            width,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Create a new RowMajorMatrix containing a single row.
+    #[must_use]
+    pub fn new_row(values: S) -> Self {
+        let width = values.borrow().len();
+        Self::new(values, width)
+    }
+
+    /// Create a new RowMajorMatrix containing a single column.
+    #[must_use]
+    pub fn new_col(values: S) -> Self {
+        Self::new(values, 1)
+    }
+
+    /// Get a view of the matrix, i.e. a reference to the underlying data.
+    pub fn as_view(&self) -> RowMajorMatrixView<'_, T> {
+        RowMajorMatrixView::new(self.values.borrow(), self.width)
+    }
+
+    /// Get a mutable view of the matrix, i.e. a mutable reference to the underlying data.
+    pub fn as_view_mut(&mut self) -> RowMajorMatrixViewMut<'_, T>
+    where
+        S: BorrowMut<[T]>,
+    {
+        RowMajorMatrixViewMut::new(self.values.borrow_mut(), self.width)
+    }
+
+    /// Copy the values from the given matrix into this matrix.
+    pub fn copy_from<S2>(&mut self, source: &DenseMatrix<T, S2>)
+    where
+        T: Copy,
+        S: BorrowMut<[T]>,
+        S2: DenseStorage<T>,
+    {
+        assert_eq!(self.dimensions(), source.dimensions());
+        // Equivalent to:
+        // self.values.borrow_mut().copy_from_slice(source.values.borrow());
+        self.par_rows_mut()
+            .zip(source.par_row_slices())
+            .for_each(|(dst, src)| {
+                dst.copy_from_slice(src);
+            });
+    }
+
+    /// Flatten an extension field matrix to a base field matrix.
+    pub fn flatten_to_base<F: Field>(self) -> RowMajorMatrix<F>
+    where
+        T: ExtensionField<F>,
+    {
+        let width = self.width * T::DIMENSION;
+        let values = T::flatten_to_base(self.values.to_vec());
+        RowMajorMatrix::new(values, width)
+    }
+
+    /// Get an iterator over the rows of the matrix.
+    pub fn row_slices(&self) -> impl DoubleEndedIterator<Item = &[T]> {
+        self.values.borrow().chunks_exact(self.width)
+    }
+
+    /// Get a parallel iterator over the rows of the matrix.
+    pub fn par_row_slices(&self) -> impl IndexedParallelIterator<Item = &[T]>
+    where
+        T: Sync,
+    {
+        self.values.borrow().par_chunks_exact(self.width)
+    }
+
+    /// Returns a slice of the given row.
+    ///
+    /// # Panics
+    /// Panics if `r` larger than self.height().
+    pub fn row_mut(&mut self, r: usize) -> &mut [T]
+    where
+        S: BorrowMut<[T]>,
+    {
+        &mut self.values.borrow_mut()[r * self.width..(r + 1) * self.width]
+    }
+
+    /// Get a mutable iterator over the rows of the matrix.
+    pub fn rows_mut(&mut self) -> impl Iterator<Item = &mut [T]>
+    where
+        S: BorrowMut<[T]>,
+    {
+        self.values.borrow_mut().chunks_exact_mut(self.width)
+    }
+
+    /// Get a mutable parallel iterator over the rows of the matrix.
+    pub fn par_rows_mut<'a>(&'a mut self) -> impl IndexedParallelIterator<Item = &'a mut [T]>
+    where
+        T: 'a + Send,
+        S: BorrowMut<[T]>,
+    {
+        self.values.borrow_mut().par_chunks_exact_mut(self.width)
+    }
+
+    /// Get a mutable iterator over the rows of the matrix which packs the rows into packed values.
+    ///
+    /// If `P::WIDTH` does not divide `self.width`, the remainder of the row will be returned as a
+    /// base slice.
+    pub fn horizontally_packed_row_mut<P>(&mut self, r: usize) -> (&mut [P], &mut [T])
+    where
+        P: PackedValue<Value = T>,
+        S: BorrowMut<[T]>,
+    {
+        P::pack_slice_with_suffix_mut(self.row_mut(r))
+    }
+
+    /// Scale the given row by the given value.
+    ///
+    /// # Panics
+    /// Panics if `r` larger than `self.height()`.
+    pub fn scale_row(&mut self, r: usize, scale: T)
+    where
+        T: Field,
+        S: BorrowMut<[T]>,
+    {
+        scale_slice_in_place_single_core(self.row_mut(r), scale);
+    }
+
+    /// Scale the given row by the given value.
+    ///
+    /// # Performance
+    /// This function is parallelized, which may introduce some overhead compared to
+    /// [`Self::scale_row`] when the width is small.
+    ///
+    /// # Panics
+    /// Panics if `r` larger than `self.height()`.
+    pub fn par_scale_row(&mut self, r: usize, scale: T)
+    where
+        T: Field,
+        S: BorrowMut<[T]>,
+    {
+        par_scale_slice_in_place(self.row_mut(r), scale);
+    }
+
+    /// Scale the entire matrix by the given value.
+    pub fn scale(&mut self, scale: T)
+    where
+        T: Field,
+        S: BorrowMut<[T]>,
+    {
+        par_scale_slice_in_place(self.values.borrow_mut(), scale);
+    }
+
+    /// Split the matrix into two matrix views, one with the first `r` rows and one with the remaining rows.
+    ///
+    /// # Panics
+    /// Panics if `r` larger than `self.height()`.
+    pub fn split_rows(&self, r: usize) -> (RowMajorMatrixView<'_, T>, RowMajorMatrixView<'_, T>) {
+        let (lo, hi) = self.values.borrow().split_at(r * self.width);
+        (
+            DenseMatrix::new(lo, self.width),
+            DenseMatrix::new(hi, self.width),
+        )
+    }
+
+    /// Split the matrix into two mutable matrix views, one with the first `r` rows and one with the remaining rows.
+    ///
+    /// # Panics
+    /// Panics if `r` larger than `self.height()`.
+    pub fn split_rows_mut(
+        &mut self,
+        r: usize,
+    ) -> (RowMajorMatrixViewMut<'_, T>, RowMajorMatrixViewMut<'_, T>)
+    where
+        S: BorrowMut<[T]>,
+    {
+        let (lo, hi) = self.values.borrow_mut().split_at_mut(r * self.width);
+        (
+            DenseMatrix::new(lo, self.width),
+            DenseMatrix::new(hi, self.width),
+        )
+    }
+
+    /// Get an iterator over the rows of the matrix which takes `chunk_rows` rows at a time.
+    ///
+    /// If `chunk_rows` does not divide the height of the matrix, the last chunk will be smaller.
+    pub fn par_row_chunks(
+        &self,
+        chunk_rows: usize,
+    ) -> impl IndexedParallelIterator<Item = RowMajorMatrixView<'_, T>>
+    where
+        T: Send,
+    {
+        self.values
+            .borrow()
+            .par_chunks(self.width * chunk_rows)
+            .map(|slice| RowMajorMatrixView::new(slice, self.width))
+    }
+
+    /// Get a parallel iterator over the rows of the matrix which takes `chunk_rows` rows at a time.
+    ///
+    /// If `chunk_rows` does not divide the height of the matrix, the last chunk will be smaller.
+    pub fn par_row_chunks_exact(
+        &self,
+        chunk_rows: usize,
+    ) -> impl IndexedParallelIterator<Item = RowMajorMatrixView<'_, T>>
+    where
+        T: Send,
+    {
+        self.values
+            .borrow()
+            .par_chunks_exact(self.width * chunk_rows)
+            .map(|slice| RowMajorMatrixView::new(slice, self.width))
+    }
+
+    /// Get a mutable iterator over the rows of the matrix which takes `chunk_rows` rows at a time.
+    ///
+    /// If `chunk_rows` does not divide the height of the matrix, the last chunk will be smaller.
+    pub fn par_row_chunks_mut(
+        &mut self,
+        chunk_rows: usize,
+    ) -> impl IndexedParallelIterator<Item = RowMajorMatrixViewMut<'_, T>>
+    where
+        T: Send,
+        S: BorrowMut<[T]>,
+    {
+        self.values
+            .borrow_mut()
+            .par_chunks_mut(self.width * chunk_rows)
+            .map(|slice| RowMajorMatrixViewMut::new(slice, self.width))
+    }
+
+    /// Get a mutable iterator over the rows of the matrix which takes `chunk_rows` rows at a time.
+    ///
+    /// If `chunk_rows` does not divide the height of the matrix, the last up to `chunk_rows - 1` rows
+    /// of the matrix will be omitted.
+    pub fn row_chunks_exact_mut(
+        &mut self,
+        chunk_rows: usize,
+    ) -> impl Iterator<Item = RowMajorMatrixViewMut<'_, T>>
+    where
+        T: Send,
+        S: BorrowMut<[T]>,
+    {
+        self.values
+            .borrow_mut()
+            .chunks_exact_mut(self.width * chunk_rows)
+            .map(|slice| RowMajorMatrixViewMut::new(slice, self.width))
+    }
+
+    /// Get a parallel mutable iterator over the rows of the matrix which takes `chunk_rows` rows at a time.
+    ///
+    /// If `chunk_rows` does not divide the height of the matrix, the last up to `chunk_rows - 1` rows
+    /// of the matrix will be omitted.
+    pub fn par_row_chunks_exact_mut(
+        &mut self,
+        chunk_rows: usize,
+    ) -> impl IndexedParallelIterator<Item = RowMajorMatrixViewMut<'_, T>>
+    where
+        T: Send,
+        S: BorrowMut<[T]>,
+    {
+        self.values
+            .borrow_mut()
+            .par_chunks_exact_mut(self.width * chunk_rows)
+            .map(|slice| RowMajorMatrixViewMut::new(slice, self.width))
+    }
+
+    /// Get a pair of mutable slices of the given rows.
+    ///
+    /// # Panics
+    /// Panics if `row_1` or `row_2` are out of bounds or if `row_1 >= row_2`.
+    pub fn row_pair_mut(&mut self, row_1: usize, row_2: usize) -> (&mut [T], &mut [T])
+    where
+        S: BorrowMut<[T]>,
+    {
+        debug_assert_ne!(row_1, row_2);
+        let start_1 = row_1 * self.width;
+        let start_2 = row_2 * self.width;
+        let (lo, hi) = self.values.borrow_mut().split_at_mut(start_2);
+        (&mut lo[start_1..][..self.width], &mut hi[..self.width])
+    }
+
+    /// Get a pair of mutable slices of the given rows, both packed into packed field elements.
+    ///
+    /// If `P:WIDTH` does not divide `self.width`, the remainder of the row will be returned as a base slice.
+    ///
+    /// # Panics
+    /// Panics if `row_1` or `row_2` are out of bounds or if `row_1 >= row_2`.
+    #[allow(clippy::type_complexity)]
+    pub fn packed_row_pair_mut<P>(
+        &mut self,
+        row_1: usize,
+        row_2: usize,
+    ) -> ((&mut [P], &mut [T]), (&mut [P], &mut [T]))
+    where
+        S: BorrowMut<[T]>,
+        P: PackedValue<Value = T>,
+    {
+        let (slice_1, slice_2) = self.row_pair_mut(row_1, row_2);
+        (
+            P::pack_slice_with_suffix_mut(slice_1),
+            P::pack_slice_with_suffix_mut(slice_2),
+        )
+    }
+
+    /// Append zeros to the "end" of the given matrix, except that the matrix is in bit-reversed order,
+    /// so in actuality we're interleaving zero rows.
+    #[instrument(level = "debug", skip_all)]
+    pub fn bit_reversed_zero_pad(self, added_bits: usize) -> RowMajorMatrix<T>
+    where
+        T: Field,
+    {
+        if added_bits == 0 {
+            return self.to_row_major_matrix();
+        }
+
+        // This is equivalent to:
+        //     reverse_matrix_index_bits(mat);
+        //     mat
+        //         .values
+        //         .resize(mat.values.len() << added_bits, F::ZERO);
+        //     reverse_matrix_index_bits(mat);
+        // But rather than implement it with bit reversals, we directly construct the resulting matrix,
+        // whose rows are zero except for rows whose low `added_bits` bits are zero.
+
+        let w = self.width;
+        let mut padded =
+            RowMajorMatrix::new(T::zero_vec(self.values.borrow().len() << added_bits), w);
+        padded
+            .par_row_chunks_exact_mut(1 << added_bits)
+            .zip(self.par_row_slices())
+            .for_each(|(mut ch, r)| ch.row_mut(0).copy_from_slice(r));
+
+        padded
+    }
+}
+
+impl<T: Clone + Send + Sync, S: DenseStorage<T>> Matrix<T> for DenseMatrix<T, S> {
+    #[inline]
+    fn width(&self) -> usize {
+        self.width
+    }
+
+    #[inline]
+    fn height(&self) -> usize {
+        self.values
+            .borrow()
+            .len()
+            .checked_div(self.width)
+            .unwrap_or(0)
+    }
+
+    #[inline]
+    unsafe fn get_unchecked(&self, r: usize, c: usize) -> T {
+        unsafe {
+            // Safety: The caller must ensure that r < self.height() and c < self.width().
+            self.values
+                .borrow()
+                .get_unchecked(r * self.width + c)
+                .clone()
+        }
+    }
+
+    #[inline]
+    unsafe fn row_subseq_unchecked(
+        &self,
+        r: usize,
+        start: usize,
+        end: usize,
+    ) -> impl IntoIterator<Item = T, IntoIter = impl Iterator<Item = T> + Send + Sync> {
+        unsafe {
+            // Safety: The caller must ensure that r < self.height() and start <= end <= self.width().
+            self.values
+                .borrow()
+                .get_unchecked(r * self.width + start..r * self.width + end)
+                .iter()
+                .cloned()
+        }
+    }
+
+    #[inline]
+    unsafe fn row_subslice_unchecked(
+        &self,
+        r: usize,
+        start: usize,
+        end: usize,
+    ) -> impl Deref<Target = [T]> {
+        unsafe {
+            // Safety: The caller must ensure that r < self.height()
+            self.values
+                .borrow()
+                .get_unchecked(r * self.width + start..r * self.width + end)
+        }
+    }
+
+    fn to_row_major_matrix(self) -> RowMajorMatrix<T>
+    where
+        Self: Sized,
+        T: Clone,
+    {
+        RowMajorMatrix::new(self.values.to_vec(), self.width)
+    }
+
+    #[inline]
+    fn horizontally_packed_row<'a, P>(
+        &'a self,
+        r: usize,
+    ) -> (
+        impl Iterator<Item = P> + Send + Sync,
+        impl Iterator<Item = T> + Send + Sync,
+    )
+    where
+        P: PackedValue<Value = T>,
+        T: Clone + 'a,
+    {
+        let buf = &self.values.borrow()[r * self.width..(r + 1) * self.width];
+        let (packed, sfx) = P::pack_slice_with_suffix(buf);
+        (packed.iter().copied(), sfx.iter().cloned())
+    }
+
+    #[inline]
+    fn padded_horizontally_packed_row<'a, P>(
+        &'a self,
+        r: usize,
+    ) -> impl Iterator<Item = P> + Send + Sync
+    where
+        P: PackedValue<Value = T>,
+        T: Clone + Default + 'a,
+    {
+        let buf = &self.values.borrow()[r * self.width..(r + 1) * self.width];
+        let (packed, sfx) = P::pack_slice_with_suffix(buf);
+        packed.iter().copied().chain(
+            (!sfx.is_empty()).then(|| P::from_fn(|i| sfx.get(i).cloned().unwrap_or_default())),
+        )
+    }
+
+    #[inline]
+    fn vertically_packed_row<P>(&self, r: usize) -> impl Iterator<Item = P>
+    where
+        T: Copy,
+        P: PackedValue<Value = T>,
+    {
+        let values = self.values.borrow();
+        let width = self.width;
+        let height = self.height();
+        let row = r % height;
+        let no_wrap = P::WIDTH != 1 && r + P::WIDTH <= height;
+        let rows = (!no_wrap && P::WIDTH != 1).then(|| self.wrapping_row_slices(r, P::WIDTH));
+
+        (0..width).map(move |c| {
+            if P::WIDTH == 1 {
+                // SAFETY: row < height (from the `%` above) and c < width (loop bound).
+                unsafe { P::broadcast(*values.get_unchecked(row * width + c)) }
+            } else if no_wrap {
+                // SAFETY: for i in 0..P::WIDTH, r + i < height (fast-path guard) and c < width.
+                P::from_fn(|i| unsafe { *values.get_unchecked((r + i) * width + c) })
+            } else {
+                let rows = rows.as_ref().unwrap();
+                P::from_fn(|i| rows[i][c])
+            }
+        })
+    }
+
+    #[inline]
+    fn vertically_packed_row_pair<P>(&self, r: usize, step: usize) -> Vec<P>
+    where
+        T: Copy,
+        P: PackedValue<Value = T>,
+    {
+        let values = self.values.borrow();
+        let width = self.width;
+        let height = self.height();
+
+        if P::WIDTH == 1 {
+            let row = r % height;
+            let next_row = (r + step) % height;
+            let mut out = Vec::with_capacity(width * 2);
+            out.extend(
+                // SAFETY: row < height and c < width (loop bound).
+                (0..width).map(|c| unsafe { P::broadcast(*values.get_unchecked(row * width + c)) }),
+            );
+            out.extend(
+                // SAFETY: next_row < height and c < width.
+                (0..width)
+                    .map(|c| unsafe { P::broadcast(*values.get_unchecked(next_row * width + c)) }),
+            );
+            out
+        } else if r + P::WIDTH <= height && r + step + P::WIDTH <= height {
+            // SAFETY: for i in 0..P::WIDTH, both r+i < height and r+step+i < height (fast-path
+            // guard), and c < width (loop bound).
+            (0..width)
+                .map(|c| P::from_fn(|i| unsafe { *values.get_unchecked((r + i) * width + c) }))
+                .chain((0..width).map(|c| {
+                    P::from_fn(|i| unsafe { *values.get_unchecked((r + step + i) * width + c) })
+                }))
+                .collect::<Vec<_>>()
+        } else {
+            let rows = self.wrapping_row_slices(r, P::WIDTH);
+            let next_rows = self.wrapping_row_slices(r + step, P::WIDTH);
+            (0..width)
+                .map(|c| P::from_fn(|i| rows[i][c]))
+                .chain((0..width).map(|c| P::from_fn(|i| next_rows[i][c])))
+                .collect::<Vec<_>>()
+        }
+    }
+}
+
+impl<T: Clone + Default + Send + Sync> DenseMatrix<T> {
+    pub fn as_cow<'a>(self) -> RowMajorMatrixCow<'a, T> {
+        RowMajorMatrixCow::new(Cow::Owned(self.values), self.width)
+    }
+
+    pub fn rand<R: Rng>(rng: &mut R, rows: usize, cols: usize) -> Self
+    where
+        StandardUniform: Distribution<T>,
+    {
+        let values = rng.sample_iter(StandardUniform).take(rows * cols).collect();
+        Self::new(values, cols)
+    }
+
+    pub fn rand_nonzero<R: Rng>(rng: &mut R, rows: usize, cols: usize) -> Self
+    where
+        T: Field,
+        StandardUniform: Distribution<T>,
+    {
+        let values = rng
+            .sample_iter(StandardUniform)
+            .filter(|x| !x.is_zero())
+            .take(rows * cols)
+            .collect();
+        Self::new(values, cols)
+    }
+
+    /// Return a copy of this matrix with additional columns filled with random
+    /// values appended on the right.
+    ///
+    /// The original columns are preserved unchanged and the new trailing
+    /// columns in each row are populated independently from the provided
+    /// random number generator.
+    ///
+    /// # Memory Layout
+    ///
+    /// ```text
+    ///     Original (h × w):          Result (h × (w + num_cols)):
+    ///     [ a00  a01  …  a0w ]  →    [ a00  a01  …  a0w | r0  r1  …  rN ]
+    ///     [ a10  a11  …  a1w ]       [ a10  a11  …  a1w | r0  r1  …  rN ]
+    ///     …                          …
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// - `num_cols`: number of random columns to append.
+    /// - `rng`: random number generator used to sample each new element.
+    ///
+    /// # Returns
+    ///
+    /// A new matrix with width equal to `self.width() + num_cols`.
+    #[instrument(level = "debug", skip_all)]
+    pub fn with_random_cols<R>(&self, num_cols: usize, mut rng: R) -> Self
+    where
+        T: Field,
+        R: Rng + Send + Sync,
+        StandardUniform: Distribution<T>,
+    {
+        // Record the original width so we know where to split each row.
+        let old_w = self.width();
+        let new_w = old_w + num_cols;
+
+        // Allocate a zero-initialized buffer for the widened matrix.
+        let new_values = T::zero_vec(new_w * self.height());
+        let mut result = Self::new(new_values, new_w);
+
+        // Copy original data into the left portion of each row in parallel; this is a plain
+        // memcpy per row with no dependency on the (necessarily serial) RNG stream below.
+        result
+            .par_rows_mut()
+            .zip(self.par_row_slices())
+            .for_each(|(new_row, old_row)| {
+                new_row[..old_w].copy_from_slice(old_row);
+            });
+
+        // Fill the trailing random columns as a separate serial pass, since `rng` is a single
+        // sequential stream.
+        result.rows_mut().for_each(|new_row| {
+            new_row[old_w..].iter_mut().for_each(|v| *v = rng.random());
+        });
+
+        result
+    }
+
+    /// Return a copy of this matrix with additional zero-filled columns
+    /// appended on the right.
+    ///
+    /// Delegates to cloning the matrix and calling the in-place widening
+    /// method with a zero fill value.
+    ///
+    /// # Memory Layout
+    ///
+    /// ```text
+    ///     Original (h × w):          Result (h × (w + num_cols)):
+    ///     [ a00  a01  …  a0w ]  →    [ a00  a01  …  a0w | 0  0  …  0 ]
+    ///     [ a10  a11  …  a1w ]       [ a10  a11  …  a1w | 0  0  …  0 ]
+    ///     …                          …
+    /// ```
+    ///
+    /// # Arguments
+    ///
+    /// - `num_cols`: number of zero columns to append.
+    ///
+    /// # Returns
+    ///
+    /// A new matrix with width equal to `self.width() + num_cols`.
+    #[instrument(level = "debug", skip_all)]
+    pub fn with_zero_cols(&self, num_cols: usize) -> Self
+    where
+        T: Field,
+    {
+        // Clone the original matrix and widen it in-place with zero fill.
+        let mut result = self.clone();
+        result.widen_right(num_cols, T::ZERO);
+        result
+    }
+
+    pub fn pad_to_height(&mut self, new_height: usize, fill: T) {
+        assert!(new_height >= self.height());
+        self.values.resize(self.width * new_height, fill);
+    }
+
+    /// Pad the matrix height to the next power of two by appending rows filled with `fill`.
+    ///
+    /// This is commonly used in proof systems where trace matrices must have power-of-two heights.
+    ///
+    /// # Behavior
+    ///
+    /// - If the matrix is empty (height = 0), it is padded to have exactly one row of `fill` values.
+    /// - If the height is already a power of two, the matrix is unchanged.
+    /// - Otherwise, the matrix is padded to the next power of two height.
+    pub fn pad_to_power_of_two_height(&mut self, fill: T) {
+        // Compute the target height as the next power of two.
+        let target_height = self.height().next_power_of_two();
+
+        // If target_height == height, resize will have no effect.
+        // Otherwise we pad the matrix to a power of two height by filling with the supplied value.
+        self.values.resize(self.width * target_height, fill);
+    }
+
+    /// Pad the matrix height to at least a given minimum, rounded up to the next power of two.
+    ///
+    /// Appends rows filled with the provided fill value.
+    /// Useful in batch proving where multiple trace matrices must share a minimum height
+    /// while still satisfying the power-of-two requirement.
+    ///
+    /// # Logic
+    ///
+    /// - Round both the current height and the minimum up to the next power of two.
+    /// - Take the maximum of those two values as the target.
+    /// - Append fill rows until the target is reached.
+    ///
+    /// # Behavior
+    ///
+    /// - If the matrix already meets or exceeds the target, it is unchanged.
+    /// - If the minimum is 0, this reduces to padding to the next power of two.
+    /// - If the matrix is empty (height = 0), it is padded entirely with fill values.
+    pub fn pad_to_min_power_of_two_height(&mut self, min_height: usize, fill: T) {
+        // Compute the target as the larger of the two power-of-two ceilings.
+        let target_height = self
+            .height()
+            .next_power_of_two()
+            .max(min_height.next_power_of_two());
+
+        // Extend with fill values to reach the target height. No-op if already there.
+        self.values.resize(self.width * target_height, fill);
+    }
+
+    /// Build a matrix from a flat buffer whose length may not be a multiple of the
+    /// requested width.
+    ///
+    /// Useful when constructing trace matrices from a stream of values where the
+    /// final row may be incomplete.
+    ///
+    /// # Arguments
+    ///
+    /// - `values`: flat row-major data, ownership transferred to avoid a copy.
+    /// - `width`: number of columns (must be > 0).
+    /// - `fill`: value used to complete the last row or to create an empty row.
+    ///
+    /// # Returns
+    ///
+    /// A dense matrix with `ceil(values.len() / width)` rows (at least 1).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `width` is zero.
+    #[must_use]
+    pub fn from_flat_padded(mut values: Vec<T>, width: usize, fill: T) -> Self {
+        // Zero width would cause a division-by-zero when computing height.
+        assert!(width > 0, "width must be positive");
+
+        // How many elements the last row is missing.
+        let len = values.len();
+        let rem = len % width;
+
+        // Complete the partial trailing row.
+        //
+        // `resize` is a single capacity check + contiguous fill,
+        // faster than `extend(repeat_n(..))` which uses iterator machinery.
+        if rem != 0 {
+            values.resize(len + (width - rem), fill.clone());
+        }
+
+        // Guarantee at least one row so callers never get a zero-height matrix.
+        if values.is_empty() {
+            values.resize(width, fill);
+        }
+
+        Self::new(values, width)
+    }
+
+    /// Return a new matrix with additional columns appended to the right of
+    /// every row, filled with a constant value.
+    ///
+    /// Useful when a trace matrix needs extra selector or flag columns that are
+    /// initialised to a default.
+    ///
+    /// # Memory Layout
+    ///
+    /// ```text
+    ///  Before (width = W):          After (width = W + extra):
+    ///  [ d0  d1 ... d_{W-1} ]       [ d0  d1 ... d_{W-1}  fill ... fill ]
+    ///  [ ..                 ]       [ ..                                ]
+    /// ```
+    ///
+    /// # Algorithm
+    ///
+    /// Rows are relocated back-to-front so that earlier (lower-address) source
+    /// data is never overwritten before it is read.
+    ///
+    /// - Grow the backing buffer to `height * new_width`.
+    /// - Walk rows from the last to the first.
+    /// - For each row, move its elements to the new position and fill the
+    ///   trailing gap with the provided value.
+    ///
+    /// # Arguments
+    ///
+    /// - `extra_cols`: number of columns to append (0 is a no-op).
+    /// - `fill`: value written into every new column.
+    pub fn widen_right(&mut self, extra_cols: usize, fill: T)
+    where
+        T: Copy,
+    {
+        // No columns to add.
+        if extra_cols == 0 {
+            return;
+        }
+
+        let old_w = self.width;
+        let new_w = old_w + extra_cols;
+        let h = self.height();
+
+        // Grow the buffer to the widened size.
+        //
+        // The last row's trailing columns are filled for free by `resize`.
+        // Interior gaps still contain stale data — fixed up below.
+        self.values.resize(h * new_w, fill);
+
+        // Reverse iteration prevents clobbering: each row moves to a
+        // higher offset than its source.
+        //
+        // After relocating row r, fill the trailing columns of row r-1.
+        for r in (1..h).rev() {
+            // Source offset in the old (compact) layout.
+            let src_start = r * old_w;
+
+            // Destination offset in the new (widened) layout.
+            let dst_start = r * new_w;
+
+            // Move the row data. Compiles to a single `memmove`.
+            self.values
+                .copy_within(src_start..src_start + old_w, dst_start);
+
+            // Fill row (r-1)'s trailing columns, right before this row.
+            self.values[dst_start - extra_cols..dst_start].fill(fill);
+        }
+
+        // - h >= 2: the r == 1 iteration already filled row 0's gap.
+        // - h == 1: the loop never ran, so row 0's trailing columns are stale.
+        // - h == 0: the buffer is empty — nothing to do.
+        if h == 1 {
+            self.values[old_w..new_w].fill(fill);
+        }
+
+        // Commit the new width so subsequent accesses use the widened stride.
+        self.width = new_w;
+    }
+}
+
+impl<T: Copy + Default + Send + Sync, V: DenseStorage<T>> DenseMatrix<T, V> {
+    /// Return the transpose of this matrix.
+    pub fn transpose(&self) -> RowMajorMatrix<T> {
+        let nelts = self.height() * self.width();
+        let mut values = vec![T::default(); nelts];
+        p3_util::transpose::transpose(
+            self.values.borrow(),
+            &mut values,
+            self.width(),
+            self.height(),
+        );
+        RowMajorMatrix::new(values, self.height())
+    }
+
+    /// Transpose the matrix returning the result in `other` without intermediate allocation.
+    pub fn transpose_into<W: DenseStorage<T> + BorrowMut<[T]>>(
+        &self,
+        other: &mut DenseMatrix<T, W>,
+    ) {
+        assert_eq!(self.height(), other.width());
+        assert_eq!(other.height(), self.width());
+        p3_util::transpose::transpose(
+            self.values.borrow(),
+            other.values.borrow_mut(),
+            self.width(),
+            self.height(),
+        );
+    }
+}
+
+impl<'a, T: Clone + Default + Send + Sync> RowMajorMatrixView<'a, T> {
+    pub fn as_cow(self) -> RowMajorMatrixCow<'a, T> {
+        RowMajorMatrixCow::new(Cow::Borrowed(self.values), self.width)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use p3_baby_bear::BabyBear;
+    use p3_field::{FieldArray, PrimeCharacteristicRing};
+    use rand::SeedableRng;
+    use rand::rngs::SmallRng;
+
+    use super::*;
+
+    #[test]
+    fn test_new() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        assert_eq!(matrix.width, 2);
+        assert_eq!(matrix.height(), 3);
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_new_row() {
+        let matrix = RowMajorMatrix::new_row(vec![1, 2, 3]);
+        assert_eq!(matrix.width, 3);
+        assert_eq!(matrix.height(), 1);
+    }
+
+    #[test]
+    fn test_new_col() {
+        let matrix = RowMajorMatrix::new_col(vec![1, 2, 3]);
+        assert_eq!(matrix.width, 1);
+        assert_eq!(matrix.height(), 3);
+    }
+
+    #[test]
+    fn test_height_with_zero_width() {
+        let matrix: DenseMatrix<i32> = RowMajorMatrix::new(vec![], 0);
+        assert_eq!(matrix.height(), 0);
+    }
+
+    #[test]
+    fn test_get_methods() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2); // Height = 3, Width = 2
+        assert_eq!(matrix.get(0, 0), Some(1));
+        assert_eq!(matrix.get(1, 1), Some(4));
+        assert_eq!(matrix.get(2, 0), Some(5));
+        unsafe {
+            assert_eq!(matrix.get_unchecked(0, 1), 2);
+            assert_eq!(matrix.get_unchecked(1, 0), 3);
+            assert_eq!(matrix.get_unchecked(2, 1), 6);
+        }
+        assert_eq!(matrix.get(3, 0), None); // Height out of bounds
+        assert_eq!(matrix.get(0, 2), None); // Width out of bounds
+    }
+
+    #[test]
+    fn test_row_methods() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6, 7, 8], 4); // Height = 2, Width = 4
+        let row: Vec<_> = matrix.row(1).unwrap().into_iter().collect();
+        assert_eq!(row, vec![5, 6, 7, 8]);
+        unsafe {
+            let row: Vec<_> = matrix.row_unchecked(0).into_iter().collect();
+            assert_eq!(row, vec![1, 2, 3, 4]);
+            let row: Vec<_> = matrix.row_subseq_unchecked(0, 0, 3).into_iter().collect();
+            assert_eq!(row, vec![1, 2, 3]);
+            let row: Vec<_> = matrix.row_subseq_unchecked(0, 1, 3).into_iter().collect();
+            assert_eq!(row, vec![2, 3]);
+            let row: Vec<_> = matrix.row_subseq_unchecked(0, 2, 4).into_iter().collect();
+            assert_eq!(row, vec![3, 4]);
+        }
+        assert!(matrix.row(2).is_none()); // Height out of bounds
+    }
+
+    #[test]
+    fn test_row_slice_methods() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6, 7, 8, 9], 3); // Height = 3, Width = 3
+        let slice0 = matrix.row_slice(0);
+        let slice2 = matrix.row_slice(2);
+        assert_eq!(slice0.unwrap().deref(), &[1, 2, 3]);
+        assert_eq!(slice2.unwrap().deref(), &[7, 8, 9]);
+        unsafe {
+            assert_eq!(&[1, 2, 3], matrix.row_slice_unchecked(0).deref());
+            assert_eq!(&[7, 8, 9], matrix.row_slice_unchecked(2).deref());
+
+            assert_eq!(&[1, 2, 3], matrix.row_subslice_unchecked(0, 0, 3).deref());
+            assert_eq!(&[8], matrix.row_subslice_unchecked(2, 1, 2).deref());
+        }
+        assert!(matrix.row_slice(3).is_none()); // Height out of bounds
+    }
+
+    #[test]
+    fn test_as_view() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        let view = matrix.as_view();
+        assert_eq!(view.values, &[1, 2, 3, 4]);
+        assert_eq!(view.width, 2);
+    }
+
+    #[test]
+    fn test_as_view_mut() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        let view = matrix.as_view_mut();
+        view.values[0] = 10;
+        assert_eq!(matrix.values, vec![10, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_copy_from() {
+        let mut matrix1 = RowMajorMatrix::new(vec![0, 0, 0, 0], 2);
+        let matrix2 = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        matrix1.copy_from(&matrix2);
+        assert_eq!(matrix1.values, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_split_rows() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        let (top, bottom) = matrix.split_rows(1);
+        assert_eq!(top.values, vec![1, 2]);
+        assert_eq!(bottom.values, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_split_rows_mut() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        let (top, bottom) = matrix.split_rows_mut(1);
+        assert_eq!(top.values, vec![1, 2]);
+        assert_eq!(bottom.values, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_row_mut() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        matrix.row_mut(1)[0] = 10;
+        assert_eq!(matrix.values, vec![1, 2, 10, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_bit_reversed_zero_pad() {
+        let matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+            ],
+            2,
+        );
+        let padded = matrix.bit_reversed_zero_pad(1);
+        assert_eq!(padded.width, 2);
+        assert_eq!(
+            padded.values,
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(0),
+                BabyBear::new(0),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(0),
+                BabyBear::new(0)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_bit_reversed_zero_pad_no_change() {
+        let matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+            ],
+            2,
+        );
+        let padded = matrix.bit_reversed_zero_pad(0);
+
+        assert_eq!(padded.width, 2);
+        assert_eq!(
+            padded.values,
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scale() {
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+            ],
+            2,
+        );
+        matrix.scale(BabyBear::new(2));
+        assert_eq!(
+            matrix.values,
+            vec![
+                BabyBear::new(2),
+                BabyBear::new(4),
+                BabyBear::new(6),
+                BabyBear::new(8),
+                BabyBear::new(10),
+                BabyBear::new(12)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scale_row() {
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+            ],
+            2,
+        );
+        matrix.scale_row(1, BabyBear::new(3));
+        assert_eq!(
+            matrix.values,
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(9),
+                BabyBear::new(12),
+                BabyBear::new(5),
+                BabyBear::new(6),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_to_row_major_matrix() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        let converted = matrix.to_row_major_matrix();
+
+        // The converted matrix should have the same values and width
+        assert_eq!(converted.width, 2);
+        assert_eq!(converted.height(), 3);
+        assert_eq!(converted.values, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn test_horizontally_packed_row() {
+        type Packed = FieldArray<BabyBear, 2>;
+
+        let matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+            ],
+            3,
+        );
+
+        let (packed_iter, suffix_iter) = matrix.horizontally_packed_row::<Packed>(1);
+
+        let packed: Vec<_> = packed_iter.collect();
+        let suffix: Vec<_> = suffix_iter.collect();
+
+        assert_eq!(
+            packed,
+            vec![Packed::from([BabyBear::new(4), BabyBear::new(5)])]
+        );
+        assert_eq!(suffix, vec![BabyBear::new(6)]);
+    }
+
+    #[test]
+    fn test_padded_horizontally_packed_row() {
+        use p3_baby_bear::BabyBear;
+
+        type Packed = FieldArray<BabyBear, 2>;
+
+        let matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+            ],
+            3,
+        );
+
+        let packed_iter = matrix.padded_horizontally_packed_row::<Packed>(1);
+        let packed: Vec<_> = packed_iter.collect();
+
+        assert_eq!(
+            packed,
+            vec![
+                Packed::from([BabyBear::new(4), BabyBear::new(5)]),
+                Packed::from([BabyBear::new(6), BabyBear::new(0)])
+            ]
+        );
+    }
+
+    #[test]
+    fn test_padded_horizontally_packed_row_exact_width() {
+        type Packed = FieldArray<BabyBear, 2>;
+
+        // Width = 4 is exactly divisible by P::WIDTH = 2.
+        // The iterator must return exactly div_ceil(4, 2) = 2 packed elements,
+        // with no extra zero-filled element appended.
+        let matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+                BabyBear::new(7),
+                BabyBear::new(8),
+            ],
+            4,
+        );
+
+        let packed: Vec<_> = matrix.padded_horizontally_packed_row::<Packed>(1).collect();
+
+        assert_eq!(packed.len(), 2);
+        assert_eq!(
+            packed,
+            vec![
+                Packed::from([BabyBear::new(5), BabyBear::new(6)]),
+                Packed::from([BabyBear::new(7), BabyBear::new(8)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pad_to_height() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 3);
+
+        // Original matrix:
+        // [ 1  2  3 ]
+        // [ 4  5  6 ] (height = 2)
+
+        matrix.pad_to_height(4, 9);
+
+        // Expected matrix after padding:
+        // [ 1  2  3 ]
+        // [ 4  5  6 ]
+        // [ 9  9  9 ]  <-- Newly added row
+        // [ 9  9  9 ]  <-- Newly added row
+
+        assert_eq!(matrix.height(), 4);
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 6, 9, 9, 9, 9, 9, 9]);
+    }
+
+    #[test]
+    fn test_pad_to_power_of_two_height() {
+        // Test 1: Non-power-of-two height (3 rows -> 4 rows) with fill value 0.
+        //
+        // - Original matrix has 3 rows, which is not a power of two.
+        // - After padding, it should have 4 rows (next power of two).
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        assert_eq!(matrix.height(), 3);
+        matrix.pad_to_power_of_two_height(0);
+        assert_eq!(matrix.height(), 4);
+        // Original values preserved, new row filled with 0.
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 6, 0, 0]);
+
+        // Test 2: Already power-of-two height (4 rows -> 4 rows, unchanged).
+        //
+        // Matrix height is already a power of two, so no padding occurs.
+        // Fill value is ignored when no padding is needed.
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6, 7, 8], 2);
+        assert_eq!(matrix.height(), 4);
+        matrix.pad_to_power_of_two_height(99);
+        assert_eq!(matrix.height(), 4);
+        // Values unchanged (fill value not used).
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // Test 3: Single row matrix (1 row -> 1 row, unchanged).
+        //
+        // Height of 1 is a power of two (2^0 = 1).
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3], 3);
+        assert_eq!(matrix.height(), 1);
+        matrix.pad_to_power_of_two_height(42);
+        assert_eq!(matrix.height(), 1);
+        assert_eq!(matrix.values, vec![1, 2, 3]);
+
+        // Test 4: 5 rows -> 8 rows with custom fill value (-1).
+        //
+        // Demonstrates padding across a larger gap with a non-zero fill value.
+        let mut matrix = RowMajorMatrix::new(vec![1; 10], 2);
+        assert_eq!(matrix.height(), 5);
+        matrix.pad_to_power_of_two_height(-1);
+        assert_eq!(matrix.height(), 8);
+        // Original 10 values plus 6 fill values (3 new rows * 2 width).
+        assert_eq!(matrix.values.len(), 16);
+        assert!(matrix.values[..10].iter().all(|&v| v == 1));
+        assert!(matrix.values[10..].iter().all(|&v| v == -1));
+    }
+
+    #[test]
+    fn test_pad_to_power_of_two_height_empty_matrix() {
+        // Empty matrix (0 rows) should be padded to 1 row of fill values.
+        // This ensures the matrix is valid for downstream operations.
+        let mut matrix: RowMajorMatrix<i32> = RowMajorMatrix::new(vec![], 3);
+        assert_eq!(matrix.height(), 0);
+        assert_eq!(matrix.width, 3);
+        matrix.pad_to_power_of_two_height(7);
+        // After padding: 1 row with 3 columns, all filled with 7.
+        assert_eq!(matrix.height(), 1);
+        assert_eq!(matrix.values, vec![7, 7, 7]);
+    }
+
+    #[test]
+    fn test_pad_to_min_power_of_two_height() {
+        // Test 1: min_height dominates (3 rows, min_height = 5 -> 8 rows).
+        //
+        // - Current height 3 rounds to 4.
+        // - min_height 5 rounds to 8.
+        // - Target is max(4, 8) = 8.
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        assert_eq!(matrix.height(), 3);
+        matrix.pad_to_min_power_of_two_height(5, 0);
+        assert_eq!(matrix.height(), 8);
+        assert_eq!(matrix.values[..6], [1, 2, 3, 4, 5, 6]);
+        assert!(matrix.values[6..].iter().all(|&v| v == 0));
+
+        // Test 2: Current height dominates (5 rows, min_height = 2 -> 8 rows).
+        //
+        // - Current height 5 rounds to 8.
+        // - min_height 2 rounds to 2.
+        // - Target is max(8, 2) = 8.
+        let mut matrix = RowMajorMatrix::new(vec![1; 10], 2);
+        assert_eq!(matrix.height(), 5);
+        matrix.pad_to_min_power_of_two_height(2, -1);
+        assert_eq!(matrix.height(), 8);
+        assert!(matrix.values[..10].iter().all(|&v| v == 1));
+        assert!(matrix.values[10..].iter().all(|&v| v == -1));
+
+        // Test 3: Already at target (4 rows, min_height = 3 -> 4 rows, unchanged).
+        //
+        // - Current height 4 is already a power of two.
+        // - min_height 3 rounds to 4.
+        // - Target is max(4, 4) = 4, no padding needed.
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6, 7, 8], 2);
+        assert_eq!(matrix.height(), 4);
+        matrix.pad_to_min_power_of_two_height(3, 99);
+        assert_eq!(matrix.height(), 4);
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        // Test 4: min_height = 0 behaves like pad_to_power_of_two_height.
+        //
+        // - min_height 0 rounds to 1.
+        // - Current height 3 rounds to 4.
+        // - Target is max(4, 1) = 4.
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+        assert_eq!(matrix.height(), 3);
+        matrix.pad_to_min_power_of_two_height(0, 0);
+        assert_eq!(matrix.height(), 4);
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 6, 0, 0]);
+
+        // Test 5: min_height is already a power of two (2 rows, min_height = 8 -> 8 rows).
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 3);
+        assert_eq!(matrix.height(), 2);
+        matrix.pad_to_min_power_of_two_height(8, 7);
+        assert_eq!(matrix.height(), 8);
+        assert_eq!(matrix.values[..6], [1, 2, 3, 4, 5, 6]);
+        assert!(matrix.values[6..].iter().all(|&v| v == 7));
+        assert_eq!(matrix.values.len(), 24); // 8 rows * 3 width
+    }
+
+    #[test]
+    fn test_pad_to_min_power_of_two_height_empty_matrix() {
+        // Empty matrix (0 rows) with min_height = 5 should pad to 8 rows.
+        let mut matrix: RowMajorMatrix<i32> = RowMajorMatrix::new(vec![], 3);
+        assert_eq!(matrix.height(), 0);
+        matrix.pad_to_min_power_of_two_height(5, 7);
+        assert_eq!(matrix.height(), 8);
+        assert_eq!(matrix.values.len(), 24);
+        assert!(matrix.values.iter().all(|&v| v == 7));
+    }
+
+    #[test]
+    fn test_from_flat_padded() {
+        // Test 1: Buffer length is an exact multiple of width (no padding needed).
+        //
+        // 6 values with width 3 -> 2 complete rows, no fill appended.
+        let matrix = RowMajorMatrix::from_flat_padded(vec![1, 2, 3, 4, 5, 6], 3, 0);
+        assert_eq!(matrix.height(), 2);
+        assert_eq!(matrix.width, 3);
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 6]);
+
+        // Test 2: Partial last row is padded with fill.
+        //
+        // 5 values with width 3 -> 1 complete row + 1 partial row (2 values + 1 fill).
+        let matrix = RowMajorMatrix::from_flat_padded(vec![1, 2, 3, 4, 5], 3, 99);
+        assert_eq!(matrix.height(), 2);
+        assert_eq!(matrix.width, 3);
+        assert_eq!(matrix.values, vec![1, 2, 3, 4, 5, 99]);
+
+        // Test 3: Single value with width 3 -> padded to one full row.
+        let matrix = RowMajorMatrix::from_flat_padded(vec![42], 3, 0);
+        assert_eq!(matrix.height(), 1);
+        assert_eq!(matrix.values, vec![42, 0, 0]);
+
+        // Test 4: Empty buffer -> one row filled entirely with fill.
+        let matrix = RowMajorMatrix::from_flat_padded(vec![], 4, 7);
+        assert_eq!(matrix.height(), 1);
+        assert_eq!(matrix.width, 4);
+        assert_eq!(matrix.values, vec![7, 7, 7, 7]);
+
+        // Test 5: Width of 1 never needs padding.
+        let matrix = RowMajorMatrix::from_flat_padded(vec![10, 20, 30], 1, 0);
+        assert_eq!(matrix.height(), 3);
+        assert_eq!(matrix.values, vec![10, 20, 30]);
+    }
+
+    #[test]
+    #[should_panic(expected = "width must be positive")]
+    fn test_from_flat_padded_zero_width_panics() {
+        let _ = RowMajorMatrix::from_flat_padded(vec![1, 2, 3], 0, 0);
+    }
+
+    #[test]
+    fn test_widen_right() {
+        // Test 1: Widen a 2x2 matrix by 1 column.
+        //
+        // Original:        Widened:
+        // [ 1  2 ]    ->   [ 1  2  0 ]
+        // [ 3  4 ]         [ 3  4  0 ]
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        matrix.widen_right(1, 0);
+        assert_eq!(matrix.width, 3);
+        assert_eq!(matrix.height(), 2);
+        assert_eq!(matrix.values, vec![1, 2, 0, 3, 4, 0]);
+
+        // Test 2: Widen by 3 columns with a non-zero fill.
+        //
+        // Original:             Widened:
+        // [ 1  2 ]    ->       [ 1  2  -1  -1  -1 ]
+        // [ 3  4 ]             [ 3  4  -1  -1  -1 ]
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        matrix.widen_right(3, -1);
+        assert_eq!(matrix.width, 5);
+        assert_eq!(matrix.height(), 2);
+        assert_eq!(matrix.values, vec![1, 2, -1, -1, -1, 3, 4, -1, -1, -1]);
+
+        // Test 3: extra_cols = 0 leaves the matrix unchanged.
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4], 2);
+        matrix.widen_right(0, 99);
+        assert_eq!(matrix.width, 2);
+        assert_eq!(matrix.values, vec![1, 2, 3, 4]);
+
+        // Test 4: Single-row matrix.
+        let mut matrix = RowMajorMatrix::new(vec![10, 20, 30], 3);
+        matrix.widen_right(2, 0);
+        assert_eq!(matrix.width, 5);
+        assert_eq!(matrix.height(), 1);
+        assert_eq!(matrix.values, vec![10, 20, 30, 0, 0]);
+
+        // Test 5: Single-column matrix widened to 3 columns.
+        //
+        // Original:    Widened:
+        // [ 1 ]   ->   [ 1  0  0 ]
+        // [ 2 ]        [ 2  0  0 ]
+        // [ 3 ]        [ 3  0  0 ]
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3], 1);
+        matrix.widen_right(2, 0);
+        assert_eq!(matrix.width, 3);
+        assert_eq!(matrix.height(), 3);
+        assert_eq!(matrix.values, vec![1, 0, 0, 2, 0, 0, 3, 0, 0]);
+    }
+
+    #[test]
+    fn test_widen_right_empty_matrix() {
+        // Empty matrix (0 rows) widened should remain empty with updated width.
+        let mut matrix: RowMajorMatrix<i32> = RowMajorMatrix::new(vec![], 3);
+        matrix.widen_right(2, 0);
+        assert_eq!(matrix.width, 5);
+        assert_eq!(matrix.height(), 0);
+        assert!(matrix.values.is_empty());
+    }
+
+    #[test]
+    fn test_transpose_into() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 3);
+
+        // Original matrix:
+        // [ 1  2  3 ]
+        // [ 4  5  6 ]
+
+        let mut transposed = RowMajorMatrix::new(vec![0; 6], 2);
+
+        matrix.transpose_into(&mut transposed);
+
+        // Expected transposed matrix:
+        // [ 1  4 ]
+        // [ 2  5 ]
+        // [ 3  6 ]
+
+        assert_eq!(transposed.width, 2);
+        assert_eq!(transposed.height(), 3);
+        assert_eq!(transposed.values, vec![1, 4, 2, 5, 3, 6]);
+    }
+
+    #[test]
+    fn test_flatten_to_base() {
+        let matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+            ],
+            2,
+        );
+
+        let flattened: RowMajorMatrix<BabyBear> = matrix.flatten_to_base();
+
+        assert_eq!(flattened.width, 2);
+        assert_eq!(
+            flattened.values,
+            vec![
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_horizontally_packed_row_mut() {
+        type Packed = FieldArray<BabyBear, 2>;
+
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+            ],
+            3,
+        );
+
+        let (packed, suffix) = matrix.horizontally_packed_row_mut::<Packed>(1);
+        packed[0] = Packed::from([BabyBear::new(9), BabyBear::new(10)]);
+        suffix[0] = BabyBear::new(11);
+
+        assert_eq!(
+            matrix.values,
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(9),
+                BabyBear::new(10),
+                BabyBear::new(11),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_par_row_chunks() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6, 7, 8], 2);
+
+        let chunks: Vec<_> = matrix.par_row_chunks(2).collect();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].values, vec![1, 2, 3, 4]);
+        assert_eq!(chunks[1].values, vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn test_par_row_chunks_exact() {
+        let matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+
+        let chunks: Vec<_> = matrix.par_row_chunks_exact(1).collect();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].values, vec![1, 2]);
+        assert_eq!(chunks[1].values, vec![3, 4]);
+        assert_eq!(chunks[2].values, vec![5, 6]);
+    }
+
+    #[test]
+    fn test_par_row_chunks_mut() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6, 7, 8], 2);
+
+        matrix
+            .par_row_chunks_mut(2)
+            .for_each(|chunk| chunk.values.iter_mut().for_each(|x| *x += 10));
+
+        assert_eq!(matrix.values, vec![11, 12, 13, 14, 15, 16, 17, 18]);
+    }
+
+    #[test]
+    fn test_row_chunks_exact_mut() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+
+        for chunk in matrix.row_chunks_exact_mut(1) {
+            chunk.values.iter_mut().for_each(|x| *x *= 2);
+        }
+
+        assert_eq!(matrix.values, vec![2, 4, 6, 8, 10, 12]);
+    }
+
+    #[test]
+    fn test_par_row_chunks_exact_mut() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+
+        matrix
+            .par_row_chunks_exact_mut(1)
+            .for_each(|chunk| chunk.values.iter_mut().for_each(|x| *x += 5));
+
+        assert_eq!(matrix.values, vec![6, 7, 8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn test_row_pair_mut() {
+        let mut matrix = RowMajorMatrix::new(vec![1, 2, 3, 4, 5, 6], 2);
+
+        let (row1, row2) = matrix.row_pair_mut(0, 2);
+        row1[0] = 9;
+        row2[1] = 10;
+
+        assert_eq!(matrix.values, vec![9, 2, 3, 4, 5, 10]);
+    }
+
+    #[test]
+    fn test_packed_row_pair_mut() {
+        type Packed = FieldArray<BabyBear, 2>;
+
+        let mut matrix = RowMajorMatrix::new(
+            vec![
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+            ],
+            3,
+        );
+
+        let ((packed1, sfx1), (packed2, sfx2)) = matrix.packed_row_pair_mut::<Packed>(0, 1);
+        packed1[0] = Packed::from([BabyBear::new(7), BabyBear::new(8)]);
+        packed2[0] = Packed::from([BabyBear::new(33), BabyBear::new(44)]);
+        sfx1[0] = BabyBear::new(99);
+        sfx2[0] = BabyBear::new(9);
+
+        assert_eq!(
+            matrix.values,
+            vec![
+                BabyBear::new(7),
+                BabyBear::new(8),
+                BabyBear::new(99),
+                BabyBear::new(33),
+                BabyBear::new(44),
+                BabyBear::new(9),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_transpose_square_matrix() {
+        const START_INDEX: usize = 1;
+        const VALUE_LEN: usize = 9;
+        const WIDTH: usize = 3;
+        const HEIGHT: usize = 3;
+
+        let matrix_values = (START_INDEX..=VALUE_LEN).collect::<Vec<_>>();
+        let matrix = RowMajorMatrix::new(matrix_values, WIDTH);
+        let transposed = matrix.transpose();
+        let should_be_transposed_values = vec![1, 4, 7, 2, 5, 8, 3, 6, 9];
+        let should_be_transposed = RowMajorMatrix::new(should_be_transposed_values, HEIGHT);
+        assert_eq!(transposed, should_be_transposed);
+    }
+
+    #[test]
+    fn test_transpose_row_matrix() {
+        const START_INDEX: usize = 1;
+        const VALUE_LEN: usize = 30;
+        const WIDTH: usize = 1;
+        const HEIGHT: usize = 30;
+
+        let matrix_values = (START_INDEX..=VALUE_LEN).collect::<Vec<_>>();
+        let matrix = RowMajorMatrix::new(matrix_values.clone(), WIDTH);
+        let transposed = matrix.transpose();
+        let should_be_transposed = RowMajorMatrix::new(matrix_values, HEIGHT);
+        assert_eq!(transposed, should_be_transposed);
+    }
+
+    #[test]
+    fn test_transpose_rectangular_matrix() {
+        const START_INDEX: usize = 1;
+        const VALUE_LEN: usize = 30;
+        const WIDTH: usize = 5;
+        const HEIGHT: usize = 6;
+
+        let matrix_values = (START_INDEX..=VALUE_LEN).collect::<Vec<_>>();
+        let matrix = RowMajorMatrix::new(matrix_values, WIDTH);
+        let transposed = matrix.transpose();
+        let should_be_transposed_values = vec![
+            1, 6, 11, 16, 21, 26, 2, 7, 12, 17, 22, 27, 3, 8, 13, 18, 23, 28, 4, 9, 14, 19, 24, 29,
+            5, 10, 15, 20, 25, 30,
+        ];
+        let should_be_transposed = RowMajorMatrix::new(should_be_transposed_values, HEIGHT);
+        assert_eq!(transposed, should_be_transposed);
+    }
+
+    #[test]
+    fn test_transpose_larger_rectangular_matrix() {
+        const START_INDEX: usize = 1;
+        const VALUE_LEN: usize = 131072; // 512 * 256
+        const WIDTH: usize = 256;
+        const HEIGHT: usize = 512;
+
+        let matrix_values = (START_INDEX..=VALUE_LEN).collect::<Vec<_>>();
+        let matrix = RowMajorMatrix::new(matrix_values, WIDTH);
+        let transposed = matrix.transpose();
+
+        assert_eq!(transposed.width(), HEIGHT);
+        assert_eq!(transposed.height(), WIDTH);
+
+        for col_index in 0..WIDTH {
+            for row_index in 0..HEIGHT {
+                assert_eq!(
+                    matrix.values[row_index * WIDTH + col_index],
+                    transposed.values[col_index * HEIGHT + row_index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_transpose_very_large_rectangular_matrix() {
+        const START_INDEX: usize = 1;
+        const VALUE_LEN: usize = 1048576; // 512 * 256
+        const WIDTH: usize = 1024;
+        const HEIGHT: usize = 1024;
+
+        let matrix_values = (START_INDEX..=VALUE_LEN).collect::<Vec<_>>();
+        let matrix = RowMajorMatrix::new(matrix_values, WIDTH);
+        let transposed = matrix.transpose();
+
+        assert_eq!(transposed.width(), HEIGHT);
+        assert_eq!(transposed.height(), WIDTH);
+
+        for col_index in 0..WIDTH {
+            for row_index in 0..HEIGHT {
+                assert_eq!(
+                    matrix.values[row_index * WIDTH + col_index],
+                    transposed.values[col_index * HEIGHT + row_index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vertically_packed_row_scalar_width_1() {
+        type Packed = BabyBear;
+
+        let matrix = RowMajorMatrix::new((1..17).map(BabyBear::new).collect::<Vec<_>>(), 4);
+        let packed = matrix
+            .vertically_packed_row::<Packed>(2)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            packed,
+            vec![
+                BabyBear::new(9),
+                BabyBear::new(10),
+                BabyBear::new(11),
+                BabyBear::new(12),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_vertically_packed_row_pair() {
+        type Packed = FieldArray<BabyBear, 2>;
+
+        let matrix = RowMajorMatrix::new((1..17).map(BabyBear::new).collect::<Vec<_>>(), 4);
+
+        // Calling the function with r = 0 and step = 2
+        let packed = matrix.vertically_packed_row_pair::<Packed>(0, 2);
+
+        // Matrix visualization:
+        //
+        // [  1   2   3   4  ]  <-- Row 0
+        // [  5   6   7   8  ]  <-- Row 1
+        // [  9  10  11  12  ]  <-- Row 2
+        // [ 13  14  15  16  ]  <-- Row 3
+        //
+        // Packing rows 0-1 together, then rows 2-3 together:
+        //
+        // Packed result:
+        // [
+        //   (1, 5), (2, 6), (3, 7), (4, 8),   // First packed row (Row 0 & Row 1)
+        //   (9, 13), (10, 14), (11, 15), (12, 16),   // Second packed row (Row 2 & Row 3)
+        // ]
+
+        assert_eq!(
+            packed,
+            (1..5)
+                .chain(9..13)
+                .map(|i| [BabyBear::new(i), BabyBear::new(i + 4)].into())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_vertically_packed_row_pair_scalar_width_1() {
+        type Packed = BabyBear;
+
+        let matrix = RowMajorMatrix::new((1..17).map(BabyBear::new).collect::<Vec<_>>(), 4);
+        let packed = matrix.vertically_packed_row_pair::<Packed>(1, 2);
+
+        assert_eq!(
+            packed,
+            vec![
+                BabyBear::new(5),
+                BabyBear::new(6),
+                BabyBear::new(7),
+                BabyBear::new(8),
+                BabyBear::new(13),
+                BabyBear::new(14),
+                BabyBear::new(15),
+                BabyBear::new(16),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_vertically_packed_row_pair_overlap() {
+        type Packed = FieldArray<BabyBear, 2>;
+
+        let matrix = RowMajorMatrix::new((1..17).map(BabyBear::new).collect::<Vec<_>>(), 4);
+
+        // Original matrix visualization:
+        //
+        // [  1   2   3   4  ]  <-- Row 0
+        // [  5   6   7   8  ]  <-- Row 1
+        // [  9  10  11  12  ]  <-- Row 2
+        // [ 13  14  15  16  ]  <-- Row 3
+        //
+        // Packing rows 0-1 together, then rows 1-2 together:
+        //
+        // Expected packed result:
+        // [
+        //   (1, 5), (2, 6), (3, 7), (4, 8),   // First packed row (Row 0 & Row 1)
+        //   (5, 9), (6, 10), (7, 11), (8, 12) // Second packed row (Row 1 & Row 2)
+        // ]
+
+        // Calling the function with overlapping rows (r = 0 and step = 1)
+        let packed = matrix.vertically_packed_row_pair::<Packed>(0, 1);
+
+        assert_eq!(
+            packed,
+            (1..5)
+                .chain(5..9)
+                .map(|i| [BabyBear::new(i), BabyBear::new(i + 4)].into())
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_vertically_packed_row_pair_wraparound_start_1() {
+        use p3_baby_bear::BabyBear;
+        use p3_field::FieldArray;
+
+        type Packed = FieldArray<BabyBear, 2>;
+
+        let matrix = RowMajorMatrix::new((1..17).map(BabyBear::new).collect::<Vec<_>>(), 4);
+
+        // Original matrix visualization:
+        //
+        // [  1   2   3   4  ]  <-- Row 0
+        // [  5   6   7   8  ]  <-- Row 1
+        // [  9  10  11  12  ]  <-- Row 2
+        // [ 13  14  15  16  ]  <-- Row 3
+        //
+        // Packing starts from row 1, skipping 2 rows (step = 2):
+        // - The first packed row should contain row 1 & row 2.
+        // - The second packed row should contain row 3 & row 1 (wraparound case).
+        //
+        // Expected packed result:
+        // [
+        //   (5, 9), (6, 10), (7, 11), (8, 12),   // Packed row (Row 1 & Row 2)
+        //   (13, 1), (14, 2), (15, 3), (16, 4)    // Packed row (Row 3 & Row 1)
+        // ]
+
+        // Calling the function with wraparound scenario (starting at r = 1 with step = 2)
+        let packed = matrix.vertically_packed_row_pair::<Packed>(1, 2);
+
+        assert_eq!(
+            packed,
+            vec![
+                Packed::from([BabyBear::new(5), BabyBear::new(9)]),
+                Packed::from([BabyBear::new(6), BabyBear::new(10)]),
+                Packed::from([BabyBear::new(7), BabyBear::new(11)]),
+                Packed::from([BabyBear::new(8), BabyBear::new(12)]),
+                Packed::from([BabyBear::new(13), BabyBear::new(1)]),
+                Packed::from([BabyBear::new(14), BabyBear::new(2)]),
+                Packed::from([BabyBear::new(15), BabyBear::new(3)]),
+                Packed::from([BabyBear::new(16), BabyBear::new(4)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_with_zero_cols() {
+        // Test 1: Append 2 zero columns to a 2×3 matrix.
+        //
+        //     Original:             Result:
+        //     [ 1  2  3 ]    →      [ 1  2  3  0  0 ]
+        //     [ 4  5  6 ]           [ 4  5  6  0  0 ]
+        let mat: RowMajorMatrix<BabyBear> =
+            RowMajorMatrix::new((1..=6).map(BabyBear::new).collect(), 3);
+        let widened = mat.with_zero_cols(2);
+
+        // Verify the new dimensions: width grows by 2, height stays the same.
+        assert_eq!(widened.width(), 5);
+        assert_eq!(widened.height(), 2);
+
+        // Row 0: original values followed by zeros.
+        assert_eq!(
+            widened.row_slices().next().unwrap(),
+            &[
+                BabyBear::new(1),
+                BabyBear::new(2),
+                BabyBear::new(3),
+                BabyBear::ZERO,
+                BabyBear::ZERO,
+            ]
+        );
+
+        // Row 1: original values followed by zeros.
+        assert_eq!(
+            widened.row_slices().nth(1).unwrap(),
+            &[
+                BabyBear::new(4),
+                BabyBear::new(5),
+                BabyBear::new(6),
+                BabyBear::ZERO,
+                BabyBear::ZERO,
+            ]
+        );
+
+        // Test 2: Appending 0 columns returns an identical copy.
+        let same = mat.with_zero_cols(0);
+        assert_eq!(same.width(), mat.width());
+        assert_eq!(same.values, mat.values);
+
+        // Test 3: Single-row matrix.
+        //
+        //     [ 7  8 ]  →  [ 7  8  0  0  0 ]
+        let single_row: RowMajorMatrix<BabyBear> =
+            RowMajorMatrix::new(vec![BabyBear::new(7), BabyBear::new(8)], 2);
+        let widened = single_row.with_zero_cols(3);
+        assert_eq!(widened.width(), 5);
+        assert_eq!(widened.height(), 1);
+        assert_eq!(
+            widened.row_slices().next().unwrap(),
+            &[
+                BabyBear::new(7),
+                BabyBear::new(8),
+                BabyBear::ZERO,
+                BabyBear::ZERO,
+                BabyBear::ZERO,
+            ]
+        );
+
+        // Test 4: Single-column matrix widened to 3 columns.
+        //
+        //     [ 1 ]        [ 1  0  0 ]
+        //     [ 2 ]   →    [ 2  0  0 ]
+        //     [ 3 ]        [ 3  0  0 ]
+        let single_col: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(
+            vec![BabyBear::new(1), BabyBear::new(2), BabyBear::new(3)],
+            1,
+        );
+        let widened = single_col.with_zero_cols(2);
+        assert_eq!(widened.width(), 3);
+        assert_eq!(widened.height(), 3);
+        for (i, row) in widened.row_slices().enumerate() {
+            // Each row has the original value followed by two zeros.
+            assert_eq!(row[0], BabyBear::new((i + 1) as u32));
+            assert_eq!(row[1], BabyBear::ZERO);
+            assert_eq!(row[2], BabyBear::ZERO);
+        }
+
+        // Test 5: Empty matrix stays empty with updated width.
+        let empty: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(vec![], 3);
+        let widened = empty.with_zero_cols(2);
+        assert_eq!(widened.width(), 5);
+        assert_eq!(widened.height(), 0);
+        assert!(widened.values.is_empty());
+    }
+
+    #[test]
+    fn test_with_zero_cols_matches_widen_right() {
+        // Both paths must produce identical results: cloning + in-place widen
+        // with zero fill versus the dedicated method.
+        //
+        //     Original (3×4):
+        //     [  1   2   3   4 ]
+        //     [  5   6   7   8 ]
+        //     [  9  10  11  12 ]
+        let mat: RowMajorMatrix<BabyBear> =
+            RowMajorMatrix::new((1..=12).map(BabyBear::new).collect(), 4);
+
+        // Produce the result via the functional method.
+        let via_method = mat.with_zero_cols(3);
+
+        // Produce the result via move + in-place widen.
+        let mut via_widen = mat;
+        via_widen.widen_right(3, BabyBear::ZERO);
+
+        // Both matrices must be identical in dimensions and content.
+        assert_eq!(via_method.width(), via_widen.width());
+        assert_eq!(via_method.height(), via_widen.height());
+        assert_eq!(via_method.values, via_widen.values);
+    }
+
+    #[test]
+    fn test_with_random_cols() {
+        // Append 3 random columns to a 2×2 matrix using a seeded RNG.
+        // We replay the same seed independently to build the exact expected
+        // matrix, so the assertion is fully deterministic.
+        //
+        //     Original:          Result:
+        //     [ 1  2 ]    →      [ 1  2  r00  r01  r02 ]
+        //     [ 3  4 ]           [ 3  4  r10  r11  r12 ]
+        let mat: RowMajorMatrix<BabyBear> =
+            RowMajorMatrix::new((1..=4).map(BabyBear::new).collect(), 2);
+
+        let seed = 42u64;
+        let widened = mat.with_random_cols(3, SmallRng::seed_from_u64(seed));
+
+        // Verify dimensions: width grows by 3, height unchanged.
+        assert_eq!(widened.width(), 5);
+        assert_eq!(widened.height(), 2);
+
+        // Replay the same seed to produce the expected random values in the
+        // exact same order the method consumes them: row-by-row, left to right
+        // within the appended portion.
+        let mut reference_rng = SmallRng::seed_from_u64(seed);
+        for (new_row, old_row) in widened.row_slices().zip(mat.row_slices()) {
+            // Left portion must be the original data, unchanged.
+            assert_eq!(&new_row[..2], old_row);
+
+            // Right portion must match the reference RNG output exactly.
+            for val in &new_row[2..] {
+                let expected: BabyBear = reference_rng.random();
+                assert_eq!(*val, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_random_cols_zero_extra() {
+        // Appending 0 random columns returns an exact copy of the original.
+        let mat: RowMajorMatrix<BabyBear> =
+            RowMajorMatrix::new((1..=6).map(BabyBear::new).collect(), 3);
+        let same = mat.with_random_cols(0, SmallRng::seed_from_u64(0));
+        assert_eq!(same.width(), mat.width());
+        assert_eq!(same.values, mat.values);
+    }
+
+    #[test]
+    fn test_with_random_cols_empty_matrix() {
+        // An empty matrix (0 rows) remains empty with updated width.
+        let empty: RowMajorMatrix<BabyBear> = RowMajorMatrix::new(vec![], 3);
+        let widened = empty.with_random_cols(2, SmallRng::seed_from_u64(0));
+        assert_eq!(widened.width(), 5);
+        assert_eq!(widened.height(), 0);
+        assert!(widened.values.is_empty());
+    }
+
+    #[test]
+    fn test_with_random_cols_different_seeds() {
+        // Verify that two different seeds each produce the correct output by
+        // replaying both seeds independently. This is fully deterministic.
+        let mat: RowMajorMatrix<BabyBear> =
+            RowMajorMatrix::new((1..=4).map(BabyBear::new).collect(), 2);
+
+        let num_random = 4;
+        let seed_a = 1u64;
+        let seed_b = 2u64;
+
+        let result_a = mat.with_random_cols(num_random, SmallRng::seed_from_u64(seed_a));
+        let result_b = mat.with_random_cols(num_random, SmallRng::seed_from_u64(seed_b));
+
+        // Replay each seed and verify every element exactly.
+        for (seed, result) in [(seed_a, &result_a), (seed_b, &result_b)] {
+            let mut reference_rng = SmallRng::seed_from_u64(seed);
+            for (new_row, old_row) in result.row_slices().zip(mat.row_slices()) {
+                // Left portion must be the original data, unchanged.
+                assert_eq!(&new_row[..2], old_row);
+
+                // Right portion must match the reference RNG output exactly.
+                for val in &new_row[2..] {
+                    let expected: BabyBear = reference_rng.random();
+                    assert_eq!(*val, expected);
+                }
+            }
+        }
+    }
+}

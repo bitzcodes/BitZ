@@ -1,0 +1,114 @@
+name: Build and Test Limber
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --examples --benches --verbose
+
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (stable + wasm32)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # cache the wasm target, too
+          cache-targets: "true"
+      # Library-only: the poseidon_bench_config helper binary is
+      # intentionally host-only (git/toolchain probing); the WASM job
+      # continues testing the library surface it is meant to cover.
+      - name: Wasm build
+        run: cargo build --lib --no-default-features --target wasm32-unknown-unknown
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (stable)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+      # The full nonignored release suite (includes the pure flag-parser
+      # tests, the non-proving H=10 structural test, and the release
+      # instances of the context regressions; only the H=10 proof stays
+      # ignored).
+      - name: Run tests
+        run: cargo test --release --verbose
+      # The named field-context regressions must also pass in DEBUG:
+      # nothing may depend on debug assertions, and the mixed-context
+      # rejection must be a clean error, never a panic, in both profiles.
+      - name: Context regressions (debug)
+        run: |
+          cargo test --lib imod_modp_rejects_wrong_digest_context
+          cargo test --lib imod_modp_rejects_wrong_vk_context
+
+  kat-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv (pinned)
+        run: pip install uv==0.12.5
+      # Read-only drift check: regenerate the KAT fixture in memory from
+      # the independent Python generator and byte-compare canonical JSON.
+      - name: Poseidon2 KAT check
+        run: uv run scripts/gen_poseidon_kat.py --check tests/data/poseidon2_kat_v1.json
+
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (stable + rustfmt)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Check Rustfmt Code Style
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check clippy warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  spelling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spell Check Repo
+        uses: crate-ci/typos@685eb3d55be2f85191e8c84acb9f44d7756f84ab

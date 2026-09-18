@@ -1,0 +1,335 @@
+// Copyright 2026 The Binius Developers
+
+//! ZK-wrapped prover channel that runs an inner proof and then proves the outer
+//! wrapper constraint system.
+//!
+//! [`ZKWrappedProverChannel`] wraps a [`BaseFoldProverChannel`] and records all channel values.
+//! On `send_*`/`sample`/`observe_*`, it delegates to the inner BaseFold channel and records
+//! each value. After the inner proof is run, [`finish`] replays the recorded interaction through
+//! a caller-provided closure to fill the outer witness, then runs the outer IOP prover.
+//!
+//! [`BaseFoldProverChannel`]: binius_iop_prover::basefold::channel::BaseFoldProverChannel
+//! [`finish`]: ZKWrappedProverChannel::finish
+
+use std::{iter::repeat_with, sync::Arc};
+
+use binius_compute::Allocator;
+use binius_field::{BinaryField, PackedField};
+use binius_iop::channel::OracleSpec;
+use binius_iop_prover::{
+	basefold::channel::{BaseFoldOracle, BaseFoldProverChannel},
+	channel::IOPProverChannel,
+	merkle_channel::MerkleIPProverChannel,
+};
+use binius_ip_prover::channel::{IPProverChannel, WordIPProverChannel};
+use binius_math::{FieldSlice, FieldVec, ntt::AdditiveNTT};
+use binius_spartan_frontend::constraint_system::WitnessLayout;
+use binius_spartan_verifier::IOPVerifier;
+use rand::CryptoRng;
+
+use crate::{Error, IOPProver, pack_and_blind_witness, wrapper::ReplayChannel};
+
+/// A prover channel that wraps a [`BaseFoldProverChannel`] and an outer Spartan IOP prover.
+///
+/// This channel records all channel values. On
+/// `send_*`/`sample`/`observe_*`, it delegates to the inner BaseFold channel and records each
+/// value. After the inner proof is run through this channel, call
+/// [`finish`](Self::finish) to replay the interaction, fill the outer witness, and generate the
+/// outer proof.
+///
+/// The `ReplayFn` closure is called during [`finish`](Self::finish) with a [`ReplayChannel`] to
+/// replay the inner verification and fill the outer witness. This allows the channel to be generic
+/// over different inner verification protocols.
+pub struct ZKWrappedProverChannel<'a, P, NTT, Channel, ReplayFn, A>
+where
+	P: PackedField<Scalar: BinaryField>,
+	NTT: AdditiveNTT<Field = P::Scalar> + Sync,
+	Channel: MerkleIPProverChannel<P::Scalar>,
+	A: Allocator,
+{
+	inner_channel: BaseFoldProverChannel<'a, P::Scalar, P, NTT, Channel, A>,
+	outer_prover: &'a IOPProver<P::Scalar>,
+	/// Allocator for the outer proof's working buffers, borrowed from the owning prover so it
+	/// outlives this per-proof channel. Used in [`Self::finish`].
+	alloc: &'a A,
+	outer_layout: Arc<WitnessLayout<P::Scalar>>,
+	replay_fn: ReplayFn,
+	keys: Vec<P::Scalar>,
+	next_key_idx: usize,
+	interaction: Vec<P::Scalar>,
+	/// Handle to the outer precommit oracle committed at construction time. The buffer
+	/// (`precommit_packed`) is purely random — it is the one-time-pad encryption key for the
+	/// outer encrypted transcript (to be wired up in a follow-up; for now the outer circuit has
+	/// no precommit wires that reference it).
+	precommit_oracle: BaseFoldOracle,
+	precommit_packed: FieldVec<P, A>,
+	/// Number of outer oracles still to be committed on `inner_channel` during `finish` (the
+	/// outer prover's non-precommit oracles — private and mask).
+	n_outer_suffix_oracles: usize,
+}
+
+impl<'a, F, P, NTT, Channel, ReplayFn, A> ZKWrappedProverChannel<'a, P, NTT, Channel, ReplayFn, A>
+where
+	F: BinaryField,
+	P: PackedField<Scalar = F>,
+	NTT: AdditiveNTT<Field = F> + Sync,
+	Channel: MerkleIPProverChannel<F>,
+	A: Allocator,
+{
+	/// Creates a new ZK-wrapped prover channel.
+	///
+	/// Commits the outer prover's precommit oracle on the inner channel as part of construction:
+	/// a random [`FieldBuffer<P>`](binius_math::FieldBuffer) the size of the outer precommit oracle
+	/// segment is sent to the channel and kept for use in [`Self::finish`]. This random buffer is
+	/// the one-time-pad encryption key for the (future) outer encrypted transcript.
+	///
+	/// The inner channel's oracle specs are expected to be laid out as
+	/// `[outer_precommit, inner..., outer_private, outer_mask]`.
+	///
+	/// # Arguments
+	///
+	/// * `inner_channel` - The BaseFold ZK channel with oracle specs for both inner and outer
+	///   proofs
+	/// * `outer_prover` - The IOP prover for the outer (wrapper) constraint system
+	/// * `outer_layout` - The witness layout for the outer constraint system
+	/// * `alloc` - Allocator for the outer proof's working buffers, borrowed from the owning prover
+	/// * `rng` - RNG used to generate the random precommit buffer (the future OTP key)
+	/// * `replay_fn` - Closure called during [`finish`](Self::finish) with a [`ReplayChannel`] to
+	///   replay the inner verification and fill the outer witness
+	pub fn new(
+		mut inner_channel: BaseFoldProverChannel<'a, F, P, NTT, Channel, A>,
+		outer_prover: &'a IOPProver<F>,
+		outer_layout: Arc<WitnessLayout<F>>,
+		alloc: &'a A,
+		rng: impl CryptoRng,
+		replay_fn: ReplayFn,
+	) -> Self {
+		let outer_oracle_specs =
+			IOPVerifier::new(outer_prover.constraint_system().clone()).oracle_specs();
+		let all_specs = inner_channel.remaining_oracle_specs();
+		let n_outer = outer_oracle_specs.len();
+		assert!(
+			n_outer >= 1 && all_specs.len() >= n_outer,
+			"outer oracle specs ({n_outer}) exceed channel oracle specs ({}) or are empty",
+			all_specs.len(),
+		);
+		assert_eq!(
+			all_specs[0], outer_oracle_specs[0],
+			"outer precommit oracle spec must be the first spec on the channel",
+		);
+		let suffix_len = n_outer - 1;
+		assert_eq!(
+			&all_specs[all_specs.len() - suffix_len..],
+			&outer_oracle_specs[1..],
+			"outer private/mask oracle specs must be the final suffix of channel specs",
+		);
+
+		let (keys, precommit_oracle, precommit_packed) = {
+			let _scope = tracing::debug_span!("Commit Transcript Mask").entered();
+			Self::commit_transcript_mask(&mut inner_channel, outer_prover, alloc, rng)
+		};
+
+		Self {
+			inner_channel,
+			outer_prover,
+			alloc,
+			outer_layout,
+			replay_fn,
+			keys,
+			next_key_idx: 0,
+			interaction: Vec::new(),
+			precommit_oracle,
+			precommit_packed,
+			n_outer_suffix_oracles: suffix_len,
+		}
+	}
+
+	/// Commits random OTP keys as the outer precommit oracle. Each key encrypts one element sent by
+	/// the inner prover through this wrapped channel; the outer CS (built symbolically from the
+	/// inner verifier) contains a matching precommit wire per key that the outer proof uses to
+	/// decrypt.
+	fn commit_transcript_mask(
+		inner_channel: &mut BaseFoldProverChannel<'a, F, P, NTT, Channel, A>,
+		outer_prover: &IOPProver<F>,
+		alloc: &A,
+		mut rng: impl CryptoRng,
+	) -> (Vec<F>, BaseFoldOracle, FieldVec<P, A>) {
+		let cs = outer_prover.constraint_system();
+		let keys = repeat_with(|| F::random(&mut rng))
+			.take(cs.n_precommit() as usize)
+			.collect::<Vec<F>>();
+		let precommit_blinding = *cs.blinding_info();
+		let precommit_packed = pack_and_blind_witness::<_, _, P>(
+			alloc,
+			cs.log_precommit() as usize,
+			&keys,
+			cs.n_precommit() as usize,
+			&precommit_blinding,
+			&mut rng,
+		);
+		let precommit_oracle = inner_channel.send_oracle(precommit_packed.as_view());
+		(keys, precommit_oracle, precommit_packed)
+	}
+
+	fn next_key(&mut self) -> F {
+		let key = self.keys[self.next_key_idx];
+		self.next_key_idx += 1;
+		key
+	}
+
+	/// Consumes the channel and runs the outer proof.
+	///
+	/// This should be called after the inner proof has been run through this channel.
+	/// It:
+	/// 1. Creates a [`ReplayChannel`] from the recorded interaction
+	/// 2. Calls the `replay_fn` closure to replay the inner verification and fill the outer witness
+	/// 3. Validates and generates the outer IOP proof
+	pub fn finish(self, rng: impl CryptoRng) -> Result<(), Error>
+	where
+		ReplayFn: FnOnce(&mut ReplayChannel<F>),
+	{
+		let Self {
+			mut inner_channel,
+			outer_prover,
+			alloc,
+			outer_layout,
+			replay_fn,
+			keys,
+			interaction,
+			precommit_oracle,
+			precommit_packed,
+			..
+		} = self;
+
+		// Replay the inner verification through the outer witness generator.
+		let witness = {
+			let _scope = tracing::debug_span!("Generating ZK wrapper witness").entered();
+			let mut replay_channel = ReplayChannel::new(outer_layout, keys, interaction);
+			replay_fn(&mut replay_channel);
+			replay_channel
+				.finish()
+				.expect("outer witness generation should not fail")
+		};
+
+		// Validate and generate the outer proof.
+		outer_prover.prove::<P, _, _>(
+			&witness,
+			precommit_oracle,
+			precommit_packed,
+			rng,
+			&mut inner_channel,
+			alloc,
+		)?;
+		// Both the inner and outer proofs queued their oracle relations onto `inner_channel`; run
+		// the single combined opening over all committed oracles now.
+		inner_channel.finish();
+		Ok(())
+	}
+}
+
+impl<F, P, NTT, Channel, ReplayFn, A> IPProverChannel<F>
+	for ZKWrappedProverChannel<'_, P, NTT, Channel, ReplayFn, A>
+where
+	F: BinaryField,
+	P: PackedField<Scalar = F>,
+	NTT: AdditiveNTT<Field = F> + Sync,
+	Channel: MerkleIPProverChannel<F>,
+	A: Allocator,
+{
+	fn send_one(&mut self, elem: F) {
+		let key = self.next_key();
+		// Encrypt the element with the OTP key before sending. Record the encrypted value in
+		// `interaction` — that's what the outer witness's inout wires hold (and what the replay
+		// side adds the key back to in order to recover the plaintext for the inner verifier).
+		let encrypted = elem + key;
+		self.inner_channel.send_one(encrypted);
+		self.interaction.push(encrypted);
+	}
+
+	fn send_public_claim(&mut self, elem: F) {
+		// A claim is a function of public values, so it is sent in the clear and consumes no OTP
+		// key. `interaction` records the plaintext, which is what the outer witness's inout wire
+		// holds and what the replay hands the inner verifier.
+		self.inner_channel.send_one(elem);
+		self.interaction.push(elem);
+	}
+
+	fn observe_one(&mut self, val: F) {
+		self.inner_channel.observe_one(val);
+		self.interaction.push(val);
+	}
+
+	fn sample(&mut self) -> F {
+		let val = self.inner_channel.sample();
+		self.interaction.push(val);
+		val
+	}
+}
+
+impl<F, P, NTT, Channel, ReplayFn, A> WordIPProverChannel<F>
+	for ZKWrappedProverChannel<'_, P, NTT, Channel, ReplayFn, A>
+where
+	F: BinaryField,
+	P: PackedField<Scalar = F>,
+	NTT: AdditiveNTT<Field = F> + Sync,
+	Channel: MerkleIPProverChannel<F>,
+	A: Allocator,
+{
+	type Word = Channel::Word;
+
+	fn observe_words(&mut self, words: &[Self::Word]) {
+		// Only the inner Fiat-Shamir state takes the words. Nothing is recorded for replay, since
+		// the replay channel observes nothing either.
+		self.inner_channel.observe_words(words);
+	}
+
+	fn sample_bits(&mut self, bits: usize) -> Self::Word {
+		self.inner_channel.sample_bits(bits)
+	}
+}
+
+impl<F, P, NTT, Channel, ReplayFn, A> IOPProverChannel<P, A>
+	for ZKWrappedProverChannel<'_, P, NTT, Channel, ReplayFn, A>
+where
+	F: BinaryField,
+	P: PackedField<Scalar = F>,
+	NTT: AdditiveNTT<Field = F> + Sync,
+	Channel: MerkleIPProverChannel<F>,
+	A: Allocator,
+{
+	type Oracle = BaseFoldOracle;
+
+	fn remaining_oracle_specs(&self) -> &[OracleSpec] {
+		let remaining = self.inner_channel.remaining_oracle_specs();
+		let n_inner_remaining = remaining.len() - self.n_outer_suffix_oracles;
+		&remaining[..n_inner_remaining]
+	}
+
+	fn send_oracle(&mut self, buffer: FieldSlice<'_, P>) -> Self::Oracle {
+		assert!(
+			!self.remaining_oracle_specs().is_empty(),
+			"send_oracle called but no inner oracle specs remaining"
+		);
+		self.inner_channel.send_oracle(buffer)
+	}
+
+	fn prove_oracle_relation(
+		&mut self,
+		oracle: Self::Oracle,
+		transparent: FieldVec<P, A>,
+		claim: P::Scalar,
+	) {
+		// For each oracle opening, the prover sends the decrypted evaluation. The outer verifier
+		// checks in the circuit equality of this value with the expected expression over encrypted
+		// values.
+		self.inner_channel.send_one(claim);
+		self.interaction.push(claim);
+
+		self.inner_channel
+			.prove_oracle_relation(oracle, transparent, claim);
+	}
+
+	fn finalize_oracle(&mut self, oracle: Self::Oracle, buffer: FieldVec<P, A>) {
+		self.inner_channel.finalize_oracle(oracle, buffer);
+	}
+}

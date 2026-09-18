@@ -1,0 +1,752 @@
+mod data;
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+pub use data::VerifierData;
+use p3_air::symbolic::{AirLayout, SymbolicExpressionExt};
+use p3_air::{Air, BaseAir};
+use p3_commit::{CommitmentWithOpeningPoints, Pcs, PolynomialSpace};
+use p3_field::{Algebra, BasedVectorSpace, ExtensionField, PrimeCharacteristicRing, PrimeField};
+use p3_lookup::folder::VerifierConstraintFolderWithLookups;
+use p3_lookup::logup::LogUpGadget;
+use p3_lookup::{
+    InteractionSymbolicBuilder, LookupError, LookupProtocol, check_multiplicity_height_bound,
+};
+use p3_uni_stark::{
+    InvalidProofShapeError, VerificationError, check_periodic_column_lengths,
+    recompose_quotient_from_chunks, validate_degree_bits,
+};
+use p3_util::checked_log_size_sum;
+use p3_util::zip_eq::zip_eq;
+use tracing::{info_span, instrument};
+
+use crate::common::CommonData;
+use crate::config::{Challenge, Commitment, Domain, PcsError, StarkGenericConfig as SGC, Val};
+use crate::error::BatchVerificationError;
+use crate::proof::{BatchCommitments, BatchOpenedValues, BatchProof};
+use crate::symbolic::get_log_num_quotient_chunks;
+use crate::transcript::BatchTranscript;
+
+/// What [`commitments_with_opening_points`] builds: the PCS opening argument itself — one
+/// [`CommitmentWithOpeningPoints`] per commitment round — paired with each instance's
+/// quotient-chunk domains, a byproduct of the same construction that the caller needs for its
+/// own post-opening constraint check.
+pub type OpeningArgumentWithQuotientDomains<SC> = (
+    Vec<CommitmentWithOpeningPoints<Challenge<SC>, Commitment<SC>, Domain<SC>>>,
+    Vec<Vec<Domain<SC>>>,
+);
+
+/// Builds the `commitments_with_opening_points` a batch-STARK proof's PCS opening argument is
+/// checked against: one round per commitment (an optional ZK-randomization round, the trace
+/// round, the quotient-chunks round, an optional preprocessed round, an optional permutation
+/// round), each pairing a commitment with the domains/points/claimed-evaluations
+/// [`Pcs::verify`] checks it at.
+///
+/// This is exactly what [`verify_batch`] builds internally before calling `pcs.verify` — pulled
+/// out so a caller that has already sampled `zeta` from its own transcript replay (and already
+/// has the per-instance shape data `verify_batch`'s own precompute loop derives) can build the
+/// same structure without needing a live `A: Air<...>` reference for anything beyond
+/// [`BaseAir::main_next_row_columns`]/[`BaseAir::preprocessed_next_row_columns`] — e.g. a
+/// recursive verifier that reads trace width and quotient degree from the proof's own
+/// opened-value shape instead of a live AIR.
+///
+/// # Arguments
+///
+/// - `zeta` — the out-of-domain point, already sampled from the transcript.
+/// - `degree_bits` — per-instance extended trace degree bits, straight from the proof. Both
+///   the trace and quotient domain sizes are derived from these through the same
+///   [`validate_degree_bits`] gate `verify_batch` applies.
+/// - `preprocessed_widths`, `log_num_quotient_chunks` — per-instance, derived exactly as
+///   `verify_batch`'s own precompute loop computes them. The committed chunk count follows
+///   from `log_num_quotient_chunks` and the ZK setting, so it is derived here rather than
+///   passed in.
+///
+/// Performs no transcript interaction.
+///
+/// # Omitted checks
+///
+/// Only the shape checks this construction itself needs are performed (degree-bit bounds,
+/// quotient-domain sizes, matching quotient-chunk counts, preprocessed metadata agreement).
+/// A caller assembling the opening argument itself inherits the rest of `verify_batch`'s
+/// proof-shape validation, none of which happens here:
+///
+/// - per-instance counts agreeing across `airs`, opened values, public values, degree bits,
+///   lookup terminals and lookups ([`InvalidProofShapeError::InstanceCountMismatch`]);
+/// - presence of the ZK randomization commitment and its per-instance opened values matching
+///   [`Pcs::ZK`], and each random opening's dimension;
+/// - public-value counts, trace-width agreement (local and next) and the
+///   `main_next_row_columns` presence rule;
+/// - quotient-chunk counts and per-chunk dimensions;
+/// - preprocessed presence/width agreement against `CommonData` and the
+///   `preprocessed_next_row_columns` presence rule;
+/// - one lookup terminal per AIR with lookups and none otherwise, plus the lookup-commitment
+///   consistency check (`commitments.permutation.is_some()` iff some AIR has lookups);
+/// - [`check_multiplicity_height_bound`], the LogUp bound that stops multiplicities wrapping
+///   modulo `p`;
+/// - [`check_periodic_column_lengths`].
+///
+/// A caller needing all of them should either call `verify_batch` directly or replicate the
+/// ones it needs.
+///
+/// # Returns
+///
+/// `(commitments_with_opening_points, quotient_domains)` — the second element is each
+/// instance's quotient-chunk domains, a byproduct of this construction that `verify_batch`
+/// also needs for its own post-opening constraint check.
+#[expect(clippy::too_many_arguments)]
+pub fn commitments_with_opening_points<SC, A>(
+    config: &SC,
+    airs: &[A],
+    zeta: Challenge<SC>,
+    commitments: &BatchCommitments<Commitment<SC>>,
+    opened_values: &BatchOpenedValues<Challenge<SC>>,
+    common: &CommonData<SC>,
+    degree_bits: &[usize],
+    preprocessed_widths: &[usize],
+    log_num_quotient_chunks: &[usize],
+) -> Result<OpeningArgumentWithQuotientDomains<SC>, BatchVerificationError<PcsError<SC>>>
+where
+    SC: SGC,
+    A: BaseAir<Val<SC>>,
+{
+    let pcs = config.pcs();
+    let is_zk = config.is_zk();
+    let mut coms_to_verify = vec![];
+
+    // Trace round: per instance, open at zeta and zeta_next.
+    //
+    // The extended domain size is `1 << degree_bits[i]`, gated by `validate_degree_bits` so
+    // that an out-of-range degree is an error rather than an overflow, and so that a caller
+    // cannot pass a domain size disagreeing with the degree bits it also passed.
+    let trace_domain_pairs = degree_bits
+        .iter()
+        .enumerate()
+        .map(|(i, &ext_db)| {
+            let (_, ext_domain_size) =
+                validate_degree_bits(Some(i), ext_db, is_zk, pcs.log_max_lde_height())?;
+            Ok((
+                pcs.natural_domain_for_degree(ext_domain_size >> is_zk),
+                pcs.natural_domain_for_degree(ext_domain_size),
+            ))
+        })
+        .collect::<Result<Vec<_>, InvalidProofShapeError>>()?;
+    let (trace_domains, ext_trace_domains): (Vec<Domain<SC>>, Vec<Domain<SC>>) =
+        trace_domain_pairs.into_iter().unzip();
+
+    if let Some(random_commit) = &commitments.random {
+        coms_to_verify.push((
+            random_commit.clone(),
+            ext_trace_domains
+                .iter()
+                .zip(opened_values.instances.iter())
+                .map(|(domain, inst_opened_vals)| {
+                    // We already checked that random is present for each instance when ZK is enabled.
+                    let random_vals = inst_opened_vals.base_opened_values.random.as_ref().unwrap();
+                    (*domain, vec![(zeta, random_vals.clone())])
+                })
+                .collect::<Vec<_>>(),
+        ));
+    }
+
+    let trace_round: Vec<_> = ext_trace_domains
+        .iter()
+        .zip(opened_values.instances.iter())
+        .enumerate()
+        .map(|(i, (ext_dom, inst_opened_vals))| {
+            let mut points = vec![(
+                zeta,
+                inst_opened_vals.base_opened_values.trace_local.clone(),
+            )];
+            if !airs[i].main_next_row_columns().is_empty() {
+                let zeta_next = trace_domains[i]
+                    .next_point(zeta)
+                    .ok_or(VerificationError::NextPointUnavailable)?;
+                points.push((
+                    zeta_next,
+                    inst_opened_vals
+                        .base_opened_values
+                        .trace_next
+                        .clone()
+                        .expect("checked in shape validation"),
+                ));
+            }
+            Ok((*ext_dom, points))
+        })
+        .collect::<Result<Vec<_>, VerificationError<PcsError<SC>>>>()?;
+    coms_to_verify.push((commitments.main.clone(), trace_round));
+
+    // Quotient chunks round: flatten per-instance chunks to match commit order.
+    // Use extended domains for the outer commit domain, with size = base_degree * num_quotient_chunks.
+    let quotient_domains: Vec<Vec<Domain<SC>>> = (0..degree_bits.len())
+        .map(|i| {
+            let ext_db = degree_bits[i];
+            let log_num_chunks = log_num_quotient_chunks[i];
+            // The committed chunk count, ZK randomization included.
+            let (_, n_chunks) = checked_log_size_sum(log_num_chunks, is_zk).ok_or_else(|| {
+                InvalidProofShapeError::QuotientDomainTooLarge {
+                    air: Some(i),
+                    maximum: usize::BITS as usize - 1,
+                    got: log_num_chunks.saturating_add(is_zk),
+                }
+            })?;
+            let ext_dom = ext_trace_domains[i];
+            let (quotient_domain_log_size, quotient_domain_size) =
+                checked_log_size_sum(ext_db, log_num_chunks).ok_or_else(|| {
+                    InvalidProofShapeError::QuotientDomainTooLarge {
+                        air: Some(i),
+                        maximum: usize::BITS as usize - 1,
+                        got: ext_db.saturating_add(log_num_chunks),
+                    }
+                })?;
+            let qdom = ext_dom
+                .try_create_disjoint_domain(quotient_domain_size)
+                .ok_or_else(|| InvalidProofShapeError::QuotientDomainTooLarge {
+                    air: Some(i),
+                    maximum: pcs.log_max_lde_height(),
+                    got: quotient_domain_log_size,
+                })?;
+            Ok(qdom.split_domains(n_chunks))
+        })
+        .collect::<Result<Vec<_>, InvalidProofShapeError>>()?;
+
+    // When ZK is enabled, the size of the quotient chunks' domains doubles.
+    let randomized_quotient_chunks_domains = quotient_domains
+        .iter()
+        .map(|doms| {
+            doms.iter()
+                .map(|dom| pcs.natural_domain_for_degree(dom.size() << is_zk))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    // Build the per-matrix openings for the aggregated quotient commitment.
+    let mut qc_round = Vec::new();
+    for (i, domains) in randomized_quotient_chunks_domains.iter().enumerate() {
+        let inst_qcs = &opened_values.instances[i]
+            .base_opened_values
+            .quotient_chunks;
+        for (d, vals) in zip_eq(
+            domains.iter(),
+            inst_qcs,
+            VerificationError::from(InvalidProofShapeError::QuotientDomainsCountMismatch {
+                air: i,
+            }),
+        )? {
+            qc_round.push((*d, vec![(zeta, vals.clone())]));
+        }
+    }
+    coms_to_verify.push((commitments.quotient_chunks.clone(), qc_round));
+
+    // Preprocessed rounds: a single global commitment with one matrix per
+    // instance that has preprocessed columns.
+    if let Some(global) = &common.preprocessed {
+        let mut pre_round = Vec::new();
+
+        for (matrix_index, &inst_idx) in global.matrix_to_instance.iter().enumerate() {
+            let pre_w = preprocessed_widths[inst_idx];
+            if pre_w == 0 {
+                return Err(
+                    InvalidProofShapeError::PreprocessedMetadataMismatch { air: inst_idx }.into(),
+                );
+            }
+
+            let inst = &opened_values.instances[inst_idx];
+            let local = inst
+                .base_opened_values
+                .preprocessed_local
+                .as_ref()
+                .ok_or_else(|| {
+                    VerificationError::from(InvalidProofShapeError::MissingPreprocessedValues {
+                        air: inst_idx,
+                    })
+                })?;
+
+            // Validate that the preprocessed data's extended degree matches what we expect.
+            let ext_db = degree_bits[inst_idx];
+
+            let meta = global.instances[inst_idx].as_ref().ok_or_else(|| {
+                VerificationError::from(InvalidProofShapeError::PreprocessedMetadataMismatch {
+                    air: inst_idx,
+                })
+            })?;
+            if meta.matrix_index != matrix_index || meta.degree_bits != ext_db {
+                return Err(
+                    InvalidProofShapeError::PreprocessedMetadataMismatch { air: inst_idx }.into(),
+                );
+            }
+
+            let meta_db = meta.degree_bits;
+            let pre_domain = pcs.natural_domain_for_degree(1 << meta_db);
+            if !airs[inst_idx].preprocessed_next_row_columns().is_empty() {
+                let next = inst
+                    .base_opened_values
+                    .preprocessed_next
+                    .as_ref()
+                    .ok_or_else(|| {
+                        VerificationError::from(InvalidProofShapeError::MissingPreprocessedValues {
+                            air: inst_idx,
+                        })
+                    })?;
+                let zeta_next_i = trace_domains[inst_idx]
+                    .next_point(zeta)
+                    .ok_or(VerificationError::NextPointUnavailable)?;
+
+                pre_round.push((
+                    pre_domain,
+                    vec![(zeta, local.clone()), (zeta_next_i, next.clone())],
+                ));
+            } else {
+                pre_round.push((pre_domain, vec![(zeta, local.clone())]));
+            }
+        }
+
+        coms_to_verify.push((global.commitment.clone(), pre_round));
+    }
+
+    if commitments.permutation.is_some() {
+        let permutation_commit = commitments.permutation.clone().unwrap();
+        let mut permutation_round = Vec::new();
+        for (i, (ext_dom, inst_opened_vals)) in ext_trace_domains
+            .iter()
+            .zip(opened_values.instances.iter())
+            .enumerate()
+        {
+            if inst_opened_vals.permutation_local.len() != inst_opened_vals.permutation_next.len() {
+                return Err(LookupError::PermutationLengthMismatch { air: i }.into());
+            }
+            if !inst_opened_vals.permutation_local.is_empty() {
+                let zeta_next = trace_domains[i]
+                    .next_point(zeta)
+                    .ok_or(VerificationError::NextPointUnavailable)?;
+                permutation_round.push((
+                    *ext_dom,
+                    vec![
+                        (zeta, inst_opened_vals.permutation_local.clone()),
+                        (zeta_next, inst_opened_vals.permutation_next.clone()),
+                    ],
+                ));
+            }
+        }
+        coms_to_verify.push((permutation_commit, permutation_round));
+    }
+
+    Ok((coms_to_verify, quotient_domains))
+}
+
+#[instrument(skip_all)]
+pub fn verify_batch<SC, A>(
+    config: &SC,
+    airs: &[A],
+    proof: &BatchProof<SC>,
+    public_values: &[Vec<Val<SC>>],
+    common: &CommonData<SC>,
+) -> Result<(), BatchVerificationError<PcsError<SC>>>
+where
+    SC: SGC,
+    Val<SC>: PrimeField,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
+    A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>
+        + for<'a> Air<VerifierConstraintFolderWithLookups<'a, SC>>,
+    Challenge<SC>: BasedVectorSpace<Val<SC>>,
+{
+    // TODO: Extend if additional lookup gadgets are added.
+    let lookup_gadget = LogUpGadget::new();
+
+    let BatchProof {
+        commitments,
+        opened_values,
+        opening_proof,
+        lookup_terminals,
+        degree_bits,
+    } = proof;
+
+    let all_lookups = &common.lookups;
+
+    let pcs = config.pcs();
+    let mut transcript = BatchTranscript::<SC>::new(config.initialise_challenger());
+
+    // Sanity checks
+    if airs.len() != opened_values.instances.len()
+        || airs.len() != public_values.len()
+        || airs.len() != degree_bits.len()
+        || airs.len() != lookup_terminals.len()
+        || airs.len() != all_lookups.len()
+        || common
+            .preprocessed
+            .as_ref()
+            .is_some_and(|global| global.instances.len() != airs.len())
+    {
+        return Err(InvalidProofShapeError::InstanceCountMismatch.into());
+    }
+
+    // Check that the random commitments are/are not present depending on the ZK setting.
+    // - If ZK is enabled, the prover should have random commitments.
+    // - If ZK is not enabled, the prover should not have random commitments.
+    if (opened_values
+        .instances
+        .iter()
+        .any(|ov| ov.base_opened_values.random.is_some() != SC::Pcs::ZK))
+        || (commitments.random.is_some() != SC::Pcs::ZK)
+    {
+        return Err(VerificationError::RandomizationError.into());
+    }
+
+    // Validate opened values shape per instance and observe per-instance binding data.
+    // Precompute per-instance preprocessed widths and number of quotient chunks.
+    let mut preprocessed_widths = Vec::with_capacity(airs.len());
+    // Number of quotient chunks per instance before ZK randomization.
+    let mut log_num_quotient_chunks = Vec::with_capacity(airs.len());
+    // The total number of quotient chunks, including ZK randomization.
+    let mut num_quotient_chunks = Vec::with_capacity(airs.len());
+    let mut base_degree_bits = Vec::with_capacity(airs.len());
+    let mut ext_domain_sizes = Vec::with_capacity(airs.len());
+
+    for (i, air) in airs.iter().enumerate() {
+        let (base_db, ext_domain_size) = validate_degree_bits(
+            Some(i),
+            degree_bits[i],
+            config.is_zk(),
+            pcs.log_max_lde_height(),
+        )?;
+        base_degree_bits.push(base_db);
+        ext_domain_sizes.push(ext_domain_size);
+
+        let pre_w = common
+            .preprocessed
+            .as_ref()
+            .and_then(|g| g.instances[i].as_ref().map(|m| m.width))
+            .unwrap_or(0);
+        preprocessed_widths.push(pre_w);
+
+        let layout = AirLayout {
+            preprocessed_width: pre_w,
+            main_width: air.width(),
+            num_public_values: air.num_public_values(),
+            num_periodic_columns: air.num_periodic_columns(),
+            ..Default::default()
+        };
+        let log_num_chunks =
+            info_span!("infer log of constraint degree", air_idx = i).in_scope(|| {
+                get_log_num_quotient_chunks::<Val<SC>, SC::Challenge, A, LogUpGadget>(
+                    air,
+                    layout,
+                    1usize << base_db,
+                    &all_lookups[i],
+                    config.is_zk(),
+                    &lookup_gadget,
+                )
+            });
+        log_num_quotient_chunks.push(log_num_chunks);
+
+        let (_, n_chunks) =
+            checked_log_size_sum(log_num_chunks, config.is_zk()).ok_or_else(|| {
+                InvalidProofShapeError::QuotientDomainTooLarge {
+                    air: Some(i),
+                    maximum: usize::BITS as usize - 1,
+                    got: log_num_chunks.saturating_add(config.is_zk()),
+                }
+            })?;
+        num_quotient_chunks.push(n_chunks);
+    }
+
+    // Soundness: bound LogUp multiplicities so none wraps modulo p.
+    // Base degree bits give the same heights the prover used.
+    let trace_heights: Vec<usize> = base_degree_bits.iter().map(|&b| 1usize << b).collect();
+    check_multiplicity_height_bound(all_lookups, &trace_heights)?;
+
+    // Observe the instance count up front to match the prover's transcript.
+    transcript.observe_instance_count(airs.len());
+
+    for (i, air) in airs.iter().enumerate() {
+        let air_width = A::width(air);
+        let expected_public_values_len = air.num_public_values();
+        let got_public_values_len = public_values[i].len();
+        let inst_opened_vals = &opened_values.instances[i];
+        let inst_base_opened_vals = &inst_opened_vals.base_opened_values;
+
+        if got_public_values_len != expected_public_values_len {
+            return Err(InvalidProofShapeError::PublicValuesLengthMismatch {
+                expected: expected_public_values_len,
+                got: got_public_values_len,
+            }
+            .into());
+        }
+
+        // Validate trace widths match the AIR
+        if inst_base_opened_vals.trace_local.len() != air_width {
+            return Err(InvalidProofShapeError::TraceLocalWidthMismatch {
+                air: i,
+                expected: air_width,
+                got: inst_base_opened_vals.trace_local.len(),
+            }
+            .into());
+        }
+        if !airs[i].main_next_row_columns().is_empty() {
+            if inst_base_opened_vals
+                .trace_next
+                .as_ref()
+                .is_none_or(|v| v.len() != air_width)
+            {
+                return Err(InvalidProofShapeError::TraceNextMismatch { air: i }.into());
+            }
+        } else if inst_base_opened_vals.trace_next.is_some() {
+            return Err(InvalidProofShapeError::UnexpectedTraceNext { air: i }.into());
+        }
+
+        // Validate quotient chunks structure
+        let n_chunks = num_quotient_chunks[i];
+        if inst_base_opened_vals.quotient_chunks.len() != n_chunks {
+            return Err(InvalidProofShapeError::QuotientChunksCountMismatch {
+                air: i,
+                expected: n_chunks,
+                got: inst_base_opened_vals.quotient_chunks.len(),
+            }
+            .into());
+        }
+
+        for chunk in &inst_base_opened_vals.quotient_chunks {
+            if chunk.len() != Challenge::<SC>::DIMENSION {
+                return Err(
+                    InvalidProofShapeError::QuotientChunkDimensionMismatch { air: i }.into(),
+                );
+            }
+        }
+
+        // Validate random commit
+        if inst_opened_vals
+            .base_opened_values
+            .random
+            .as_ref()
+            .is_some_and(|r_comm| r_comm.len() != SC::Challenge::DIMENSION)
+        {
+            return Err(VerificationError::RandomizationError.into());
+        }
+
+        // Validate that any preprocessed width implied by CommonData matches the opened shapes.
+        let pre_w = preprocessed_widths[i];
+        let pre_local_len = inst_base_opened_vals
+            .preprocessed_local
+            .as_ref()
+            .map_or(0, |v| v.len());
+        let pre_next_len = inst_base_opened_vals
+            .preprocessed_next
+            .as_ref()
+            .map_or(0, |v| v.len());
+        if pre_w == 0 {
+            if pre_local_len != 0 || pre_next_len != 0 {
+                return Err(InvalidProofShapeError::UnexpectedPreprocessedValues { air: i }.into());
+            }
+        } else if !airs[i].preprocessed_next_row_columns().is_empty() {
+            if pre_local_len != pre_w || pre_next_len != pre_w {
+                return Err(InvalidProofShapeError::PreprocessedWidthMismatch { air: i }.into());
+            }
+        } else if pre_local_len != pre_w || pre_next_len != 0 {
+            return Err(InvalidProofShapeError::PreprocessedWidthMismatch { air: i }.into());
+        }
+
+        // One terminal per AIR with lookups; none otherwise.
+        let expected_present = !all_lookups[i].is_empty();
+        let got_present = lookup_terminals[i].is_some();
+        if expected_present != got_present {
+            return Err(LookupError::TerminalPresenceMismatch {
+                air: i,
+                expected_present,
+                got_present,
+            }
+            .into());
+        }
+
+        // Observe per-instance binding data.
+        let ext_db = degree_bits[i];
+        let base_db = base_degree_bits[i];
+        let width = air.width();
+        let n_chunks = num_quotient_chunks[i];
+        transcript.observe_instance_binding(ext_db, base_db, width, n_chunks);
+    }
+
+    // Observe main commitment and public values, then preprocessed data.
+    transcript.observe_main(&commitments.main, public_values);
+    transcript.observe_preprocessed(&preprocessed_widths, common.preprocessed.as_ref());
+
+    // Validate the shape of the lookup commitment.
+    let is_lookup = commitments.permutation.is_some();
+
+    if is_lookup != all_lookups.iter().any(|c| !c.is_empty()) {
+        return Err(LookupError::CommitmentMismatch.into());
+    }
+
+    // Sample permutation challenges and alpha.
+    let challenges_per_instance = transcript.sample_perm_challenges(all_lookups, &lookup_gadget);
+    let alpha: Challenge<SC> = transcript
+        .observe_perm_and_sample_alpha(commitments.permutation.as_ref(), lookup_terminals);
+
+    // Observe quotient chunks and optional random commitment.
+    transcript.observe_quotient_commitment(&commitments.quotient_chunks);
+    if let Some(r_commit) = &commitments.random {
+        transcript.observe_random_commitment(r_commit);
+    }
+
+    // Sample OOD point.
+    let zeta = transcript.sample_zeta();
+
+    let (coms_to_verify, quotient_domains) = commitments_with_opening_points(
+        config,
+        airs,
+        zeta,
+        commitments,
+        opened_values,
+        common,
+        degree_bits,
+        &preprocessed_widths,
+        &log_num_quotient_chunks,
+    )?;
+
+    // Verify all openings via PCS.
+    pcs.verify(coms_to_verify, opening_proof, &mut transcript.challenger)
+        .map_err(VerificationError::InvalidOpeningArgument)?;
+
+    // Un-extended trace domains, one per instance — needed below for periodic-column
+    // evaluation. `commitments_with_opening_points` derives the same domains internally but
+    // doesn't expose them, since only the caller's own post-opening constraint check needs them.
+    let trace_domains: Vec<Domain<SC>> = ext_domain_sizes
+        .iter()
+        .map(|&ext_size| pcs.natural_domain_for_degree(ext_size >> config.is_zk()))
+        .collect();
+
+    // Now check constraint equality per instance.
+    // For each instance, recombine quotient from chunks at zeta and compare to folded constraints.
+    for (i, air) in airs.iter().enumerate() {
+        let _air_span = info_span!("verify constraints", air_idx = i).entered();
+
+        let qc_domains = &quotient_domains[i];
+
+        // Recompose quotient(zeta) from chunks using utility function.
+        let quotient = recompose_quotient_from_chunks::<SC>(
+            qc_domains,
+            &opened_values.instances[i]
+                .base_opened_values
+                .quotient_chunks,
+            zeta,
+        );
+
+        // Recompose permutation openings into extension-field columns.
+        //
+        // Shapes:
+        // - commitment           — base-flattened matrix, width = aux_width * DIMENSION.
+        // - constraint evaluator — extension-field matrix, width = aux_width.
+        //
+        // aux_width under the single-terminal layout:
+        // - col 0:      shared accumulator
+        // - col i + 1:  fraction column for lookup i
+        // - so aux_width = num_lookups + 1, or 0 when the AIR declares no lookup.
+        let aux_width = if all_lookups[i].is_empty() {
+            0
+        } else {
+            all_lookups[i].len() + 1
+        };
+
+        let ext_degree = Challenge::<SC>::DIMENSION;
+        let expected_perm_len = aux_width * ext_degree;
+        if opened_values.instances[i].permutation_local.len() != expected_perm_len
+            || opened_values.instances[i].permutation_next.len() != expected_perm_len
+        {
+            return Err(LookupError::PermutationWidthMismatch {
+                air: i,
+                expected: expected_perm_len,
+            }
+            .into());
+        }
+
+        let recompose = |flat: &[Challenge<SC>]| -> Vec<Challenge<SC>> {
+            if aux_width == 0 {
+                return vec![];
+            }
+            // Each `ext_degree`-chunk holds the basis coefficients (in EF) of one EF element.
+            // chunks_exact yields chunks of exactly `ext_degree` = DIMENSION, so the unwrap
+            // below cannot panic.
+            flat.chunks_exact(ext_degree)
+                .map(|chunk| {
+                    Challenge::<SC>::from_ext_basis_coefficients(chunk)
+                        .expect("chunk length matches DIMENSION by construction")
+                })
+                .collect()
+        };
+
+        let perm_local_ext = recompose(&opened_values.instances[i].permutation_local);
+        let perm_next_ext = recompose(&opened_values.instances[i].permutation_next);
+
+        // Verify constraints at zeta using utility function.
+        let init_trace_domain = trace_domains[i];
+        let trace_next_zeros;
+        let trace_next_ref = match &opened_values.instances[i].base_opened_values.trace_next {
+            Some(v) => v.as_slice(),
+            None => {
+                trace_next_zeros = SC::Challenge::zero_vec(A::width(air));
+                &trace_next_zeros
+            }
+        };
+        let pre_next_zeros;
+        let pre_next_ref = match &opened_values.instances[i]
+            .base_opened_values
+            .preprocessed_next
+        {
+            Some(v) => v.as_slice(),
+            None => {
+                pre_next_zeros = SC::Challenge::zero_vec(preprocessed_widths[i]);
+                &pre_next_zeros
+            }
+        };
+        let perm_vals: Vec<SC::Challenge> = lookup_terminals[i].iter().map(|t| t.0).collect();
+
+        // Periodic columns are AIR logic; a malformed one must error, not panic.
+        let periodic_columns = air.periodic_columns();
+        check_periodic_column_lengths(&periodic_columns, trace_domains[i].size())?;
+
+        let periodic_values: Vec<Challenge<SC>> =
+            trace_domains[i].evaluate_periodic_columns_at(&periodic_columns, zeta);
+        let verifier_data = VerifierData {
+            trace_local: &opened_values.instances[i].base_opened_values.trace_local,
+            trace_next: trace_next_ref,
+            preprocessed_local: opened_values.instances[i]
+                .base_opened_values
+                .preprocessed_local
+                .as_ref()
+                .map_or(&[], |v| v),
+            preprocessed_next: pre_next_ref,
+            permutation_local: &perm_local_ext,
+            permutation_next: &perm_next_ext,
+            permutation_challenges: &challenges_per_instance[i],
+            permutation_values: &perm_vals,
+            periodic_values: &periodic_values,
+            lookups: &all_lookups[i],
+            public_values: &public_values[i],
+            trace_domain: init_trace_domain,
+            zeta,
+            alpha,
+            quotient,
+        };
+
+        verifier_data
+            .verify_constraints_with_lookups::<A, LogUpGadget, PcsError<SC>>(air, &lookup_gadget)
+            .map_err(|e| match e {
+                VerificationError::OodEvaluationMismatch { .. } => {
+                    VerificationError::OodEvaluationMismatch { index: Some(i) }
+                }
+                other => other,
+            })?;
+    }
+
+    // Single-terminal LogUp cross-AIR check.
+    //
+    // Each AIR with lookups commits one terminal: the sum of every per-row
+    // rational contribution across its trace.
+    //
+    // Soundness:
+    // - The total across the batch must be zero.
+    // - Bus challenges are sampled after the main commitment, so any
+    //   per-bus imbalance survives the collapse with overwhelming probability.
+    lookup_gadget.verify_terminal_sum(lookup_terminals)?;
+
+    Ok(())
+}

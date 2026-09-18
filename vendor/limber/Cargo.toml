@@ -1,0 +1,117 @@
+[package]
+name = "limber"
+version = "0.1.0"
+edition = "2024"
+description = "SNARKs for integer Mod-R1CS (per-constraint moduli), built on Spartan's sum-check pipeline"
+readme = "README.md"
+repository = "https://github.com/lucasxia01/limber-impl"
+license-file = "LICENSE"
+keywords = ["zkSNARKs", "cryptography", "proofs"]
+
+[dependencies]
+bellpepper-core = "0.4.0"
+bellpepper = "0.4.0"
+ff = { version = "0.13.0", features = ["derive"] }
+digest = "0.10"
+sha3 = "0.10"
+sha2 = "0.10.7"
+rayon = "1.10.0"
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+rand = "0.8"
+itertools = "0.14.0"
+subtle = "2.5"
+generic-array = "0.14"
+num-bigint = { version = "0.4", features = ["serde", "rand"] }
+crypto-bigint = { version = "0.7.0-rc.9", features = ["serde", "zeroize"] }
+crypto-primes = "0.7"
+num-traits = "0.2"
+num-integer = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+blake3 = "1.5"
+flate2 = "1.0"
+bitvec = "1.0"
+byteorder = "1.4.3"
+thiserror = "2.0.12"
+group = "0.13.0"
+once_cell = "1.18.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "time"] }
+tikv-jemallocator = { version = "0.6.0", optional = true }
+
+# Use halo2curves ASM on x86_64 by default; disable ASM on non-x86_64
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+halo2curves = { version = "0.9.0", features = ["std", "bits", "derive_serde", "asm"] }
+
+[target.'cfg(not(target_arch = "x86_64"))'.dependencies]
+halo2curves = { version = "0.9.0", features = ["std", "bits", "derive_serde"] }
+
+[target.wasm32-unknown-unknown.dependencies]
+# see https://github.com/rust-random/rand/pull/948
+getrandom = { version = "0.2.0", default-features = false, features = ["js"] }
+
+[dev-dependencies]
+libc = "0.2"
+rand = "0.8.4"
+criterion = "0.5"
+hex = "0.4.3"
+cfg-if = "1.0.0"
+sha2 = "0.10.7"
+proptest = "1.2.0"
+
+[features]
+default = []
+jem = ["tikv-jemallocator"]
+
+[[bench]]
+name = "sha256_spartan"
+harness = false
+
+[[bench]]
+name = "imod_spartan"
+harness = false
+
+[[bench]]
+name = "imod_spartan_modp"
+harness = false
+
+[[bench]]
+name = "spartan_synthetic"
+harness = false
+
+[[bench]]
+name = "multiswap_modp"
+harness = false
+
+[[bench]]
+name = "logup_gkr"
+harness = false
+
+[[bench]]
+name = "poseidon_modp"
+harness = false
+
+[profile.release]
+debug = 1
+lto = "fat"
+
+# Keep optimized benchmark code while preserving symbols for Apple Silicon
+# sampling (cargo-flamegraph/xctrace/Speedscope).  This does not alter the
+# release profile used by applications.
+[profile.bench]
+debug = 2
+strip = false
+split-debuginfo = "unpacked"
+
+# Profiling build: same optimization level as release, but with full debug
+# symbols and thin LTO so the flamegraph keeps readable frame boundaries
+# (fat LTO inlines so aggressively that most frames vanish). Driven by
+# scripts/flamegraph.sh via samply. Not used by CI or the default benches.
+[profile.profiling]
+inherits = "release"
+debug = true
+lto = "thin"
+
+[patch.crates-io]
+halo2curves = { git = "https://github.com/privacy-ethereum/halo2curves.git", rev = "02c235f0bb52800c28d9c3370400b5435dbe2220" }

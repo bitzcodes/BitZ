@@ -1,0 +1,314 @@
+// Copyright 2026 The Binius Developers
+
+//! Zero-knowledge verification configuration for Binius64 constraint systems.
+//!
+//! This module provides [`ZKVerifier`], which wraps the Binius64 IOP verifier with a
+//! Spartan-based zero-knowledge wrapper. The wrapper transforms the non-ZK Binius64
+//! verification into a ZK proof by:
+//!
+//! 1. Symbolically executing the inner verifier to build an outer Spartan constraint system
+//! 2. Combining inner and outer oracle specs into a single BaseFold ZK compiler
+//! 3. At verification time, running the inner verifier through a [`ZKWrappedVerifierChannel`] that
+//!    records all values as outer public inputs, then finishing with outer Spartan verification
+//!
+//! [`ZKWrappedVerifierChannel`]: binius_spartan_verifier::wrapper::ZKWrappedVerifierChannel
+
+use std::{marker::PhantomData, sync::Arc};
+
+use binius_core::{
+	constraint_system::{ConstraintSystem, InoutSegment},
+	word::Word,
+};
+use binius_field::Ghash128b as B128;
+use binius_hash::HashSuite;
+use binius_iop::{
+	basefold::compiler::BaseFoldVerifierCompiler,
+	channel::OracleSpec,
+	fri::{self, MinProofSizeStrategy},
+	merkle_tree::BinaryMerkleTreeScheme,
+};
+use binius_ip::channel::WordIPVerifierChannel;
+use binius_spartan_frontend::{
+	compiler::compile,
+	constraint_system::{BlindingInfo, WitnessLayout},
+};
+use binius_spartan_verifier::{
+	IOPVerifier as IronSpartanIOPVerifier,
+	constraint_system::ConstraintSystemPadded,
+	wrapper::{IronSpartanBuilderChannel, ZKWrappedVerifierChannel},
+};
+use binius_transcript::{VerifierTranscript, fiat_shamir::Challenger};
+use binius_utils::{DeserializeBytes, SerializeBytes, serialization::SerializationError};
+use bytes::{Buf, BufMut};
+use digest::Output;
+
+use crate::{
+	protocols::shift::WiringEvalClaim,
+	verify::{IOPVerifier, SECURITY_BITS},
+};
+
+/// Zero-knowledge verifier for Binius64 constraint systems.
+///
+/// Wraps the Binius64 IOP verifier with a Spartan-based ZK wrapper. Call [`Self::setup`] with
+/// a constraint system, then [`Self::verify`] with public inputs and a proof transcript.
+#[derive(Clone)]
+pub struct ZKVerifier<H: HashSuite> {
+	inner_iop_verifier: IOPVerifier,
+	outer_iop_verifier: IronSpartanIOPVerifier<B128>,
+	outer_layout: Arc<WitnessLayout<B128>>,
+	basefold_compiler: BaseFoldVerifierCompiler<B128>,
+	/// The verifier creates its Merkle transcript channels with the hash suite `H`.
+	_hash_marker: PhantomData<H>,
+}
+
+impl<H> ZKVerifier<H>
+where
+	H: HashSuite,
+	Output<H::LeafHash>: DeserializeBytes,
+{
+	/// Constructs a ZK verifier for a constraint system.
+	pub fn setup(constraint_system: ConstraintSystem, log_inv_rate: usize) -> Result<Self, Error> {
+		let _setup_guard = tracing::debug_span!("Setup ZK verifier").entered();
+
+		constraint_system.validate()?;
+
+		let log_public_words = constraint_system.log_public_words(InoutSegment::Public);
+
+		let inner_iop_verifier = IOPVerifier::new(constraint_system, log_public_words);
+
+		// Symbolically execute the inner verifier to build the outer constraint system.
+		let dummy_inout_words =
+			vec![Word::from_u64(0); inner_iop_verifier.constraint_system().n_inout];
+
+		let outer_builder = {
+			let _guard = tracing::debug_span!("Build ZK wrapper circuit").entered();
+			let mut builder_channel = IronSpartanBuilderChannel::new();
+			// The wiring claim is dropped rather than discharged: [`Self::verify`] checks it over
+			// the public segment instead, so the circuit built here carries none of it.
+			let _ = inner_iop_verifier
+				.verify(&dummy_inout_words, &mut builder_channel)
+				.expect("symbolic verify should not fail");
+			builder_channel.finish()
+		};
+		let (outer_cs, outer_layout) = {
+			let _guard = tracing::debug_span!("Compile ZK wrapper circuit").entered();
+			compile(outer_builder)
+		};
+
+		tracing::debug!(
+			n_public = outer_cs.n_public(),
+			n_precommit = outer_cs.n_precommit(),
+			n_private = outer_cs.n_private(),
+			n_mul_constraints = outer_cs.mul_constraints().len(),
+			"ZK wrapper circuit stats"
+		);
+
+		// Pad the outer constraint system for zero-knowledge.
+		let n_test_queries = fri::calculate_n_test_queries(SECURITY_BITS, log_inv_rate);
+		let blinding_info = BlindingInfo::for_fri_queries(n_test_queries);
+		let outer_cs = ConstraintSystemPadded::new(outer_cs, blinding_info);
+		let outer_layout = Arc::new(outer_layout.with_blinding(*outer_cs.blinding_info()));
+		let outer_iop_verifier = IronSpartanIOPVerifier::new(outer_cs);
+
+		// Transcript layout: outer precommit oracle first (committed at wrapper construction),
+		// then all inner oracles, then the remaining outer oracles (private, mask).
+		let outer_oracle_specs = outer_iop_verifier.oracle_specs();
+		let oracle_specs: Vec<OracleSpec> = [
+			vec![outer_oracle_specs[0]],
+			inner_iop_verifier.oracle_specs(true),
+			outer_oracle_specs[1..].to_vec(),
+		]
+		.concat();
+
+		let merkle_scheme = BinaryMerkleTreeScheme::<B128, H>::new();
+		let basefold_compiler = BaseFoldVerifierCompiler::new(
+			&merkle_scheme,
+			oracle_specs,
+			log_inv_rate,
+			n_test_queries,
+			&MinProofSizeStrategy,
+		);
+
+		Ok(Self {
+			inner_iop_verifier,
+			outer_iop_verifier,
+			outer_layout,
+			basefold_compiler,
+			_hash_marker: PhantomData,
+		})
+	}
+
+	/// Returns a reference to the inner IOP verifier.
+	pub const fn inner_iop_verifier(&self) -> &IOPVerifier {
+		&self.inner_iop_verifier
+	}
+
+	/// Returns a reference to the outer spartan IOP verifier.
+	pub const fn outer_iop_verifier(&self) -> &IronSpartanIOPVerifier<B128> {
+		&self.outer_iop_verifier
+	}
+
+	/// Returns the witness layout of the outer Spartan constraint system.
+	///
+	/// The layout maps each logical wire to its position in the witness vector.
+	pub fn outer_layout(&self) -> &WitnessLayout<B128> {
+		&self.outer_layout
+	}
+
+	/// Returns the shared handle to the outer witness layout.
+	///
+	/// The prover clones this `Arc` to share the layout instead of deep-cloning it.
+	pub fn outer_layout_arc(&self) -> Arc<WitnessLayout<B128>> {
+		Arc::clone(&self.outer_layout)
+	}
+
+	/// Returns the BaseFold ZK verifier compiler.
+	pub const fn basefold_compiler(&self) -> &BaseFoldVerifierCompiler<B128> {
+		&self.basefold_compiler
+	}
+
+	/// Returns the constraint system.
+	pub const fn constraint_system(&self) -> &ConstraintSystem {
+		self.inner_iop_verifier.constraint_system()
+	}
+
+	/// Returns log2 of the number of public words.
+	pub const fn log_public_words(&self) -> usize {
+		self.inner_iop_verifier.log_public_words()
+	}
+
+	/// Returns the log of the inverse Reed–Solomon rate this verifier was set up with.
+	pub fn log_inv_rate(&self) -> usize {
+		self.basefold_compiler.fri_params().rs_code().log_inv_rate()
+	}
+
+	/// Verifies a ZK proof against the constraint system.
+	pub fn verify<Challenger_: Challenger>(
+		&self,
+		inout: &[Word],
+		transcript: &mut VerifierTranscript<Challenger_>,
+	) -> Result<(), Error> {
+		// Create BaseFold channel and wrap with outer verifier.
+		let channel = self
+			.basefold_compiler
+			.create_channel_from_transcript::<H, Challenger_, _>(transcript);
+		let mut wrapped_channel = ZKWrappedVerifierChannel::new(
+			channel,
+			&self.outer_iop_verifier,
+			Arc::clone(&self.outer_layout),
+		)?;
+
+		// Run the inner IOP verification through the wrapped channel.
+		{
+			let inner_cs = self.inner_iop_verifier.constraint_system();
+			let _scope = tracing::debug_span!(
+				"Binius64",
+				n_hidden_words = inner_cs.n_hidden_words(InoutSegment::Public),
+				n_bitand = inner_cs.and_constraints.len(),
+				n_intmul = inner_cs.imul_constraints.len(),
+			)
+			.entered();
+
+			// The statement is observed here, and what comes back is what the IOP verifies
+			// against — the same split the transparent verifier makes.
+			let inout = wrapped_channel.observe_words(inout);
+			let claim = self
+				.inner_iop_verifier
+				.verify(&inout, &mut wrapped_channel)?;
+
+			// The wiring claim and every input it reads are public wires of the wrapper circuit, so
+			// tying the claim to the constraint system is an equation between values this verifier
+			// holds. Checking it here keeps the evaluation out of the circuit entirely, and the
+			// wrapper's other two runs — the symbolic build and the prover's replay — emit nothing
+			// for it either.
+			let public_value = |elem| {
+				wrapped_channel
+					.public_value(elem)
+					.expect("a public claim and its inputs are public wires")
+			};
+			WiringEvalClaim {
+				inputs: claim.inputs.iter().map(public_value).collect(),
+				claimed: public_value(&claim.claimed),
+				eval_fn: claim.eval_fn,
+			}
+			.check_native()
+			.map_err(crate::error::Error::from)?;
+		};
+
+		// Finish runs the outer spartan verification.
+		{
+			let outer_cs = self.outer_iop_verifier.constraint_system();
+			let _scope = tracing::debug_span!(
+				"ZK Wrapper",
+				n_witness = outer_cs.n_private(),
+				n_constraints = outer_cs.mul_constraints().len(),
+			)
+			.entered();
+
+			wrapped_channel.finish()?;
+		}
+
+		Ok(())
+	}
+
+	/// Verifies a ZK signature of knowledge over `message`.
+	///
+	/// Binds `message` into the transcript before any other data, then runs the ordinary
+	/// [`Self::verify`] checks. See [`crate::signature`] for details.
+	pub fn verify_sig<Challenger_: Challenger>(
+		&self,
+		inout: &[Word],
+		message: &[u8],
+		transcript: &mut VerifierTranscript<Challenger_>,
+	) -> Result<(), Error> {
+		crate::signature::observe_message::<H, _>(&mut transcript.observe(), message);
+		self.verify(inout, transcript)
+	}
+}
+
+/// Serializes the seed a [`ZKVerifier`] is built from — its constraint system and
+/// `log_inv_rate`. The derived state (outer constraint system, oracle specs, BaseFold compiler)
+/// is recomputed on [`DeserializeBytes::deserialize`], which is cheap relative to proving.
+impl<H> SerializeBytes for ZKVerifier<H>
+where
+	H: HashSuite,
+	Output<H::LeafHash>: DeserializeBytes,
+{
+	fn serialize(&self, mut write_buf: impl BufMut) -> Result<(), SerializationError> {
+		const VERSION: u32 = 1;
+		VERSION.serialize(&mut write_buf)?;
+		self.constraint_system().serialize(&mut write_buf)?;
+		self.log_inv_rate().serialize(write_buf)
+	}
+}
+
+impl<H> DeserializeBytes for ZKVerifier<H>
+where
+	H: HashSuite,
+	Output<H::LeafHash>: DeserializeBytes,
+{
+	fn deserialize(mut read_buf: impl Buf) -> Result<Self, SerializationError> {
+		const VERSION: u32 = 1;
+		let version = u32::deserialize(&mut read_buf)?;
+		if version != VERSION {
+			return Err(SerializationError::InvalidConstruction {
+				name: "ZKVerifier::version",
+			});
+		}
+		let constraint_system = ConstraintSystem::deserialize(&mut read_buf)?;
+		let log_inv_rate = usize::deserialize(&mut read_buf)?;
+		Self::setup(constraint_system, log_inv_rate)
+			.map_err(|_| SerializationError::InvalidConstruction { name: "ZKVerifier" })
+	}
+}
+
+/// Error type for ZK verification.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+	#[error("inner verification error: {0}")]
+	InnerVerification(#[from] crate::error::Error),
+	#[error("outer verification error: {0}")]
+	OuterVerification(#[from] binius_spartan_verifier::Error),
+	#[error("constraint system error: {0}")]
+	ConstraintSystem(#[from] binius_core::ConstraintSystemError),
+}

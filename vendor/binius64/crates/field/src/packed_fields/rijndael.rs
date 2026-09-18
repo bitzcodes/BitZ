@@ -1,0 +1,83 @@
+// Copyright 2024-2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
+
+use crate::{
+	arch::{
+		AesInvert1x, AesInvert16x, AesInvert32x, AesInvert64x, AesSquare1x, AesSquare16x,
+		AesSquare32x, AesSquare64x, AesWideMul1x, AesWideMul16x, AesWideMul32x, AesWideMul64x,
+		M128, M256, M512, portable::packed_macros::*,
+	},
+	fields::rijndael::Rijndael8b,
+};
+
+define_packed_binary_field!(
+	PackedRijndael1x8b,
+	Rijndael8b,
+	u8,
+	(AesSquare1x),
+	(AesInvert1x),
+	(AesWideMul1x)
+);
+define_packed_binary_field!(
+	PackedRijndael16x8b,
+	Rijndael8b,
+	M128,
+	(AesSquare16x),
+	(AesInvert16x),
+	(AesWideMul16x)
+);
+define_packed_binary_field!(
+	PackedRijndael32x8b,
+	Rijndael8b,
+	M256,
+	(AesSquare32x),
+	(AesInvert32x),
+	(AesWideMul32x)
+);
+define_packed_binary_field!(
+	PackedRijndael64x8b,
+	Rijndael8b,
+	M512,
+	(AesSquare64x),
+	(AesInvert64x),
+	(AesWideMul64x)
+);
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{WideMul, packed_fields::test_utils::packed_field_tests};
+
+	packed_field_tests!(aes_1x8b, PackedRijndael1x8b);
+	packed_field_tests!(aes_16x8b, PackedRijndael16x8b);
+	packed_field_tests!(aes_32x8b, PackedRijndael32x8b);
+	packed_field_tests!(aes_64x8b, PackedRijndael64x8b);
+
+	#[test]
+	fn test_wide_mul_exhaustive_scalar_pairs() {
+		// The scalar field has only 2^8 elements, so every product admits an exhaustive check.
+		// Each byte pair is broadcast across the 128-bit packing and multiplied deferred.
+		//
+		//     reduce(wide_mul(a, b)) must equal the scalar product in every lane.
+		//
+		// The scalar multiply is an independent oracle: it runs the tower-field log/exp tables,
+		// not the packed widening path under test.
+		for a in 0..=u8::MAX {
+			for b in 0..=u8::MAX {
+				let expected = crate::Rijndael8b::new(a) * crate::Rijndael8b::new(b);
+
+				let a_packed = crate::PackedRijndael16x8b::broadcast(crate::Rijndael8b::new(a));
+				let b_packed = crate::PackedRijndael16x8b::broadcast(crate::Rijndael8b::new(b));
+				let reduced = crate::PackedRijndael16x8b::reduce(
+					crate::PackedRijndael16x8b::wide_mul(a_packed, b_packed),
+				);
+
+				assert_eq!(
+					reduced,
+					crate::PackedRijndael16x8b::broadcast(expected),
+					"a={a:#04x} b={b:#04x}"
+				);
+			}
+		}
+	}
+}

@@ -1,0 +1,16 @@
+/target
+.envrc
+*.local.md
+.worktreeinclude
+# Library repos shouldn't track lockfiles
+Cargo.lock
+# Agent harness configs
+/.claude/
+# IDE configs
+/.idea/
+/.vscode/
+# Apple bullshit
+**/.DS_Store
+# Proptest failure seeds, written by whichever crate's tests happened to fail locally
+proptest-regressions/
+

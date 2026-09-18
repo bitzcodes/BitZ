@@ -1,0 +1,20 @@
+[package]
+name = "binius-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+binius-field = { path = "../field" }
+binius-utils = { path = "../utils" }
+bytemuck = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+rand = { workspace = true }

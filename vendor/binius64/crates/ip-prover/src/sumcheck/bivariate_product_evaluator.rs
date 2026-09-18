@@ -1,0 +1,164 @@
+// Copyright 2026 The Binius Developers
+
+use binius_compute::Allocator;
+use binius_field::{Field, PackedField, WideMul};
+use binius_ip::sumcheck::RoundCoeffs;
+use binius_math::FieldVec;
+use itertools::izip;
+
+use super::{
+	mle_store::{ColId, EvaluationChunk, MleStore, RoundContext},
+	round_evals::RoundEvals,
+	round_evaluator::{SharedSumcheckProver, SumcheckRoundEvaluator},
+};
+
+/// Sumcheck round evaluator for a composite defined as the product of two store columns.
+///
+/// This is the store-backed counterpart of the bivariate product sumcheck prover: it proves the
+/// plain (non-eq-weighted) sum claim of the product over the hypercube, emitting regular
+/// sumcheck round polynomials.
+pub struct BivariateProductEvaluator {
+	cols: [ColId; 2],
+}
+
+impl BivariateProductEvaluator {
+	/// Creates an evaluator for the product of two store columns.
+	///
+	/// The claimed sum is held by the driving [`SharedSumcheckProver`], not the evaluator.
+	pub const fn new(cols: [ColId; 2]) -> Self {
+		Self { cols }
+	}
+}
+
+/// Builds a [`SumcheckProver`](crate::sumcheck::common::SumcheckProver) for the plain hypercube sum
+/// of the product of two multilinears.
+///
+/// This is the store-backed replacement for the former bespoke bivariate-product prover: it loads
+/// the two columns into a fresh [`MleStore`] and drives a single [`BivariateProductEvaluator`]. The
+/// multilinears must have the same number of variables; the returned prover's `finish` emits their
+/// two evaluations in the given order.
+pub fn bivariate_product_prover<'alloc, A: Allocator, F: Field, P: PackedField<Scalar = F>>(
+	alloc: &'alloc A,
+	multilinears: [FieldVec<P, A>; 2],
+	sum: F,
+) -> SharedSumcheckProver<'alloc, A, P, BivariateProductEvaluator> {
+	assert_eq!(
+		multilinears[0].log_len(),
+		multilinears[1].log_len(),
+		"multilinears must have equal number of variables"
+	);
+
+	let mut store = MleStore::new(multilinears[0].log_len(), alloc);
+	let cols = multilinears.map(|col| store.push_owned(col));
+	SharedSumcheckProver::new(store, [(sum, BivariateProductEvaluator::new(cols))])
+}
+
+impl<F: Field, P: PackedField<Scalar = F>> SumcheckRoundEvaluator<F, P>
+	for BivariateProductEvaluator
+{
+	fn degree(&self) -> usize {
+		// Product of two multilinears: two sampled evaluations, `y_1` and `y_inf`.
+		2
+	}
+
+	fn accumulate(&self, chunk: &EvaluationChunk<'_, P>, accum: &mut [<P as WideMul>::Output]) {
+		let a = chunk.col(self.cols[0]);
+		let b = chunk.col(self.cols[1]);
+
+		// Accumulate F(1) and F(∞) where F = ∑_{v ∈ B} A(v || X) B(v || X). The low half is the
+		// v-prefix at x=0, the high half at x=1.
+		//
+		// The per-point products are accumulated in unreduced (wide) form and reduced a single
+		// time in interpolate, amortizing the GF(2^128) reduction over the whole sum.
+		let mut y_1 = <P as WideMul>::Output::default();
+		let mut y_inf = <P as WideMul>::Output::default();
+		for (&a_0_i, &a_1_i, &b_0_i, &b_1_i) in
+			izip!(a.lo.as_ref(), a.hi.as_ref(), b.lo.as_ref(), b.hi.as_ref())
+		{
+			// Evaluate M(∞) = M(0) + M(1)
+			let a_inf_i = a_0_i + a_1_i;
+			let b_inf_i = b_0_i + b_1_i;
+
+			y_1 += P::wide_mul(a_1_i, b_1_i);
+			y_inf += P::wide_mul(a_inf_i, b_inf_i);
+		}
+
+		RoundEvals([y_1, y_inf]).add_to(accum);
+	}
+
+	fn interpolate(&self, ctx: &RoundContext<'_, P>, accum: &[P], claim: F) -> RoundCoeffs<F> {
+		// The store has not yet folded this round, so its remaining-variable count is this round's.
+		let n_vars_remaining = ctx.n_vars();
+		assert!(n_vars_remaining > 0);
+
+		// `claim` is this round's sum.
+		// The evaluation at 0, which was never sampled, is recovered from it.
+		RoundEvals::<P, 2>::from_slots(accum)
+			.sum_scalars(n_vars_remaining)
+			.interpolate(claim)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use binius_compute::GlobalAllocator;
+	use binius_field::arch::{OptimalB128, OptimalPackedB128};
+	use binius_ip::sumcheck::verify;
+	use binius_math::{
+		inner_product::inner_product_par, multilinear::evaluate::evaluate,
+		test_utils::random_field_buffer,
+	};
+	use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
+	use rand::prelude::*;
+
+	use super::*;
+	use crate::sumcheck::prove::prove_single;
+
+	type StdChallenger = HasherChallenger<sha2::Sha256>;
+
+	// Proving the product sum of two multilinears via the shared store, then verifying, recovers
+	// the two multilinear evaluations at the challenge point and their product as the reduced
+	// eval.
+	#[test]
+	fn test_bivariate_product_sumcheck() {
+		type F = OptimalB128;
+		type P = OptimalPackedB128;
+
+		let n_vars = 8;
+		let mut rng = StdRng::seed_from_u64(0);
+		let alloc = GlobalAllocator;
+
+		let multilinear_a = random_field_buffer::<P>(&mut rng, n_vars);
+		let multilinear_b = random_field_buffer::<P>(&mut rng, n_vars);
+		let expected_sum = inner_product_par(&multilinear_a, &multilinear_b);
+
+		let prover = bivariate_product_prover(
+			&alloc,
+			[multilinear_a.clone(), multilinear_b.clone()],
+			expected_sum,
+		);
+
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		let output = prove_single(prover, &mut prover_transcript);
+		prover_transcript
+			.message()
+			.write_slice(&output.multilinear_evals);
+
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		let sumcheck_output = verify(n_vars, 2, expected_sum, &mut verifier_transcript).unwrap();
+		let multilinear_evals: Vec<F> = verifier_transcript.message().read_vec(2).unwrap();
+
+		assert_eq!(
+			multilinear_evals[0] * multilinear_evals[1],
+			sumcheck_output.eval,
+			"product of the multilinear evaluations should equal the reduced evaluation"
+		);
+
+		// The prover binds variables high-to-low; `evaluate` expects them low-to-high.
+		let mut eval_point = sumcheck_output.challenges.clone();
+		eval_point.reverse();
+		assert_eq!(evaluate(&multilinear_a, &eval_point), multilinear_evals[0]);
+		assert_eq!(evaluate(&multilinear_b, &eval_point), multilinear_evals[1]);
+		assert_eq!(output.challenges, sumcheck_output.challenges);
+	}
+}

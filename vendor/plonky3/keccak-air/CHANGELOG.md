@@ -1,0 +1,56 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+## [0.6.0] - 2026-06-11
+### Merged PRs
+- Chore(deps): update sha2 requirement from 0.10.9 to 0.11.0 (#1503)
+- Perf: use Neon Goldilocks only for hash operations (#1517)
+- Refactor(fri): move FRI parameter constructors to associated methods (#1530)
+- Test(keccak-air): add proptests for AIR constraints and trace generation (#1562)
+- Perf(goldilocks): scalar add/sub for PackedGoldilocksNeon (#1619)
+- Ci: tighten doc/release/TOML checks (#1689)
+- Chore: update CHANGELOGs (#1785)
+
+## [0.5.3] - 2026-05-15
+### Merged PRs
+- Perf: use Neon Goldilocks only for hash operations (#1517)
+- Perf(goldilocks): scalar add/sub for PackedGoldilocksNeon (#1619)
+
+## [0.5.2] - 2026-03-27
+## [0.5.1] - 2026-03-16
+## [0.5.0] - 2026-03-10
+### Merged PRs
+- Deps: update rand and rand_xoshiro (#1314)
+- Feat: add Merkle Caps (#1321)
+- Feat: switch AirBuilder::Var back to Copy (#1368)
+- Air: rm `is_transition_window` and add `RowWindow` (#1357)
+- Feat: add high-arity support in `MerkleTree` and `MMCS`  (#1373)
+
+## [0.4.2] - 2026-01-05
+### Authors
+
+## [0.4.1] - 2025-12-18
+### Authors
+
+## [0.4.0] - 2025-12-12
+### Merged PRs
+- Chore: add descriptions to all sub-crate manifests (#906) (Himess)
+- Replace `Copy` with `Clone` in `AirBuilder`'s `Var` (#930) (Linda Guiga)
+- Keccak air: better doc and some touchups (#942) (Thomas Coratger)
+- Remove Nightly Features (#932) (AngusG)
+- Clippy: small step (#1102) (Thomas Coratger)
+- Refactor: Replace &Vec<T> with &[T] in function parameters (#1111) (Merkel Tranjes)
+- Fix(keccak-air): align state indexing with Keccak specification (#1177) (Himess)
+
+### Authors
+- AngusG
+- Himess
+- Linda Guiga
+- Merkel Tranjes
+- Thomas Coratger
+

@@ -1,0 +1,72 @@
+[package]
+name = "p3-uni-stark"
+description = "A minimal univariate STARK framework providing core components for proof generation and verification."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
+
+[dependencies]
+libm.workspace = true
+p3-air.workspace = true
+p3-challenger.workspace = true
+p3-commit.workspace = true
+p3-field.workspace = true
+p3-matrix.workspace = true
+p3-maybe-rayon.workspace = true
+p3-security.workspace = true
+p3-util.workspace = true
+
+itertools.workspace = true
+serde = { workspace = true, features = ["derive", "alloc"] }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+p3-baby-bear = { path = "../baby-bear" }
+p3-blake3-air = { path = "../blake3-air" }
+p3-challenger = { path = "../challenger" }
+p3-circle = { path = "../circle" }
+p3-commit = { path = "../commit", features = ["test-utils"] }
+p3-dft = { path = "../dft" }
+p3-fri = { path = "../fri" }
+p3-goldilocks = { path = "../goldilocks" }
+p3-keccak = { path = "../keccak" }
+p3-matrix = { path = "../matrix" }
+p3-merkle-tree = { path = "../merkle-tree" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+p3-symmetric = { path = "../symmetric" }
+
+criterion.workspace = true
+postcard = { workspace = true, features = ["alloc"] }
+rand = { workspace = true, features = ["std_rng"] }
+tracing-subscriber = { workspace = true, features = ["std", "registry"] }
+
+[[bench]]
+name = "prove_mul_int"
+harness = false
+
+[[bench]]
+name = "prove_mul_babybear"
+harness = false
+
+[[bench]]
+name = "prove_blake3"
+harness = false
+
+[[bench]]
+name = "prove_xyz_phases"
+harness = false
+
+[[bench]]
+name = "baby_bear_mul"
+harness = false
+
+[lints]
+workspace = true

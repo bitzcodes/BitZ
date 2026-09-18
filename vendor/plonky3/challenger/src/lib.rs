@@ -1,0 +1,229 @@
+#![doc = include_str!("../README.md")]
+#![no_std]
+
+extern crate alloc;
+
+mod duplex_challenger;
+mod grinding_challenger;
+mod hash_challenger;
+mod multi_field_challenger;
+mod serializing_challenger;
+
+use alloc::vec::Vec;
+use core::array;
+
+pub use duplex_challenger::*;
+pub use grinding_challenger::*;
+pub use hash_challenger::*;
+pub use multi_field_challenger::*;
+pub use p3_field::UniformSamplingField;
+use p3_field::{Algebra, BasedVectorSpace, Field, PrimeField64};
+pub use serializing_challenger::*;
+
+/// A generic trait for absorbing elements into the transcript.
+///
+/// Absorbed elements update the internal sponge state,
+/// preparing it to deterministically produce future challenges.
+pub trait CanObserve<T> {
+    /// Absorb a single value into the transcript.
+    fn observe(&mut self, value: T);
+
+    /// Absorb a slice of values into the transcript.
+    fn observe_slice(&mut self, values: &[T])
+    where
+        T: Clone,
+    {
+        for value in values {
+            self.observe(value.clone());
+        }
+    }
+}
+
+/// A trait for sampling challenge elements from the Fiat-Shamir transcript.
+///
+/// Sampling produces pseudo-random elements deterministically derived
+/// from the absorbed inputs and the sponge state.
+pub trait CanSample<T> {
+    /// Sample a single challenge value from the transcript.
+    fn sample(&mut self) -> T;
+
+    /// Sample an array of `N` challenge values from the transcript.
+    fn sample_array<const N: usize>(&mut self) -> [T; N] {
+        array::from_fn(|_| self.sample())
+    }
+
+    /// Sample a `Vec` of `n` challenge values from the transcript.
+    fn sample_vec(&mut self, n: usize) -> Vec<T> {
+        (0..n).map(|_| self.sample()).collect()
+    }
+}
+
+/// A trait for sampling random bitstrings from the Fiat-Shamir transcript.
+pub trait CanSampleBits<T> {
+    /// Sample a random `bits`-bit integer from the transcript.
+    ///
+    /// The distribution should be reasonably close to uniform.
+    /// (In practice, a small bias may arise when bit-decomposing a uniformly
+    /// sampled field element)
+    ///
+    /// Guarantees that the returned value fits within the requested bit width.
+    fn sample_bits(&mut self, bits: usize) -> T;
+}
+
+/// Uniform bit sampling interface.
+///
+/// This trait provides a method for drawing uniformly distributed bitstrings
+/// from a Fiat–Shamir transcript. The goal is to obtain an integer supported
+/// on the range $[0, 2^{bits})$ with each value having equal probability.
+pub trait CanSampleUniformBits<F> {
+    /// Sample a random `bits`-bit integer from the transcript with a guarantee of
+    /// uniformly sampled bits.
+    ///
+    /// Performance overhead depends on the field and number of bits requested.
+    /// E.g. for KoalaBear sampling up to 24 bits uniformly is essentially free.
+    ///
+    /// If `RESAMPLE` is set to true then this function will sample multiple field
+    /// elements until it finds one which will produce uniform bits.
+    /// If `RESAMPLE` is set to false then this function will sample a single field
+    /// element and produce an error if the value would produce non-uniform bits.
+    ///
+    /// The probability of a panic or a resample is about 1/P for most fields.
+    /// See `UniformSamplingField` implementation for each field for details.
+    fn sample_uniform_bits<const RESAMPLE: bool>(
+        &mut self,
+        bits: usize,
+    ) -> Result<usize, ResamplingError>;
+}
+
+/// A high-level trait combining observation and sampling over a finite field.
+pub trait FieldChallenger<F: Field>:
+    CanObserve<F> + CanSample<F> + CanSampleBits<usize> + Sync
+{
+    /// Absorb an element from a vector space over the base field.
+    ///
+    /// Decomposes the element into its basis coefficients and absorbs each.
+    #[inline(always)]
+    fn observe_algebra_element<A: BasedVectorSpace<F>>(&mut self, alg_elem: A) {
+        self.observe_slice(alg_elem.as_basis_coefficients_slice());
+    }
+
+    /// Absorb a slice of elements from a vector space over the base field.
+    ///
+    /// Decomposes each element into its basis coefficients and absorbs them.
+    #[inline(always)]
+    fn observe_algebra_slice<A: BasedVectorSpace<F> + Clone>(&mut self, alg_elems: &[A]) {
+        for alg_elem in alg_elems {
+            self.observe_algebra_element(alg_elem.clone());
+        }
+    }
+
+    /// Sample an element of a vector space over the base field.
+    ///
+    /// Constructs the element by sampling basis coefficients.
+    #[inline(always)]
+    fn sample_algebra_element<A: BasedVectorSpace<F>>(&mut self) -> A {
+        A::from_basis_coefficients_fn(|_| self.sample())
+    }
+
+    /// Observe base field elements as extension field elements for recursion-friendly transcripts.
+    ///
+    /// This simplifies recursive verifier circuits by using a uniform extension field challenger.
+    /// Instead of observing a mix of base and extension field elements, we convert all base field
+    /// observations (metadata, public values) to extension field elements before passing to the challenger.
+    ///
+    /// # Recursion Benefits
+    ///
+    /// In recursive proof systems, the verifier circuit needs to verify the inner proof. Since STARK
+    /// verification operates entirely in the extension field (challenges, opened values, constraint
+    /// evaluation), having a challenger that only observes extension field elements significantly
+    /// simplifies the recursive circuit implementation.
+    #[inline(always)]
+    fn observe_base_as_algebra_element<EF>(&mut self, val: F)
+    where
+        EF: Algebra<F> + BasedVectorSpace<F>,
+    {
+        self.observe_algebra_element(EF::from(val));
+    }
+}
+
+impl<C, T> CanObserve<T> for &mut C
+where
+    C: CanObserve<T>,
+{
+    #[inline(always)]
+    fn observe(&mut self, value: T) {
+        (*self).observe(value);
+    }
+
+    #[inline(always)]
+    fn observe_slice(&mut self, values: &[T])
+    where
+        T: Clone,
+    {
+        (*self).observe_slice(values);
+    }
+}
+
+impl<C, T> CanSample<T> for &mut C
+where
+    C: CanSample<T>,
+{
+    #[inline(always)]
+    fn sample(&mut self) -> T {
+        (*self).sample()
+    }
+
+    #[inline(always)]
+    fn sample_array<const N: usize>(&mut self) -> [T; N] {
+        (*self).sample_array()
+    }
+
+    #[inline(always)]
+    fn sample_vec(&mut self, n: usize) -> Vec<T> {
+        (*self).sample_vec(n)
+    }
+}
+
+impl<C, T> CanSampleBits<T> for &mut C
+where
+    C: CanSampleBits<T>,
+{
+    #[inline(always)]
+    fn sample_bits(&mut self, bits: usize) -> T {
+        (*self).sample_bits(bits)
+    }
+}
+
+impl<C, F: Field> FieldChallenger<F> for &mut C where C: FieldChallenger<F> {}
+
+impl<C, F> CanSampleUniformBits<F> for &mut C
+where
+    F: PrimeField64,
+    C: CanSampleUniformBits<F>,
+{
+    fn sample_uniform_bits<const RESAMPLE: bool>(
+        &mut self,
+        bits: usize,
+    ) -> Result<usize, ResamplingError> {
+        (*self).sample_uniform_bits::<RESAMPLE>(bits)
+    }
+}
+
+/// Extract a binding commitment to the full transcript state.
+///
+/// Consumes the challenger, producing a digest that commits to all
+/// previously observed values.
+///
+/// ## Contract
+///
+/// Implementations must satisfy the following properties:
+///
+/// - **Determinism**: identical sequences of observations and samples produce identical digests.
+/// - **Observation sensitivity**: different observed values produce different digests.
+pub trait CanFinalizeDigest {
+    /// The type of digest produced by finalization.
+    type Digest;
+
+    /// Finalize the transcript and produce a binding digest.
+    fn finalize(self) -> Self::Digest;
+}

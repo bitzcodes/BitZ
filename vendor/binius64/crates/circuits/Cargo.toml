@@ -1,0 +1,34 @@
+[package]
+name = "binius-circuits"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+binius-frontend = { path = "../frontend" }
+binius-core = { path = "../core" }
+blake3 = { workspace = true }
+hex-literal.workspace = true
+num-bigint = { workspace = true }
+num-integer = { workspace = true }
+rand.workspace = true
+sha3.workspace = true
+
+[dev-dependencies]
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+anyhow.workspace = true
+bitcoin = { workspace = true }
+blake2 = { workspace = true }
+blake3 = { workspace = true }
+hmac = { workspace = true }
+k256 = { workspace = true, features = ["arithmetic"] }
+rand = { workspace = true, features = ["thread_rng"] }
+ripemd = { workspace = true }
+rsa = { workspace = true, features = ["sha2"] }
+hex-literal = { workspace = true }
+proptest = { workspace = true }
+rstest = { workspace = true }
+sha2 = { workspace = true }

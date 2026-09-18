@@ -1,0 +1,26 @@
+[package]
+name = "p3-symmetric"
+description = "A modular framework for symmetric cryptographic primitives."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+p3-field.workspace = true
+p3-util.workspace = true
+
+itertools.workspace = true
+serde = { workspace = true, features = ["alloc"] }
+
+[dev-dependencies]
+p3-goldilocks = { path = "../goldilocks" }
+p3-koala-bear = { path = "../koala-bear" }
+
+proptest.workspace = true
+
+[lints]
+workspace = true

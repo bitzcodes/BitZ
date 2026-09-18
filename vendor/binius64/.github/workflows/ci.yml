@@ -1,0 +1,285 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+  merge_group:
+  # Cache warming only — main is already gated by the merge queue, so nothing here re-checks it.
+  #
+  # Actions restores a cache from the current ref, the base branch, and the default branch, but
+  # neither of the triggers above writes to main's scope: pull requests save to `refs/pull/<N>/merge`
+  # and merge-queue runs save to a `gh-readonly-queue` branch that is deleted immediately. With
+  # nothing on main to fall back to, every run compiles the workspace from scratch. A push run
+  # writes the entry both of them then restore.
+  #
+  # Only `rust-checks` participates, and only far enough to populate its cache; see the `if`
+  # conditions below.
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI never debugs interactively, so drop most debuginfo to cut compile + link time. Keep line
+  # tables so panic / test-failure backtraces still report file:line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+concurrency:
+  group: ${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  format:
+    name: format
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install prek
+        run: cargo install prek --version 0.4.4 --locked
+      - name: Check copyright
+        run: prek run copyright --all-files
+      - name: Check typos
+        run: prek run typos --all-files
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          components: rustfmt
+      - name: Install nightly toolchain for rustfmt
+        run: rustup toolchain install nightly-2026-07-01 --component rustfmt
+      - name: Check rustfmt
+        run: prek run rustfmt --all-files
+
+  rust-checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          # The feature-enabled legs pin an explicit target-feature set rather than asking for
+          # `-Ctarget-cpu=native`. GitHub's runner fleet is heterogeneous, so `native` makes the
+          # generated code — and therefore which `cfg(target_feature)` paths CI compiles and runs
+          # — a property of whichever SKU the job landed on, and it makes every artifact
+          # unshareable between SKUs. The sets below are the ones every SKU in the fleet has:
+          # AES-NI and PCLMULQDQ are Westmere-era, AVX2 (`x86-64-v3`) is Haswell-era, and Armv8
+          # AES/SHA2 are present on every arm64 runner. Wider x86_64 features — AVX-512, GFNI,
+          # VAES, VPCLMULQDQ, SHA-NI — are only on some SKUs, so they are type-checked by the
+          # check-only clippy pass below instead of executed.
+          #
+          # `arch_packages_on_pr` marks a leg that narrows to the architecture-specific packages on
+          # a pull request. See `PACKAGES` below.
+          - name: x86_64-portable
+            runner: ubuntu-26.04
+            rustflags: # portable
+            arch_packages_on_pr: true
+          - name: x86_64
+            runner: ubuntu-26.04
+            rustflags: "-Ctarget-cpu=x86-64-v3 -Ctarget-feature=+pclmulqdq,+aes"
+          - name: arm64
+            runner: ubuntu-26.04-arm
+            rustflags: "-Ctarget-feature=+neon,+aes,+sha2"
+            arch_packages_on_pr: true
+    name: rust-checks-${{ matrix.arch.name }}
+    # This job also runs on pushes to main, where it stops after Compile and exists only to write a
+    # cache entry that pull-request and merge-queue runs can restore. The verification steps below
+    # are skipped there, since the merge queue already ran them on the same tree.
+    #
+    # The warming runs live inside this job rather than in a workflow of their own so that the cache
+    # keys match by construction. `Swatinem/rust-cache` derives the key from, among other things, the
+    # literal job id and every `CARGO*`/`RUST*` environment variable, so a separate workflow would
+    # have to restate the job id, the per-leg RUSTFLAGS and the workflow-level CARGO_* settings — and
+    # would silently stop matching the moment one of them is edited here.
+    runs-on: ${{ matrix.arch.runner }}
+    env:
+      # Link with lld instead of the default ld.bfd: the rust-checks build links many test and
+      # example binaries, where bfd is a serial bottleneck. Appended to the per-arch target
+      # features. lld is installed below.
+      RUSTFLAGS: "${{ matrix.arch.rustflags }} -Clink-arg=-fuse-ld=lld"
+      # Package selection for the build, test and doctest steps: either the packages that contain
+      # architecture-specific code, or the whole workspace. A pull request takes the narrow set on
+      # the two secondary legs — the rest of the workspace is architecture-independent, so building
+      # and testing it three times asks the same question three times. Everything else — the x86_64
+      # leg, the merge queue, the push warmers — takes the workspace, so the whole of it is still
+      # built and tested on all three legs before anything reaches main.
+      #
+      # The `field` SIMD paths are also exercised transitively by the `prover` and `math` tests,
+      # which the narrow set drops. A SIMD bug that `field`'s own tests miss therefore bounces a
+      # merge rather than failing the pull request.
+      #
+      # Clippy below stays on the whole workspace on every leg and every event: it is the cheap way
+      # to type-check the arch-gated code under this leg's cfg.
+      PACKAGES: ${{ github.event_name == 'pull_request' && matrix.arch.arch_packages_on_pr && '-p binius-field -p binius-hash-prover -p binius-arith-bench' || '--workspace' }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          components: clippy
+      - name: Install cargo-nextest
+        if: github.event_name != 'push'
+        uses: taiki-e/install-action@v2.87.5
+        with:
+          tool: cargo-nextest
+      - name: Install lld
+        run: sudo apt-get update -qq && sudo apt-get install -y lld
+      # Build only the targets this job runs. Benchmarks and examples are both excluded: each is a
+      # separate binary linking the whole crate, and this job runs neither. Codegen + linking them
+      # is pure overhead. Clippy below still checks both via `--all-targets` — that's front-end
+      # only (no codegen/link), so it guards against bitrot (API drift) for a fraction of a full
+      # build. The demo circuits are not among the examples: they are subcommands of the
+      # `binius-examples` binary, which `--bins` builds here and `circuits-snapshot` runs.
+      - name: Compile
+        run: cargo build $PACKAGES --lib --bins --tests
+      - name: Run platform diagnostics
+        if: github.event_name != 'push'
+        run: cargo test -p binius-utils --features platform-diagnostics test_platform_diagnostics -- --nocapture
+      - name: Run clippy
+        if: github.event_name != 'push'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # The target selection repeats the Compile step's, and is load-bearing: nextest inherits
+      # `cargo test`'s default target selection, which includes examples. A bare `--workspace`
+      # here builds every one of them, paying in this step the cost Compile above declines to pay.
+      - name: Run tests
+        if: github.event_name != 'push'
+        run: cargo nextest run $PACKAGES --lib --bins --tests --no-fail-fast
+      # Must run doctests separately, see https://github.com/nextest-rs/nextest/issues/16
+      - name: Run doctests
+        if: github.event_name != 'push'
+        run: cargo test --doc $PACKAGES
+      # The AVX-512, GFNI, VAES, VPCLMULQDQ and SHA-NI paths are compiled nowhere else in CI: the
+      # x86_64 leg's pinned features stop at what every runner is guaranteed to have, so nothing
+      # above type-checks them. Clippy is check-only, so it compiles those `cfg(target_feature)`
+      # branches without ever running the instructions. Only the three crates with
+      # architecture-specific code are checked; the rest of the workspace is feature-agnostic.
+      # Executing these paths needs a runner that has the features, and is not attempted here.
+      #
+      # `--target` is load-bearing rather than redundant. Without it cargo applies RUSTFLAGS to
+      # build scripts and proc macros as well, which it then executes on the runner — and those
+      # die with SIGILL the moment the compiler uses an instruction the runner lacks. Naming the
+      # target explicitly splits host units from target units, leaving the host ones on the
+      # default feature set.
+      - name: Run clippy with the wide x86_64 feature set
+        if: github.event_name != 'push' && matrix.arch.name == 'x86_64'
+        env:
+          RUSTFLAGS: "-Ctarget-cpu=x86-64-v3 -Ctarget-feature=+pclmulqdq,+vpclmulqdq,+aes,+vaes,+sha,+gfni,+avx512f,+avx512bw -Clink-arg=-fuse-ld=lld"
+        run: >-
+          cargo clippy --target x86_64-unknown-linux-gnu
+          -p binius-field -p binius-hash-prover -p binius-arith-bench
+          --all-targets -- -D warnings
+
+  unused-deps:
+    name: unused-deps
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2.87.5
+        with:
+          tool: cargo-machete@0.8.0
+      # No toolchain setup and no build: machete only parses the manifests and greps the sources,
+      # so the whole job takes seconds and needs nothing from the build cache.
+      #
+      # `--with-metadata` resolves each package through `cargo metadata` instead of reading the
+      # manifests alone. It is not optional here: without it dev-dependencies are never examined,
+      # which is where every unused dependency in this workspace happened to be.
+      - name: Check for unused dependencies
+        run: cargo machete --with-metadata
+
+  # Build against wasm32-unknown-unknown target to test that our libraries compile to wasm.
+  wasm-vanilla-build:
+    name: wasm-vanilla-build
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          target: wasm32-unknown-unknown
+      - name: Compile vanilla wasm32
+        run: cargo build -p binius-field --target wasm32-unknown-unknown
+
+  # Build against wasm32-unknown-unknown with the simd128 target feature enabled. This is the
+  # only configuration that compiles the SIMD GHASH implementation in
+  # crates/field/src/arch/wasm32: the vanilla build above leaves it unbuilt, so without this job
+  # it type-checks nowhere in CI.
+  wasm-simd128-build:
+    name: wasm-simd128-build
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    env:
+      RUSTFLAGS: "-C target-feature=+simd128"
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          target: wasm32-unknown-unknown
+      - name: Compile wasm32 with simd128
+        run: cargo build -p binius-field --target wasm32-unknown-unknown
+
+  wasm-tests:
+    name: wasm-tests
+    if: github.event_name != 'push'
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          target: wasm32-wasip1
+      - name: Set up Wasmer
+        uses: wasmerio/setup-wasmer@v3
+        with:
+          version: 'v6.0.1'
+      - name: Test on wasm32-wasip1
+        run: cargo test -p binius-math -p binius-field -p binius-prover -p binius-verifier --target wasm32-wasip1 --config "target.wasm32-wasip1.runner=['wasmer']"
+
+  rust-doc:
+    name: rust-doc
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+      - name: Build documentation (including private items for CI checks)
+        run: cargo doc --document-private-items --no-deps
+        env:
+          # Promote rustdoc lints (broken intra-doc links, missing crate-level
+          # docs) to errors, matching the `rustdoc` pre-push hook in prek.toml.
+          RUSTDOCFLAGS: "-D warnings"
+
+  circuits-snapshot:
+    name: circuits-snapshot
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+      # One job instead of a 9-way matrix: the circuits are subcommands of one binary, so the
+      # first iteration below builds it and the rest are plain runs. See BINIUS-151.
+      - name: Check circuit statistics snapshots
+        run: |
+          set -e
+          # Keep this list in sync with the committed snapshots in crates/examples/snapshots:
+          # every circuit that ships a .snap must be checked here, or it can drift undetected.
+          for circuit in ethsign zklogin sha256 sha512 sha3 sha3_512 keccak blake2s blake2b blake3_compress blake3 hashsign ec_msm bitcoin_headers bitcoin_p2pkh; do
+            echo "::group::${circuit}"
+            cargo run -p binius-examples -- "${circuit}" check-snapshot
+            echo "::endgroup::"
+          done

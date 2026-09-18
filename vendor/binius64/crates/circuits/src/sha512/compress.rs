@@ -1,0 +1,523 @@
+// Copyright 2025 Irreducible Inc.
+use binius_core::word::Word;
+use binius_frontend::{ChipGadget, CircuitBuilder, Hint, Wire, WitnessFiller};
+
+const IV: [u64; 8] = [
+	0x6a09e667f3bcc908,
+	0xbb67ae8584caa73b,
+	0x3c6ef372fe94f82b,
+	0xa54ff53a5f1d36f1,
+	0x510e527fade682d1,
+	0x9b05688c2b3e6c1f,
+	0x1f83d9abfb41bd6b,
+	0x5be0cd19137e2179,
+];
+
+const K: [u64; 80] = [
+	0x428a2f98d728ae22,
+	0x7137449123ef65cd,
+	0xb5c0fbcfec4d3b2f,
+	0xe9b5dba58189dbbc,
+	0x3956c25bf348b538,
+	0x59f111f1b605d019,
+	0x923f82a4af194f9b,
+	0xab1c5ed5da6d8118,
+	0xd807aa98a3030242,
+	0x12835b0145706fbe,
+	0x243185be4ee4b28c,
+	0x550c7dc3d5ffb4e2,
+	0x72be5d74f27b896f,
+	0x80deb1fe3b1696b1,
+	0x9bdc06a725c71235,
+	0xc19bf174cf692694,
+	0xe49b69c19ef14ad2,
+	0xefbe4786384f25e3,
+	0x0fc19dc68b8cd5b5,
+	0x240ca1cc77ac9c65,
+	0x2de92c6f592b0275,
+	0x4a7484aa6ea6e483,
+	0x5cb0a9dcbd41fbd4,
+	0x76f988da831153b5,
+	0x983e5152ee66dfab,
+	0xa831c66d2db43210,
+	0xb00327c898fb213f,
+	0xbf597fc7beef0ee4,
+	0xc6e00bf33da88fc2,
+	0xd5a79147930aa725,
+	0x06ca6351e003826f,
+	0x142929670a0e6e70,
+	0x27b70a8546d22ffc,
+	0x2e1b21385c26c926,
+	0x4d2c6dfc5ac42aed,
+	0x53380d139d95b3df,
+	0x650a73548baf63de,
+	0x766a0abb3c77b2a8,
+	0x81c2c92e47edaee6,
+	0x92722c851482353b,
+	0xa2bfe8a14cf10364,
+	0xa81a664bbc423001,
+	0xc24b8b70d0f89791,
+	0xc76c51a30654be30,
+	0xd192e819d6ef5218,
+	0xd69906245565a910,
+	0xf40e35855771202a,
+	0x106aa07032bbd1b8,
+	0x19a4c116b8d2d0c8,
+	0x1e376c085141ab53,
+	0x2748774cdf8eeb99,
+	0x34b0bcb5e19b48a8,
+	0x391c0cb3c5c95a63,
+	0x4ed8aa4ae3418acb,
+	0x5b9cca4f7763e373,
+	0x682e6ff3d6b2b8a3,
+	0x748f82ee5defb2fc,
+	0x78a5636f43172f60,
+	0x84c87814a1f0ab72,
+	0x8cc702081a6439ec,
+	0x90befffa23631e28,
+	0xa4506cebde82bde9,
+	0xbef9a3f7b2c67915,
+	0xc67178f2e372532b,
+	0xca273eceea26619c,
+	0xd186b8c721c0c207,
+	0xeada7dd6cde0eb1e,
+	0xf57d4f7fee6ed178,
+	0x06f067aa72176fba,
+	0x0a637dc5a2c898a6,
+	0x113f9804bef90dae,
+	0x1b710b35131c471b,
+	0x28db77f523047d84,
+	0x32caab7b40c72493,
+	0x3c9ebe0a15c9bebc,
+	0x431d67c49c100d4c,
+	0x4cc5d4becb3e42b6,
+	0x597f299cfc657e2a,
+	0x5fcb6fab3ad6faec,
+	0x6c44198c4a475817,
+];
+
+/// The internal state of SHA-512.
+///
+/// The state size is 512 bits.
+///
+/// The elements are referred to as a–h or H0–H7.
+#[derive(Clone, Copy)]
+pub struct State(pub [Wire; 8]);
+
+impl State {
+	pub const fn new(wires: [Wire; 8]) -> Self {
+		State(wires)
+	}
+
+	pub fn public(builder: &CircuitBuilder) -> Self {
+		State(std::array::from_fn(|_| builder.add_inout()))
+	}
+
+	pub fn private(builder: &CircuitBuilder) -> Self {
+		State(std::array::from_fn(|_| builder.add_witness()))
+	}
+
+	pub fn iv(builder: &CircuitBuilder) -> Self {
+		State(std::array::from_fn(|i| builder.add_constant(Word(IV[i]))))
+	}
+}
+
+/// SHA-512 compression function.
+///
+/// Builds a circuit that updates the chaining state with one 1024-bit message block. Returns the
+/// next chaining state.
+///
+/// # Chips
+///
+/// This is a [`ChipGadget`]. A circuit that calls
+/// [`register_chip`](CircuitBuilder::register_chip) with [`Sha512Compress`] before building turns
+/// every compression under it into a chip call, including the ones `sha512_fixed` and
+/// `sha512_varlen` reach.
+pub fn compress(builder: &CircuitBuilder, state_in: State, m: [Wire; 16]) -> State {
+	let inputs: Vec<Wire> = state_in.0.into_iter().chain(m).collect();
+
+	let outputs = builder.build_gadget(Sha512Compress, &[], &inputs);
+	State(std::array::from_fn(|i| outputs[i]))
+}
+
+/// [`compress`] as a gadget, so that a circuit can make it a chip.
+///
+/// Its interface is the flat 24 input words `state[0..8]`, `m[0..16]`, and the 8 output state
+/// words. Every word is a full 64-bit SHA-512 word; there is no lane packing.
+pub struct Sha512Compress;
+
+impl Hint for Sha512Compress {
+	const NAME: &'static str = "binius.sha512_compress";
+
+	fn shape(&self, _dimensions: &[usize]) -> (usize, usize) {
+		(24, 8)
+	}
+
+	fn execute(&self, _dimensions: &[usize], inputs: &[Word], outputs: &mut [Word]) {
+		let state_in: [u64; 8] = std::array::from_fn(|i| inputs[i].as_u64());
+		let m: [u64; 16] = std::array::from_fn(|i| inputs[8 + i].as_u64());
+
+		for (slot, word) in outputs.iter_mut().zip(ref_compress(state_in, m)) {
+			*slot = Word(word);
+		}
+	}
+}
+
+impl ChipGadget for Sha512Compress {
+	fn build(&self, builder: &CircuitBuilder, _dimensions: &[usize], inputs: &[Wire]) -> Vec<Wire> {
+		let state_in = State(std::array::from_fn(|i| inputs[i]));
+		let m: [Wire; 16] = std::array::from_fn(|i| inputs[8 + i]);
+		compress_gates(builder, state_in, m).0.to_vec()
+	}
+}
+
+/// Pure-Rust SHA-512 compression of a single 1024-bit block.
+///
+/// Matches the in-circuit compression exactly.
+/// Used for prover-side witness generation and as the test reference.
+pub fn ref_compress(state_in: [u64; 8], m: [u64; 16]) -> [u64; 8] {
+	let mut w = [0u64; 80];
+	w[..16].copy_from_slice(&m);
+	for t in 16..80 {
+		let s0 = w[t - 15].rotate_right(1) ^ w[t - 15].rotate_right(8) ^ (w[t - 15] >> 7);
+		let s1 = w[t - 2].rotate_right(19) ^ w[t - 2].rotate_right(61) ^ (w[t - 2] >> 6);
+		w[t] = w[t - 16]
+			.wrapping_add(s0)
+			.wrapping_add(w[t - 7])
+			.wrapping_add(s1);
+	}
+
+	let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state_in;
+	for t in 0..80 {
+		let big_s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+		let ch = (e & f) ^ ((!e) & g);
+		let t1 = h
+			.wrapping_add(big_s1)
+			.wrapping_add(ch)
+			.wrapping_add(K[t])
+			.wrapping_add(w[t]);
+		let big_s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+		let maj = (a & b) ^ (a & c) ^ (b & c);
+		let t2 = big_s0.wrapping_add(maj);
+		h = g;
+		g = f;
+		f = e;
+		e = d.wrapping_add(t1);
+		d = c;
+		c = b;
+		b = a;
+		a = t1.wrapping_add(t2);
+	}
+
+	[
+		state_in[0].wrapping_add(a),
+		state_in[1].wrapping_add(b),
+		state_in[2].wrapping_add(c),
+		state_in[3].wrapping_add(d),
+		state_in[4].wrapping_add(e),
+		state_in[5].wrapping_add(f),
+		state_in[6].wrapping_add(g),
+		state_in[7].wrapping_add(h),
+	]
+}
+
+/// [`compress`] in gates, whatever the building circuit does with the gadget.
+fn compress_gates(builder: &CircuitBuilder, state_in: State, m: [Wire; 16]) -> State {
+	// ---- message-schedule ----
+	// W[0..15] = block_words
+	// for t = 16 .. 79:
+	//     s0   = σ0(W[t-15])
+	//     s1   = σ1(W[t-2])
+	//     (p, _)  = Add(W[t-16], s0)
+	//     (q, _)  = Add(p, W[t-7])
+	//     (W[t],_) = Add(q, s1)
+	let mut w = Vec::with_capacity(80);
+
+	// W[0..15] = block_words
+	w.extend_from_slice(&m);
+
+	// W[16..79] computed from previous W values
+	for t in 16..80 {
+		let s0 = small_sigma_0(builder, w[t - 15]);
+		let s1 = small_sigma_1(builder, w[t - 2]);
+		let (p, _carry) = builder.iadd(w[t - 16], s0);
+		let (q, _carry) = builder.iadd(p, w[t - 7]);
+		let (w_t, _carry) = builder.iadd(q, s1);
+		w.push(w_t);
+	}
+
+	let w: &[Wire; 80] = (&*w).try_into().unwrap();
+	let mut state = state_in;
+	for t in 0..80 {
+		state = round(builder, t, state, w);
+	}
+
+	// Add the compressed chunk to the current hash value
+	let (a_out, _carry) = builder.iadd(state_in.0[0], state.0[0]);
+	let (b_out, _carry) = builder.iadd(state_in.0[1], state.0[1]);
+	let (c_out, _carry) = builder.iadd(state_in.0[2], state.0[2]);
+	let (d_out, _carry) = builder.iadd(state_in.0[3], state.0[3]);
+	let (e_out, _carry) = builder.iadd(state_in.0[4], state.0[4]);
+	let (f_out, _carry) = builder.iadd(state_in.0[5], state.0[5]);
+	let (g_out, _carry) = builder.iadd(state_in.0[6], state.0[6]);
+	let (h_out, _carry) = builder.iadd(state_in.0[7], state.0[7]);
+
+	State([a_out, b_out, c_out, d_out, e_out, f_out, g_out, h_out])
+}
+
+/// Packs a 128-byte SHA-512 message block into the 16 message wires of [`compress`].
+///
+/// Each output wire receives the 64-bit big-endian word formed from the corresponding 8 input
+/// bytes.
+pub fn pack_message_block(w: &mut WitnessFiller<'_>, m_wires: &[Wire; 16], block: [u8; 128]) {
+	for i in 0..16 {
+		let j = i * 8;
+		// Assemble a 64-bit big-endian word.
+		let limb = ((block[j] as u64) << 56)
+			| ((block[j + 1] as u64) << 48)
+			| ((block[j + 2] as u64) << 40)
+			| ((block[j + 3] as u64) << 32)
+			| ((block[j + 4] as u64) << 24)
+			| ((block[j + 5] as u64) << 16)
+			| ((block[j + 6] as u64) << 8)
+			| (block[j + 7] as u64);
+
+		w[m_wires[i]] = Word(limb);
+	}
+}
+
+fn round(builder: &CircuitBuilder, round: usize, state: State, w: &[Wire; 80]) -> State {
+	let State([a, b, c, d, e, f, g, h]) = state;
+
+	let big_sigma_e = big_sigma_1(builder, e);
+	let ch_efg = ch(builder, e, f, g);
+	let (t1a, _carry) = builder.iadd(h, big_sigma_e);
+	let (t1b, _carry) = builder.iadd(t1a, ch_efg);
+	let rc = builder.add_constant(Word(K[round]));
+	let (t1c, _carry) = builder.iadd(t1b, rc);
+	let (t1, _carry) = builder.iadd(t1c, w[round]);
+
+	let big_sigma_a = big_sigma_0(builder, a);
+	let maj_abc = maj(builder, a, b, c);
+	let (t2, _carry) = builder.iadd(big_sigma_a, maj_abc);
+
+	let h = g;
+	let g = f;
+	let f = e;
+	let (e, _carry) = builder.iadd(d, t1);
+	let d = c;
+	let c = b;
+	let b = a;
+	let (a, _carry) = builder.iadd(t1, t2);
+
+	State([a, b, c, d, e, f, g, h])
+}
+
+/// Ch(x, y, z) = (x AND y) XOR (NOT y AND z)
+///             = z XOR (x AND (y XOR z))
+fn ch(builder: &CircuitBuilder, x: Wire, y: Wire, z: Wire) -> Wire {
+	builder.bxor(z, builder.band(x, builder.bxor(y, z)))
+}
+
+/// Maj(x, y, z) = (x AND y) XOR (x AND z) XOR (y AND z)
+///              = (x XOR z) AND (y XOR z) XOR z.
+fn maj(builder: &CircuitBuilder, x: Wire, y: Wire, z: Wire) -> Wire {
+	builder.bxor(builder.band(builder.bxor(x, z), builder.bxor(y, z)), z)
+}
+
+/// Σ0(x)       = XOR( XOR( ROTR(x, 28), ROTR(x, 34) ), ROTR(x, 39) )
+fn big_sigma_0(b: &CircuitBuilder, x: Wire) -> Wire {
+	let r1 = b.rotr(x, 28);
+	let r2 = b.rotr(x, 34);
+	let r3 = b.rotr(x, 39);
+	let x1 = b.bxor(r1, r2);
+	b.bxor(x1, r3)
+}
+
+/// Σ1(x)       = XOR( XOR( ROTR(x, 14), ROTR(x, 18) ), ROTR(x, 41) )
+fn big_sigma_1(b: &CircuitBuilder, x: Wire) -> Wire {
+	let r1 = b.rotr(x, 14);
+	let r2 = b.rotr(x, 18);
+	let r3 = b.rotr(x, 41);
+	let x1 = b.bxor(r1, r2);
+	b.bxor(x1, r3)
+}
+
+/// σ0(x)       = XOR( XOR( ROTR(x,  1), ROTR(x,  8)), SHR(x,  7) )
+fn small_sigma_0(b: &CircuitBuilder, x: Wire) -> Wire {
+	let r1 = b.rotr(x, 1);
+	let r2 = b.rotr(x, 8);
+	let s1 = b.shr(x, 7);
+	let x1 = b.bxor(r1, r2);
+	b.bxor(x1, s1)
+}
+
+/// σ1(x)       = XOR( XOR( ROTR(x, 19), ROTR(x, 61) ), SHR(x,  6) )
+fn small_sigma_1(b: &CircuitBuilder, x: Wire) -> Wire {
+	let r1 = b.rotr(x, 19);
+	let r2 = b.rotr(x, 61);
+	let s1 = b.shr(x, 6);
+	let x1 = b.bxor(r1, r2);
+	b.bxor(x1, s1)
+}
+
+#[cfg(test)]
+mod tests {
+	use binius_core::word::Word;
+	use binius_frontend::{CircuitBuilder, Hint, Wire};
+	use proptest::prelude::*;
+
+	use super::{Sha512Compress, State, compress, compress_gates, pack_message_block};
+
+	/// A test circuit that proves a knowledge of preimage for a given state vector S in
+	///
+	///     compress1024(preimage) = S
+	///
+	/// without revealing the preimage, only S.
+	#[test]
+	fn proof_preimage() {
+		// Use the test-vector for SHA512 single block message: "abc".
+		let mut preimage: [u8; 128] = [0; 128];
+		preimage[0..3].copy_from_slice(b"abc");
+		preimage[3] = 0x80;
+		preimage[127] = 0x18;
+
+		#[rustfmt::skip]
+		let expected_state: [u64; 8] = [
+			0xddaf35a193617aba, 0xcc417349ae204131, 0x12e6fa4e89a97ea2, 0x0a9eeee64b55d39a,
+			0x2192992a274fc1a8, 0x36ba3c23a3feebbd, 0x454d4423643ce80e, 0x2a9ac94fa54ca49f,
+		];
+
+		let circuit = CircuitBuilder::new();
+		let state = State::iv(&circuit);
+		let input: [Wire; 16] = std::array::from_fn(|_| circuit.add_witness());
+		let output: [Wire; 8] = std::array::from_fn(|_| circuit.add_inout());
+		let state_out = compress(&circuit, state, input);
+
+		for (i, (actual_x, expected_x)) in state_out.0.iter().zip(output).enumerate() {
+			circuit.assert_eq(format!("preimage_eq[{i}]"), *actual_x, expected_x);
+		}
+
+		let circuit = circuit.build();
+		let cs = circuit.constraint_system();
+		let mut w = circuit.new_witness_filler();
+
+		// Populate the input message for the compression function.
+		pack_message_block(&mut w, &input, preimage);
+
+		for (i, &output) in output.iter().enumerate() {
+			w[output] = Word(expected_state[i]);
+		}
+		circuit.populate_wire_witness(&mut w).unwrap();
+
+		cs.verify(&w.into_value_vec()).unwrap();
+	}
+
+	#[test]
+	fn sha512_chain() {
+		// Tests multiple SHA-512 compress1024 invocations where the outputs are linked to the
+		// inputs of the following compression function.
+		const N: usize = 3;
+		let circuit = CircuitBuilder::new();
+
+		let mut m_wires: Vec<[Wire; 16]> = Vec::with_capacity(N);
+
+		// First, declare the initial state.
+		let mut state = State::iv(&circuit);
+		for i in 0..N {
+			// Create a new subcircuit builder. This is not necessary but can improve readability
+			// and diagnostics.
+			let sha512_builder = circuit.subcircuit(format!("sha512[{i}]"));
+
+			// Build a new instance of the sha512 verification subcircuit, passing the inputs `m` to
+			// it. For the first compression `m` is public but everything else if private.
+			let m: [Wire; 16] = if i == 0 {
+				std::array::from_fn(|_| sha512_builder.add_inout())
+			} else {
+				std::array::from_fn(|_| sha512_builder.add_witness())
+			};
+			state = compress(&sha512_builder, state, m);
+			m_wires.push(m);
+		}
+
+		let circuit = circuit.build();
+		let cs = circuit.constraint_system();
+		let mut w = circuit.new_witness_filler();
+
+		for m in &m_wires {
+			pack_message_block(&mut w, m, [0; 128]);
+		}
+		circuit.populate_wire_witness(&mut w).unwrap();
+
+		cs.verify(&w.into_value_vec()).unwrap();
+	}
+
+	#[test]
+	fn sha512_parallel() {
+		// Test multiple SHA-512 compressions in parallel (no chaining)
+		const N: usize = 3;
+		let circuit = CircuitBuilder::new();
+
+		let mut m_wires: Vec<[Wire; 16]> = Vec::with_capacity(N);
+
+		for i in 0..N {
+			// Create a new subcircuit builder
+			let sha512_builder = circuit.subcircuit(format!("sha512[{i}]"));
+
+			// Each SHA-512 instance gets its own IV and input (all committed)
+			let state = State::iv(&sha512_builder);
+			let m: [Wire; 16] = std::array::from_fn(|_| sha512_builder.add_inout());
+			let _state_out = compress(&sha512_builder, state, m);
+			m_wires.push(m);
+		}
+
+		let circuit = circuit.build();
+		let cs = circuit.constraint_system();
+		let mut w = circuit.new_witness_filler();
+
+		for m in &m_wires {
+			pack_message_block(&mut w, m, [0; 128]);
+		}
+		circuit.populate_wire_witness(&mut w).unwrap();
+		cs.verify(&w.into_value_vec()).unwrap();
+	}
+
+	/// Runs [`compress`] in gates over its flat word interface.
+	fn run_compress_words(inputs: [u64; 24]) -> [u64; 8] {
+		let builder = CircuitBuilder::new();
+		let wires: [Wire; 24] = std::array::from_fn(|_| builder.add_witness());
+		let out = compress_gates(
+			&builder,
+			State(std::array::from_fn(|i| wires[i])),
+			std::array::from_fn(|i| wires[8 + i]),
+		);
+		for wire in out.0 {
+			builder.mark_inout(wire);
+		}
+
+		let circuit = builder.build();
+		let mut w = circuit.new_witness_filler();
+		for (wire, word) in std::iter::zip(wires, inputs) {
+			w[wire] = Word(word);
+		}
+		circuit.populate_wire_witness(&mut w).unwrap();
+
+		std::array::from_fn(|i| w[out.0[i]].as_u64())
+	}
+
+	proptest! {
+		// The chip path takes the outputs from `Sha512Compress::execute` and the chip recomputes
+		// them from its gates, so the two have to agree on every word a circuit can reach them
+		// with. Every SHA-512 word is a full 64-bit value, so random words cover the whole
+		// interface.
+		#[test]
+		fn compress_hint_matches_its_gates(words in prop::collection::vec(any::<u64>(), 24)) {
+			let inputs: [u64; 24] = std::array::from_fn(|i| words[i]);
+
+			let mut hinted = [Word::ZERO; 8];
+			Sha512Compress.execute(&[], &inputs.map(Word), &mut hinted);
+
+			prop_assert_eq!(hinted.map(|word| word.as_u64()), run_compress_words(inputs));
+		}
+	}
+}

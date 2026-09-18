@@ -1,0 +1,52 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+## [0.6.0] - 2026-06-11
+### Merged PRs
+- Mds: small improvements and more testing (#1459)
+- Fix: faster packed than scalar Goldilocks MDS layer for poseidon1 (#1645)
+- Feat: add p3-monolith-air crate for Monolith permutation arithmetization (#1516)
+- Ci: tighten doc/release/TOML checks (#1689)
+- Chore: update CHANGELOGs (#1785)
+
+## [0.5.3] - 2026-05-15
+## [0.5.2] - 2026-03-27
+### Merged PRs
+- Mds: small improvements and more testing (#1459)
+
+## [0.5.1] - 2026-03-16
+## [0.5.0] - 2026-03-10
+### Merged PRs
+- Deps: update rand and rand_xoshiro (#1314)
+- Chore(mds): expand naive coverage across fields and widths (#1347)
+- Poseidon1: packed form for monty31 (#1378)
+
+## [0.4.2] - 2026-01-05
+### Authors
+
+## [0.4.1] - 2025-12-18
+### Authors
+
+## [0.4.0] - 2025-12-12
+### Merged PRs
+- Field.rs: `Powers::packed_collect_n` (#888) (Adrian Hamelink)
+- Chore: add descriptions to all sub-crate manifests (#906) (Himess)
+- Chore: use `collect_n` with powers when possible (#963) (Thomas Coratger)
+- Clippy: small step (#1102) (Thomas Coratger)
+- Refactor(mds): Eliminate code duplication in bowers_g_layer functions (#1098) (andrewshab)
+- Clippy: add semicolon_if_nothing_returned (#1107) (Thomas Coratger)
+- Clippy: add `needless_pass_by_value` (#1112) (Thomas Coratger)
+- Allow users to impl either permute or permute_mut (#1175) (AngusG)
+
+### Authors
+- Adrian Hamelink
+- AngusG
+- Himess
+- Thomas Coratger
+- andrewshab
+

@@ -1,0 +1,44 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+## [0.6.0] - 2026-06-11
+### Merged PRs
+- Batch-stark: more efficient prover (#1470)
+- Ci: tighten doc/release/TOML checks (#1689)
+- Refactor: move DisjointMutPtr to p3-util (#1720)
+- Chore: update CHANGELOGs (#1785)
+
+## [0.5.3] - 2026-05-15
+## [0.5.2] - 2026-03-27
+## [0.5.1] - 2026-03-16
+## [0.5.0] - 2026-03-10
+### Merged PRs
+- Refactor maybe-rayon cfg usage to remove duplicated prelude/iter modules (#1255)
+
+## [0.4.2] - 2026-01-05
+### Merged PRs
+- SIMD optimization for proof-of-work grinding in DuplexChallenger (#1208) (Utsav Sharma)
+
+### Authors
+- Utsav Sharma
+
+## [0.4.1] - 2025-12-18
+### Authors
+
+## [0.4.0] - 2025-12-12
+### Merged PRs
+- Chore(maybe-rayon): replace deprecated repeatn with repeat_n (#1064) (Skylar Ray)
+- Update lib.rs (#1091) (AJoX)
+- Clippy: small step (#1102) (Thomas Coratger)
+- Challenger: add `observe_base_as_algebra_element ` to `FieldChallenger` trait (#1152) (Thomas Coratger)
+
+### Authors
+- AJoX
+- Skylar Ray
+- Thomas Coratger
+

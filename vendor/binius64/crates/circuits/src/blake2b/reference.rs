@@ -1,0 +1,214 @@
+// Copyright 2025 Irreducible Inc.
+//! BLAKE2b reference implementation
+//!
+//! This module provides a pure Rust implementation of BLAKE2b following RFC 7693.
+//! It serves as a reference for the circuit implementation and testing.
+
+use super::constants::{BLOCK_BYTES, IV, MAX_OUTPUT_BYTES, R1, R2, R3, R4, ROUNDS, SIGMA};
+
+/// Rotate right for 64-bit words
+#[inline(always)]
+const fn rotr64(x: u64, n: u32) -> u64 {
+	x.rotate_right(n)
+}
+
+/// G mixing function - the core primitive of BLAKE2b
+///
+/// Performs 8 operations mixing two input words with the state
+#[inline(always)]
+pub const fn g(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64) {
+	v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+	v[d] = rotr64(v[d] ^ v[a], R1);
+	v[c] = v[c].wrapping_add(v[d]);
+	v[b] = rotr64(v[b] ^ v[c], R2);
+	v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+	v[d] = rotr64(v[d] ^ v[a], R3);
+	v[c] = v[c].wrapping_add(v[d]);
+	v[b] = rotr64(v[b] ^ v[c], R4);
+}
+
+/// Convert bytes to 64-bit words (little-endian)
+pub fn bytes_to_words(bytes: &[u8]) -> [u64; 16] {
+	let mut words = [0u64; 16];
+	for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+		words[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+	}
+	words
+}
+
+/// BLAKE2b compression function F
+///
+/// Compresses a 128-byte block into the state using 12 rounds of mixing
+pub fn compress(h: &mut [u64; 8], block: &[u8; 128], t: u128, last: bool) {
+	// Initialize working vector
+	let mut v = [0u64; 16];
+
+	// First half from state
+	v[0..8].copy_from_slice(h);
+
+	// Second half from IV
+	v[8..16].copy_from_slice(&IV);
+
+	// Mix in counter (128-bit counter split into two 64-bit words)
+	v[12] ^= t as u64; // Low word
+	v[13] ^= (t >> 64) as u64; // High word
+
+	// Invert v[14] for last block flag
+	if last {
+		v[14] = !v[14];
+	}
+
+	// Convert block to 16 words
+	let m = bytes_to_words(block);
+
+	// 12 rounds of mixing
+	for round in 0..ROUNDS {
+		let s = &SIGMA[round];
+
+		// Column step (mix columns of the 4x4 matrix)
+		g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+		g(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+		g(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+		g(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+
+		// Diagonal step (mix diagonals of the 4x4 matrix)
+		g(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+		g(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+		g(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+		g(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+	}
+
+	// Finalization: XOR the two halves back into state
+	for i in 0..8 {
+		h[i] ^= v[i] ^ v[i + 8];
+	}
+}
+
+/// BLAKE2b hash function with variable output length
+///
+/// Computes BLAKE2b hash of input data with specified output length (1-64 bytes)
+pub fn blake2b(data: &[u8], outlen: usize) -> Vec<u8> {
+	assert!(outlen > 0 && outlen <= MAX_OUTPUT_BYTES, "Output length must be 1-64 bytes");
+
+	// Initialize state with IV XORed with parameter block
+	let mut h = IV;
+
+	// Parameter block: Set output length in first byte, rest are zeros for basic version
+	// Format: 0x0101kknn where nn=outlen, kk=keylen (0 for us), fanout=depth=1
+	h[0] ^= 0x01010000 | (outlen as u64);
+
+	// Process message blocks
+	let mut t = 0u128; // Total bytes counter
+	let mut offset = 0;
+
+	// Process all complete blocks except the last one
+	while offset + BLOCK_BYTES < data.len() {
+		let mut block = [0u8; BLOCK_BYTES];
+		block.copy_from_slice(&data[offset..offset + BLOCK_BYTES]);
+
+		t += BLOCK_BYTES as u128;
+		compress(&mut h, &block, t, false);
+
+		offset += BLOCK_BYTES;
+	}
+
+	// Process final block (always exists, may be partial or full)
+	let mut final_block = [0u8; BLOCK_BYTES];
+	let remaining = data.len() - offset;
+	if remaining > 0 {
+		final_block[..remaining].copy_from_slice(&data[offset..]);
+	}
+
+	t += remaining as u128;
+	compress(&mut h, &final_block, t, true); // Set last block flag
+
+	// Convert state to bytes and return requested length
+	let mut output = Vec::with_capacity(outlen);
+	for word in h.iter() {
+		let bytes = word.to_le_bytes();
+		for byte in bytes {
+			if output.len() < outlen {
+				output.push(byte);
+			}
+		}
+	}
+	output.truncate(outlen);
+	output
+}
+
+/// BLAKE2b-256: Fixed 256-bit (32-byte) output variant
+///
+/// This is a convenience function for the common 256-bit output case
+pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
+	let hash = blake2b(data, 32);
+	let mut result = [0u8; 32];
+	result.copy_from_slice(&hash);
+	result
+}
+
+#[cfg(test)]
+mod tests {
+	use blake2::{
+		Blake2b, Blake2b256, Digest,
+		digest::{
+			array::ArraySize,
+			consts::U64,
+			typenum::{IsLessOrEqual, True},
+		},
+	};
+
+	use super::*;
+
+	/// Compares [`blake2b`] against the reference hasher at the output length `N` names.
+	///
+	/// The length is a type rather than a value, since the hasher fixes its output size at
+	/// compile time.
+	fn check_output_length<N>(msg: &[u8])
+	where
+		N: ArraySize + IsLessOrEqual<U64, Output = True>,
+	{
+		let expected = Blake2b::<N>::digest(msg);
+		assert_eq!(blake2b(msg, N::USIZE), expected.as_slice(), "output length {}", N::USIZE);
+	}
+
+	/// Calls [`check_output_length`] once per named length.
+	macro_rules! check_output_lengths {
+		($msg:expr, $($len:ident),+ $(,)?) => {
+			$(check_output_length::<blake2::digest::consts::$len>($msg);)+
+		};
+	}
+
+	/// Test variable output lengths
+	#[test]
+	fn test_variable_output_lengths() {
+		let msg = b"test message for variable output lengths";
+
+		// BLAKE2b mixes its output length into the parameter block.
+		// So every length is its own computation, and none of them stands in for the rest.
+		check_output_lengths!(
+			msg, U1, U2, U3, U4, U5, U6, U7, U8, U9, U10, U11, U12, U13, U14, U15, U16, U17, U18,
+			U19, U20, U21, U22, U23, U24, U25, U26, U27, U28, U29, U30, U31, U32, U33, U34, U35,
+			U36, U37, U38, U39, U40, U41, U42, U43, U44, U45, U46, U47, U48, U49, U50, U51, U52,
+			U53, U54, U55, U56, U57, U58, U59, U60, U61, U62, U63, U64
+		);
+	}
+
+	/// Test incremental hashing verification
+	#[test]
+	fn test_incremental_hashing() {
+		let data = vec![0x55u8; 300];
+
+		// Hash all at once with our reference
+		let expected = blake2b_256(&data);
+
+		// Incremental hashing using standard crate
+		let mut hasher = Blake2b256::new();
+		hasher.update(&data[0..100]);
+		hasher.update(&data[100..200]);
+		hasher.update(&data[200..300]);
+		let incremental = hasher.finalize();
+
+		// Our implementation should match incrementally computed hash
+		assert_eq!(&expected[..], &incremental[..], "Incremental hashing verification failed");
+	}
+}

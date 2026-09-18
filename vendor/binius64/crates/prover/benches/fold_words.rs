@@ -1,0 +1,39 @@
+// Copyright 2025 Irreducible Inc.
+use binius_compute::BufferPool;
+use binius_core::word::Word;
+use binius_field::arch::OptimalPackedB128;
+use binius_math::test_utils::random_scalars;
+use binius_prover::fold_word::BitAxisFolder;
+use binius_verifier::config::B128;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use rand::prelude::*;
+
+fn bench_fold_words(c: &mut Criterion) {
+	let mut group = c.benchmark_group("fold_words");
+
+	// Sizes below the task floor show what bounding the split is worth.
+	// The floor is 2^12 words, so 2^10 folds as one task and 2^20 as many.
+	for log_n_words in [10, 12, 14, 16, 20] {
+		let n_words = 1 << log_n_words;
+
+		// Set throughput to measure elements per second
+		group.throughput(Throughput::Elements(n_words as u64));
+
+		group.bench_with_input(BenchmarkId::from_parameter(n_words), &n_words, |b, &n_words| {
+			let mut rng = rand::rng();
+			let words = (0..n_words)
+				.map(|_| Word::from_u64(rng.random()))
+				.collect::<Vec<_>>();
+			let vec = random_scalars::<B128>(&mut rng, Word::BITS);
+
+			let pool = BufferPool::new();
+			let alloc = &pool;
+			b.iter(|| BitAxisFolder::new(&vec).fold::<OptimalPackedB128, _>(&alloc, &words));
+		});
+	}
+
+	group.finish();
+}
+
+criterion_group!(benches, bench_fold_words);
+criterion_main!(benches);

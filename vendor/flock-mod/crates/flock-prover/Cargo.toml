@@ -1,0 +1,23 @@
+[package]
+name = "flock-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Apple-silicon-optimized end-to-end prover for Flock (R1CS over GF(2))."
+
+[features]
+# Forwarded to flock-core. See that crate's manifest for semantics.
+hash-count = ["flock-core/hash-count"]
+unsound-challenger = ["flock-core/unsound-challenger"]
+
+[dependencies]
+flock-core = { path = "../flock-core" }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[lints]
+workspace = true

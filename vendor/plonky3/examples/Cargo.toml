@@ -1,0 +1,56 @@
+[package]
+name = "p3-examples"
+description = "Example implementations and demonstrations of Plonky3 STARK proof system components."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[dependencies]
+p3-air.workspace = true
+p3-blake3-air.workspace = true
+p3-challenger.workspace = true
+p3-circle.workspace = true
+p3-commit.workspace = true
+p3-dft.workspace = true
+p3-field.workspace = true
+p3-fri.workspace = true
+p3-keccak.workspace = true
+p3-keccak-air.workspace = true
+p3-matrix.workspace = true
+p3-merkle-tree.workspace = true
+p3-mersenne-31.workspace = true
+p3-monty-31.workspace = true
+p3-poseidon1-air.workspace = true
+p3-poseidon2.workspace = true
+p3-poseidon2-air.workspace = true
+p3-symmetric.workspace = true
+p3-uni-stark.workspace = true
+
+clap.workspace = true
+postcard = { workspace = true, features = ["alloc"] }
+rand.workspace = true
+
+[dev-dependencies]
+p3-baby-bear = { path = "../baby-bear" }
+p3-challenger = { path = "../challenger" }
+p3-commit = { path = "../commit", features = ["test-utils"] }
+p3-dft = { path = "../dft" }
+p3-koala-bear = { path = "../koala-bear" }
+p3-matrix = { path = "../matrix" }
+p3-poseidon1 = { path = "../poseidon1" }
+p3-stir = { path = "../stir" }
+p3-sumcheck = { path = "../sumcheck" }
+p3-util = { path = "../util" }
+p3-whir = { path = "../whir" }
+
+tracing.workspace = true
+tracing-forest = { workspace = true, features = ["ansi", "smallvec"] }
+tracing-subscriber = { workspace = true, features = ["std", "env-filter"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,833 @@
+use alloc::vec;
+use alloc::vec::Vec;
+
+use itertools::Itertools;
+use p3_air::symbolic::{AirLayout, SymbolicAirBuilder, get_symbolic_constraints};
+use p3_air::{Air, RowWindow};
+use p3_challenger::{CanObserve, FieldChallenger};
+use p3_commit::{Pcs, PolynomialSpace};
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use p3_field::Field;
+use p3_field::{PackedFieldExtension, PackedValue, PrimeCharacteristicRing};
+use p3_matrix::Matrix;
+use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView};
+use p3_maybe_rayon::prelude::*;
+use p3_util::log2_strict_usize;
+use tracing::{debug_span, info_span, instrument};
+
+use crate::{
+    Commitments, Domain, OpenedValues, PackedChallenge, PackedVal, PreprocessedProverData, Proof,
+    ProverConstraintFolder, StarkGenericConfig, Val, get_constraint_layout,
+    get_log_num_quotient_chunks,
+};
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use crate::{VectorizedChallenge, VectorizedConstraintFolder, VectorizedVal};
+
+/// Number of packed vectors evaluated in lockstep per constraint expression during
+/// quotient evaluation on NEON, for fields where
+/// [`Field::BENEFITS_FROM_LOCKSTEP_EVALUATION`] holds. A single packed vector forms one
+/// dependency chain per constraint expression, which cannot hide the latency of modular
+/// multiplication (e.g. ~10 cycles at ~1.25 cycles/vector throughput on NEON). Two
+/// lockstep chains let the out-of-order core overlap independent rows; values above 2
+/// increase register pressure with diminishing returns.
+///
+/// Public so that a concrete (non-generic) `impl Air<ProverConstraintFolder<'a, SC>>` can
+/// name it in the matching `impl Air<VectorizedConstraintFolder<'a, SC, QUOTIENT_ILP>>`
+/// required by [`QuotientAir`] on `aarch64`+`neon` — see that trait's docs.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub const QUOTIENT_ILP: usize = 2;
+
+/// AIRs usable with [`quotient_values`] and the functions built on it.
+///
+/// On `aarch64` with NEON this requires implementing both [`ProverConstraintFolder`] and
+/// the wider [`VectorizedConstraintFolder`], so [`quotient_values`] can pick between them
+/// per field at runtime (see [`Field::BENEFITS_FROM_LOCKSTEP_EVALUATION`]); AIRs written
+/// generically over the builder (the usual pattern) satisfy both automatically. Elsewhere
+/// this is exactly the [`ProverConstraintFolder`] bound, unchanged.
+///
+/// A concrete AIR with its own `impl Air<ProverConstraintFolder<'a, SC>>` (rather than a
+/// generic `impl<B: AirBuilder> Air<B>`) compiles on `x86_64` but fails to compile on
+/// `aarch64`+`neon` unless it also adds `impl<'a, SC> Air<VectorizedConstraintFolder<'a,
+/// SC, QUOTIENT_ILP>> for MyAir`.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub trait QuotientAir<SC: StarkGenericConfig>:
+    Air<SymbolicAirBuilder<Val<SC>>>
+    + for<'a> Air<ProverConstraintFolder<'a, SC>>
+    + for<'a> Air<VectorizedConstraintFolder<'a, SC, QUOTIENT_ILP>>
+{
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+impl<SC, A> QuotientAir<SC> for A
+where
+    SC: StarkGenericConfig,
+    A: Air<SymbolicAirBuilder<Val<SC>>>
+        + for<'a> Air<ProverConstraintFolder<'a, SC>>
+        + for<'a> Air<VectorizedConstraintFolder<'a, SC, QUOTIENT_ILP>>,
+{
+}
+
+/// AIRs usable with [`quotient_values`] and the functions built on it.
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+pub trait QuotientAir<SC: StarkGenericConfig>:
+    Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>
+{
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+impl<SC, A> QuotientAir<SC> for A
+where
+    SC: StarkGenericConfig,
+    A: Air<SymbolicAirBuilder<Val<SC>>> + for<'a> Air<ProverConstraintFolder<'a, SC>>,
+{
+}
+
+#[instrument(skip_all)]
+#[allow(clippy::multiple_bound_locations, clippy::type_repetition_in_bounds)] // cfg not supported in where clauses?
+pub fn prove_with_preprocessed<
+    SC,
+    #[cfg(debug_assertions)] A: for<'a> Air<p3_air::DebugConstraintBuilder<'a, Val<SC>>>,
+    #[cfg(not(debug_assertions))] A,
+>(
+    config: &SC,
+    air: &A,
+    trace: RowMajorMatrix<Val<SC>>,
+    public_values: &[Val<SC>],
+    preprocessed: Option<&PreprocessedProverData<SC>>,
+) -> Proof<SC>
+where
+    SC: StarkGenericConfig,
+    A: QuotientAir<SC>,
+{
+    #[cfg(debug_assertions)]
+    p3_air::check_constraints(air, &trace, public_values);
+
+    // Compute the height `N = 2^n` and `log_2(height)`, `n`, of the trace.
+    let degree = trace.height();
+    let log_degree = log2_strict_usize(degree);
+    let log_ext_degree = log_degree + config.is_zk();
+
+    // Get preprocessed width for symbolic constraint evaluation.
+    //
+    // - If reusable preprocessed prover data is provided, trust its width and degree_bits
+    //   (and enforce consistency).
+    // - Otherwise, if the AIR defines preprocessed columns, we treat it as an error:
+    //   callers must use `setup_preprocessed` and pass the resulting data in.
+    let preprocessed_width = preprocessed.map_or_else(
+        || {
+            let width = air.preprocessed_width();
+            if width > 0 {
+                panic!(
+                    "AIR defines preprocessed columns (width = {width}), \
+                     but no PreprocessedProverData was provided. \
+                     Call `setup_preprocessed` and pass it to `prove_with_preprocessed`."
+                );
+            }
+            0
+        },
+        |pp| {
+            assert_eq!(
+                pp.degree_bits, log_ext_degree,
+                "PreprocessedProverData degree_bits does not match trace degree_bits"
+            );
+            pp.width
+        },
+    );
+
+    let layout = AirLayout {
+        preprocessed_width,
+        main_width: air.width(),
+        num_public_values: air.num_public_values(),
+        num_periodic_columns: air.num_periodic_columns(),
+        ..Default::default()
+    };
+
+    // In debug builds, cross-check the static hint against symbolic evaluation.
+    debug_assert!(
+        air.num_constraints()
+            .is_none_or(|n| { n == get_symbolic_constraints(air, layout).len() }),
+        "num_constraints() = {} but symbolic evaluation found {} constraints",
+        air.num_constraints().unwrap(),
+        get_symbolic_constraints(air, layout).len(),
+    );
+
+    // Each constraint polynomial looks like `C_j(X_1, ..., X_w, Y_1, ..., Y_w, Z_1, ..., Z_j)`.
+    // When evaluated on a given row, the X_i's will be the `i`'th element of the that row, the
+    // Y_i's will be the `i`'th element of the next row and the Z_i's will be evaluations of
+    // selector polynomials on the given row index.
+    //
+    // When we convert to working with polynomials, the `X_i`'s and `Y_i`'s will be replaced by the
+    // degree `N - 1` polynomials `T_i(x)` and `T_i(hx)` respectively. The selector polynomials are
+    // a little more complicated, however.
+    //
+    // In our case, the selector polynomials are `S_1(x) = is_first_row`, `S_2(x) = is_last_row`
+    // and `S_3(x) = is_transition`. Both `S_1(x)` and `S_2(x)` are polynomials of degree `N - 1`
+    // as they must be non-zero only at a single location in the initial domain. However,
+    // `is_transition` is a polynomial of degree `1` as it simply needs to be `0` on the last row.
+    //
+    // The constraint degree (`deg(C)`) is the linear factor of `N` in the constraint polynomial. In other
+    // words, it is roughly the total degree of `C`; however, we treat `Z_3` as a constant term which does
+    // not contribute to the degree.
+    //
+    // E.g. `C_j = Z_1 * (X_1^3 - X_2 * X_3 * X_4)` would have degree `4`.
+    //      `C_j = Z_3 * (X_1^3 - X_2 * X_3 * X_4)` would have degree `3`.
+    //
+    // The point of all this is that, defining:
+    //          C(x) = C(T_1(x), ..., T_w(x), T_1(hx), ... T_w(hx), S_1(x), S_2(x), S_3(x))
+    // We get the constraint bound:
+    //          deg(C(x)) <= deg(C) * (N - 1) + 1
+    // The `+1` is due to the `is_transition` selector which is not accounted for in `deg(C)`. Note
+    // that S_i^2 should never appear in a constraint as it should just be replaced by `S_i`.
+    //
+    // For now in comments we assume that `deg(C) = 3` meaning `deg(C(x)) <= 3N - 2`
+
+    // From the degree of the constraint polynomial, compute the number
+    // of quotient polynomials we will split Q(x) into. This is chosen to
+    // always be a power of 2.
+    let log_num_quotient_chunks =
+        get_log_num_quotient_chunks::<Val<SC>, A>(air, layout, degree, config.is_zk());
+
+    let num_quotient_chunks = 1 << (log_num_quotient_chunks + config.is_zk());
+
+    // Initialize the PCS and the Challenger.
+    let pcs = config.pcs();
+    let mut challenger = config.initialise_challenger();
+
+    // Get the subgroup `H` of size `N`. We treat each column `T_i` of
+    // the trace as an evaluation vector of polynomials `T_i(x)` over `H`.
+    // (In the Circle STARK case `H` is instead a standard position twin coset of size `N`)
+    let trace_domain = pcs.natural_domain_for_degree(degree);
+
+    // When ZK is enabled, we need to use an extended domain of size `2N` as we will
+    // add random values to the trace.
+    let ext_trace_domain = pcs.natural_domain_for_degree(degree * (config.is_zk() + 1));
+
+    // Let `g` denote a generator of the multiplicative group of `F` and `H'` the unique
+    // subgroup of `F` of size `N << (pcs.config.log_blowup + config.is_zk())`.
+    // If `zk` is enabled, we double the trace length by adding random values.
+    //
+    // For each trace column `T_i`, we compute the evaluation vector of `T_i(x)` over `H'`. This
+    // new extended trace `ET` is hashed into a Merkle tree with its rows bit-reversed.
+    //      trace_commit contains the root of the tree
+    //      trace_data contains the entire tree.
+    //          - trace_data.leaves is the matrix containing `ET`.
+    let (trace_commit, trace_data) =
+        info_span!("commit to trace data").in_scope(|| pcs.commit([(ext_trace_domain, trace)]));
+
+    // Benchmark-only aggregate boundary: the AIR relation reduction starts after
+    // committing the execution trace and ends before the PCS/FRI opening.
+    let piop_span = info_span!("AIR quotient PIOP");
+    let piop_guard = piop_span.enter();
+
+    // Preprocessed commitment and prover data (if any).
+    let (preprocessed_commit, preprocessed_data_ref) = preprocessed
+        .map(|pp| (pp.commitment.clone(), &pp.prover_data))
+        .unzip();
+
+    // Observe the instance.
+    // degree < 2^255 so we can safely cast log_degree to a u8.
+    challenger.observe(Val::<SC>::from_u8(log_ext_degree as u8));
+    challenger.observe(Val::<SC>::from_u8(log_degree as u8));
+    challenger.observe(Val::<SC>::from_usize(preprocessed_width));
+    // TODO: Might be best practice to include other instance data here; see verifier comment.
+
+    // Observe the Merkle root of the trace commitment.
+    challenger.observe(trace_commit.clone());
+    if preprocessed_width > 0 {
+        challenger.observe(preprocessed_commit.as_ref().unwrap().clone());
+    }
+
+    // Observe the public input values.
+    challenger.observe_slice(public_values);
+
+    // Get the first Fiat Shamir challenge which will be used to combine all constraint polynomials
+    // into a single polynomial.
+    //
+    // Soundness Error:
+    // If a prover is malicious, we can find a row `i` such that some of the constraints
+    // C_0, ..., C_n are non 0 on this row. The malicious prover "wins" if the random challenge
+    // alpha is such that:
+    // (1): C_0(i) + alpha * C_1(i) + ... + alpha^n * C_n(i) = 0
+    // This is a polynomial of degree n, so it has at most n roots. Thus the probability of this
+    // occurring for a given trace and set of constraints is n/|EF|.
+    //
+    // Currently, we do not observe data about the constraint polynomials directly. In particular
+    // a prover could take a trace and fiddle around with the AIR it claims to satisfy without
+    // changing this sample alpha.
+    //
+    // In particular this means that a malicious prover could create a custom AIR for a given trace
+    // such that equation (1) holds. However, such AIRs would need to be very specific and
+    // so such tampering should be obvious to spot. The verifier needs to check the AIR anyway to
+    // confirm that satisfying it indeed proves what the prover claims. Hence this should not be
+    // a soundness issue.
+    let alpha: SC::Challenge = challenger.sample_algebra_element();
+
+    // A domain large enough to uniquely identify the quotient polynomial.
+    // This domain must be contained in the domain over which `trace_data` is defined.
+    // Explicitly it should be equal to `gK` for some subgroup `K` contained in `H'`.
+    let quotient_domain =
+        ext_trace_domain.create_disjoint_domain(1 << (log_ext_degree + log_num_quotient_chunks));
+
+    // Return a the subset of the extended trace `ET` corresponding to the rows giving evaluations
+    // over the quotient domain.
+    //
+    // This only works if the trace domain is `gH'` and the quotient domain is `gK` for some subgroup `K` contained in `H'`.
+    // TODO: Make this explicit in `get_evaluations_on_domain` or otherwise fix this.
+    let trace_on_quotient_domain = pcs.get_evaluations_on_domain(&trace_data, 0, quotient_domain);
+    let preprocessed_on_quotient_domain = preprocessed_data_ref
+        .map(|data| pcs.get_evaluations_on_domain_no_random(data, 0, quotient_domain));
+
+    // Compute the quotient polynomial `Q(x)` by evaluating
+    //          `C(T_1(x), ..., T_w(x), T_1(hx), ..., T_w(hx), selectors(x)) / Z_H(x)`
+    // at every point in the quotient domain. The degree of `Q(x)` is `<= deg(C(x)) - N = 2N - 2` in the case
+    // where `deg(C) = 3`. (See the discussion above constraint_degree for more details.)
+    let quotient_values = quotient_values(
+        pcs,
+        air,
+        public_values,
+        layout,
+        trace_domain,
+        quotient_domain,
+        &trace_on_quotient_domain,
+        preprocessed_on_quotient_domain.as_ref(),
+        alpha,
+    );
+
+    // Due to `alpha`, evaluations of `Q` all lie in the extension field `E`.
+    // We flatten this into a matrix of `F` values by treating `E` as an `F`
+    // vector space and so separating each element of `E` into `e + 1 = [E: F]` elements of `F`.
+    //
+    // This is valid to do because our domain lies in the base field `F`. Hence we can split
+    // `Q(x)` into `e + 1` polynomials `Q_0(x), ... , Q_e(x)` each contained in `F`.
+    // such that `Q(x) = [Q_0(x), ... ,Q_e(x)]` holds for all `x` in `F`.
+    let quotient_flat = RowMajorMatrix::new_col(quotient_values).flatten_to_base();
+
+    // Currently each polynomial `Q_i(x)` is of degree `<= 2(N - 1)` and
+    // we have it's evaluations over a the coset `gK of size `2N`. Let `k` be the chosen
+    // generator of `K` which satisfies `k^2 = h`.
+    //
+    // We can split this coset into the sub-cosets `gH` and `gkH` each of size `N`.
+    // Define:  L_g(x)    = (x^N - (gk)^N)/(g^N - (gk)^N) = (x^N + g^N)/2g^N
+    //          L_{gk}(x) = (x^N - g^N)/(g^N - (gk)^N)    = -(x^N - g^N)/2g^N.
+    // Then `L_g` is equal to `1` on `gH` and `0` on `gkH` and `L_{gk}` is equal to `1` on `gkH` and `0` on `gH`.
+    //
+    // Thus we can decompose `Q_i(x) = L_{g}(x)q_{i0}(x) + L_{gk}(x)q_{i1}(x)` (Or an randomized version of this in the zk case)
+    // where `q_{i0}(x)` and `q_{i1}(x)` are polynomials of degree `<= N - 1`.
+    // Moreover the evaluations of `q_{i0}(x), q_{i1}(x)` on `gH` and `gkH` respectively are
+    // exactly the evaluations of `Q_i(x)` on `gH` and `gkH`.
+    // For each polynomial `q_{ij}`, compute the evaluation vector of `q_{ij}(x)` over `gH'`. We bit
+    // reverse the rows and hash the resulting matrix into a merkle tree.
+    //      quotient_commit contains the root of the tree
+    //      quotient_data contains the entire tree.
+    //          - quotient_data.leaves is a pair of matrices containing the `q_i0(x)` and `q_i1(x)`.
+    let (quotient_commit, quotient_data) = info_span!("commit to quotient poly chunks")
+        .in_scope(|| pcs.commit_quotient(quotient_domain, quotient_flat, num_quotient_chunks));
+    challenger.observe(quotient_commit.clone());
+
+    // If zk is enabled, we generate random extension field values of the size of the randomized trace. If `n` is the degree of the initial trace,
+    // then the randomized trace has degree `2n`. To randomize the FRI batch polynomial, we then need an extension field random polynomial of degree `2n -1`.
+    // So we can generate a random polynomial of degree `2n`, and provide it to `open` as is.
+    // Then the method will add `(R(X) - R(z)) / (X - z)` (which is of the desired degree `2n - 1`), to the batch of polynomials.
+    // Since we need a random polynomial defined over the extension field, and the `commit` method is over the base field,
+    // we actually need to commit to `SC::Challenge::D` base field random polynomials.
+    // This is similar to what is done for the quotient polynomials.
+    // TODO: This approach is only statistically zk. To make it perfectly zk, `R` would have to truly be an extension field polynomial.
+    let (opt_r_commit, opt_r_data) = if SC::Pcs::ZK {
+        let (r_commit, r_data) = pcs
+            .get_opt_randomization_poly_commitment(core::iter::once(ext_trace_domain))
+            .expect("ZK is enabled, so we should have randomization commitments");
+        (Some(r_commit), Some(r_data))
+    } else {
+        (None, None)
+    };
+
+    // Combine our commitments to the trace and quotient polynomials into a single object which
+    // will be passed to the verifier.
+    let commitments = Commitments {
+        trace: trace_commit,
+        quotient_chunks: quotient_commit,
+        random: opt_r_commit.clone(),
+    };
+
+    if let Some(r_commit) = opt_r_commit {
+        challenger.observe(r_commit);
+    }
+
+    // Get an out-of-domain point to open our values at.
+    //
+    // Soundness Error:
+    // This sample will be used to check the equality: `C(X) = ZH(X)Q(X)`. If a prover is malicious
+    // and this equality is false, the probability that it is true at the point `zeta` will be
+    // deg(C(X))/|EF| = dN/|EF| where `N` is the trace length and our constraints have degree `d`.
+    //
+    // Completeness Error:
+    // If zeta happens to lie in the domain `gK`, then when opening at zeta we will run into division
+    // by zero errors. This doesn't lead to a soundness issue as the verifier will just reject in those
+    // cases but it is a completeness issue and contributes a completeness error of |gK| = 2N/|EF|.
+    let zeta: SC::Challenge = challenger.sample_algebra_element();
+    let zeta_next = trace_domain
+        .next_point(zeta)
+        .expect("domain should support next_point operation");
+
+    let is_random = opt_r_data.is_some();
+    let main_next = !air.main_next_row_columns().is_empty();
+    let pre_next = !air.preprocessed_next_row_columns().is_empty();
+    drop(piop_guard);
+    let (opened_values, opening_proof) = info_span!("open").in_scope(|| {
+        let round0 = opt_r_data.as_ref().map(|r_data| (r_data, vec![vec![zeta]]));
+        let round1_points = if main_next {
+            vec![zeta, zeta_next]
+        } else {
+            vec![zeta]
+        };
+        let round1 = (&trace_data, vec![round1_points]);
+        let round2 = (&quotient_data, vec![vec![zeta]; num_quotient_chunks]); // open every chunk at zeta
+        let round3 = preprocessed_data_ref.map(|data| {
+            let pre_points = if pre_next {
+                vec![zeta, zeta_next]
+            } else {
+                vec![zeta]
+            };
+            (data, vec![pre_points])
+        });
+
+        let rounds = round0
+            .into_iter()
+            .chain([round1, round2])
+            .chain(round3)
+            .collect();
+
+        pcs.open_with_preprocessing(rounds, &mut challenger, preprocessed_data_ref.is_some())
+    });
+    let trace_idx = SC::Pcs::TRACE_IDX;
+    let quotient_idx = SC::Pcs::QUOTIENT_IDX;
+    let trace_local = opened_values[trace_idx][0][0].clone();
+    let trace_next = if main_next {
+        Some(opened_values[trace_idx][0][1].clone())
+    } else {
+        None
+    };
+    let quotient_chunks = opened_values[quotient_idx]
+        .iter()
+        .map(|v| v[0].clone())
+        .collect_vec();
+    let random = if is_random {
+        Some(opened_values[0][0][0].clone())
+    } else {
+        None
+    };
+    let (preprocessed_local, preprocessed_next) = if preprocessed_width > 0 {
+        let local = Some(opened_values[SC::Pcs::PREPROCESSED_TRACE_IDX][0][0].clone());
+        let next = if pre_next {
+            Some(opened_values[SC::Pcs::PREPROCESSED_TRACE_IDX][0][1].clone())
+        } else {
+            None
+        };
+        (local, next)
+    } else {
+        (None, None)
+    };
+    let opened_values = OpenedValues {
+        trace_local,
+        trace_next,
+        preprocessed_local,
+        preprocessed_next,
+        quotient_chunks,
+        random,
+    };
+    Proof {
+        commitments,
+        opened_values,
+        opening_proof,
+        degree_bits: log_ext_degree,
+    }
+}
+
+#[instrument(skip_all)]
+#[allow(clippy::multiple_bound_locations, clippy::type_repetition_in_bounds)] // cfg not supported in where clauses?
+pub fn prove<
+    SC,
+    #[cfg(debug_assertions)] A: for<'a> Air<p3_air::DebugConstraintBuilder<'a, Val<SC>>>,
+    #[cfg(not(debug_assertions))] A,
+>(
+    config: &SC,
+    air: &A,
+    trace: RowMajorMatrix<Val<SC>>,
+    public_values: &[Val<SC>],
+) -> Proof<SC>
+where
+    SC: StarkGenericConfig,
+    A: QuotientAir<SC>,
+{
+    prove_with_preprocessed::<SC, A>(config, air, trace, public_values, None)
+}
+
+#[instrument(skip_all, level = "debug")]
+// TODO: Group some arguments to remove the `allow`?
+#[allow(clippy::too_many_arguments)]
+pub fn quotient_values<SC, A, Mat>(
+    pcs: &SC::Pcs,
+    air: &A,
+    public_values: &[Val<SC>],
+    layout: AirLayout,
+    trace_domain: Domain<SC>,
+    quotient_domain: Domain<SC>,
+    trace_on_quotient_domain: &Mat,
+    preprocessed_on_quotient_domain: Option<&Mat>,
+    alpha: SC::Challenge,
+) -> Vec<SC::Challenge>
+where
+    SC: StarkGenericConfig,
+    A: QuotientAir<SC>,
+    Mat: Matrix<Val<SC>> + Sync,
+{
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    if Val::<SC>::BENEFITS_FROM_LOCKSTEP_EVALUATION {
+        return quotient_values_inner::<SC, A, Mat, VectorizedEval<QUOTIENT_ILP>>(
+            pcs,
+            air,
+            public_values,
+            layout,
+            trace_domain,
+            quotient_domain,
+            trace_on_quotient_domain,
+            preprocessed_on_quotient_domain,
+            alpha,
+        );
+    }
+    quotient_values_inner::<SC, A, Mat, PlainEval>(
+        pcs,
+        air,
+        public_values,
+        layout,
+        trace_domain,
+        quotient_domain,
+        trace_on_quotient_domain,
+        preprocessed_on_quotient_domain,
+        alpha,
+    )
+}
+
+/// Row-group constraint-folding strategy used by [`quotient_values_inner`].
+///
+/// Abstracts over the plain (single packed vector) and lockstep-vectorized folders so the
+/// row-group loop is written once. `quotient_values_inner` is monomorphized per `Self`, so
+/// instantiating it at two concrete strategies produces the same machine code as two
+/// hand-written copies of the loop — no shared runtime dispatch is introduced between them.
+trait QuotientEvalStrategy<SC: StarkGenericConfig, A> {
+    /// The packed base-field type this strategy evaluates constraints over.
+    type Pack: PackedValue<Value = Val<SC>> + Copy + Send + Sync;
+    /// The packed extension-field type constraints are folded into.
+    type Challenge: Copy + Send + Sync;
+
+    /// Evaluate one row group's constraints, fold them (dividing by the vanishing
+    /// polynomial via `inv_vanishing`), and return the resulting challenge together with
+    /// the `base_constraints`/`ext_constraints` buffers so the caller can reclaim and
+    /// reuse their allocations for the next row group.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_row_group<'a>(
+        air: &A,
+        main: RowMajorMatrixView<'a, Self::Pack>,
+        preprocessed: RowMajorMatrixView<'a, Self::Pack>,
+        periodic_values: &'a [Self::Pack],
+        public_values: &'a [Val<SC>],
+        is_first_row: Self::Pack,
+        is_last_row: Self::Pack,
+        is_transition: Self::Pack,
+        inv_vanishing: Self::Pack,
+        base_alpha_powers: &'a [Vec<Val<SC>>],
+        ext_alpha_powers: &'a [SC::Challenge],
+        base_constraints: Vec<Self::Pack>,
+        ext_constraints: Vec<Self::Challenge>,
+        base_coefficients_buf: &mut Vec<Self::Pack>,
+        constraint_count: usize,
+    ) -> (Self::Challenge, Vec<Self::Pack>, Vec<Self::Challenge>);
+
+    /// Extract the scalar challenge at packed lane `idx`.
+    fn extract(challenge: &Self::Challenge, idx: usize) -> SC::Challenge;
+}
+
+/// [`QuotientEvalStrategy`] evaluating a single packed vector per constraint expression,
+/// via [`ProverConstraintFolder`].
+struct PlainEval;
+
+impl<SC, A> QuotientEvalStrategy<SC, A> for PlainEval
+where
+    SC: StarkGenericConfig,
+    A: for<'a> Air<ProverConstraintFolder<'a, SC>>,
+{
+    type Pack = PackedVal<SC>;
+    type Challenge = PackedChallenge<SC>;
+
+    #[inline]
+    fn eval_row_group<'a>(
+        air: &A,
+        main: RowMajorMatrixView<'a, Self::Pack>,
+        preprocessed: RowMajorMatrixView<'a, Self::Pack>,
+        periodic_values: &'a [Self::Pack],
+        public_values: &'a [Val<SC>],
+        is_first_row: Self::Pack,
+        is_last_row: Self::Pack,
+        is_transition: Self::Pack,
+        inv_vanishing: Self::Pack,
+        base_alpha_powers: &'a [Vec<Val<SC>>],
+        ext_alpha_powers: &'a [SC::Challenge],
+        base_constraints: Vec<Self::Pack>,
+        ext_constraints: Vec<Self::Challenge>,
+        _base_coefficients_buf: &mut Vec<Self::Pack>,
+        constraint_count: usize,
+    ) -> (Self::Challenge, Vec<Self::Pack>, Vec<Self::Challenge>) {
+        let mut folder = ProverConstraintFolder {
+            main,
+            preprocessed,
+            preprocessed_window: RowWindow::from_view(&preprocessed),
+            periodic_values,
+            public_values,
+            is_first_row,
+            is_last_row,
+            is_transition,
+            base_alpha_powers,
+            ext_alpha_powers,
+            base_constraints,
+            ext_constraints,
+            constraint_index: 0,
+            constraint_count,
+        };
+        air.eval(&mut folder);
+
+        // quotient(x) = constraints(x) / Z_H(x)
+        let quotient = folder.finalize_constraints() * inv_vanishing;
+        (quotient, folder.base_constraints, folder.ext_constraints)
+    }
+
+    #[inline]
+    fn extract(challenge: &Self::Challenge, idx: usize) -> SC::Challenge {
+        challenge.extract(idx)
+    }
+}
+
+/// [`QuotientEvalStrategy`] evaluating `N` packed vectors in lockstep per constraint
+/// expression, via [`VectorizedConstraintFolder`].
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+struct VectorizedEval<const N: usize>;
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+impl<SC, A, const N: usize> QuotientEvalStrategy<SC, A> for VectorizedEval<N>
+where
+    SC: StarkGenericConfig,
+    A: for<'a> Air<VectorizedConstraintFolder<'a, SC, N>>,
+{
+    type Pack = VectorizedVal<SC, N>;
+    type Challenge = VectorizedChallenge<SC, N>;
+
+    #[inline]
+    fn eval_row_group<'a>(
+        air: &A,
+        main: RowMajorMatrixView<'a, Self::Pack>,
+        preprocessed: RowMajorMatrixView<'a, Self::Pack>,
+        periodic_values: &'a [Self::Pack],
+        public_values: &'a [Val<SC>],
+        is_first_row: Self::Pack,
+        is_last_row: Self::Pack,
+        is_transition: Self::Pack,
+        inv_vanishing: Self::Pack,
+        base_alpha_powers: &'a [Vec<Val<SC>>],
+        ext_alpha_powers: &'a [SC::Challenge],
+        base_constraints: Vec<Self::Pack>,
+        ext_constraints: Vec<Self::Challenge>,
+        base_coefficients_buf: &mut Vec<Self::Pack>,
+        constraint_count: usize,
+    ) -> (Self::Challenge, Vec<Self::Pack>, Vec<Self::Challenge>) {
+        let mut folder = VectorizedConstraintFolder {
+            main,
+            preprocessed,
+            preprocessed_window: RowWindow::from_view(&preprocessed),
+            periodic_values,
+            public_values,
+            is_first_row,
+            is_last_row,
+            is_transition,
+            base_alpha_powers,
+            ext_alpha_powers,
+            base_constraints,
+            ext_constraints,
+            constraint_index: 0,
+            constraint_count,
+        };
+        air.eval(&mut folder);
+
+        // quotient(x) = constraints(x) / Z_H(x)
+        let quotient = folder.finalize_constraints(base_coefficients_buf) * inv_vanishing;
+        (quotient, folder.base_constraints, folder.ext_constraints)
+    }
+
+    #[inline]
+    fn extract(challenge: &Self::Challenge, idx: usize) -> SC::Challenge {
+        challenge.extract(idx)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn quotient_values_inner<SC, A, Mat, Strat>(
+    pcs: &SC::Pcs,
+    air: &A,
+    public_values: &[Val<SC>],
+    layout: AirLayout,
+    trace_domain: Domain<SC>,
+    quotient_domain: Domain<SC>,
+    trace_on_quotient_domain: &Mat,
+    preprocessed_on_quotient_domain: Option<&Mat>,
+    alpha: SC::Challenge,
+) -> Vec<SC::Challenge>
+where
+    SC: StarkGenericConfig,
+    A: Air<SymbolicAirBuilder<Val<SC>>>,
+    Mat: Matrix<Val<SC>> + Sync,
+    Strat: QuotientEvalStrategy<SC, A>,
+{
+    type Pack<SC, A, Strat> = <Strat as QuotientEvalStrategy<SC, A>>::Pack;
+    type Challenge<SC, A, Strat> = <Strat as QuotientEvalStrategy<SC, A>>::Challenge;
+
+    let quotient_size = quotient_domain.size();
+    let width = trace_on_quotient_domain.width();
+    let mut sels = debug_span!("Compute Selectors")
+        .in_scope(|| trace_domain.selectors_on_coset(quotient_domain));
+
+    let qdb = log2_strict_usize(quotient_domain.size()) - log2_strict_usize(trace_domain.size());
+    let next_step = 1 << qdb;
+
+    // We take Pack::WIDTH worth of values at a time from a quotient_size slice, so we need to
+    // pad with default values in the case where quotient_size is smaller than Pack::WIDTH.
+    for _ in quotient_size..Pack::<SC, A, Strat>::WIDTH {
+        sels.is_first_row.push(Val::<SC>::default());
+        sels.is_last_row.push(Val::<SC>::default());
+        sels.is_transition.push(Val::<SC>::default());
+        sels.inv_vanishing.push(Val::<SC>::default());
+    }
+
+    let constraint_layout = get_constraint_layout(air, layout);
+    let (base_alpha_powers, ext_alpha_powers) = constraint_layout.decompose_alpha(alpha);
+    let periodic_cols = air.periodic_columns();
+    let periodic_table =
+        pcs.build_periodic_lde_table(&periodic_cols, trace_domain, quotient_domain);
+
+    let pack_width = Pack::<SC, A, Strat>::WIDTH;
+    let periodic_packed: Vec<Vec<Pack<SC, A, Strat>>> = if periodic_table.is_empty() {
+        Vec::new()
+    } else {
+        let ncols = periodic_table.width();
+        (0..quotient_size)
+            .step_by(pack_width)
+            .map(|i_start| {
+                (0..ncols)
+                    .map(|col_idx| {
+                        Pack::<SC, A, Strat>::from_fn(|offset| {
+                            *periodic_table.get(i_start + offset, col_idx)
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+
+    // Buffers reused across row-groups on each worker thread: allocating the
+    // packed row pairs and constraint accumulators fresh per group costs
+    // ~20% of this function's runtime on wide traces.
+    struct GroupBuffers<P, C> {
+        main: Vec<P>,
+        preprocessed: Vec<P>,
+        base_constraints: Vec<P>,
+        ext_constraints: Vec<C>,
+        base_coefficients: Vec<P>,
+    }
+
+    let mut quotient_values = SC::Challenge::zero_vec(quotient_size);
+    quotient_values
+        .par_chunks_mut(Pack::<SC, A, Strat>::WIDTH)
+        .enumerate()
+        .for_each_init(
+            || GroupBuffers::<Pack<SC, A, Strat>, Challenge<SC, A, Strat>> {
+                main: Vec::with_capacity(2 * width),
+                preprocessed: Vec::with_capacity(
+                    2 * preprocessed_on_quotient_domain.map_or(0, |p| p.width()),
+                ),
+                base_constraints: Vec::with_capacity(constraint_layout.base_indices.len()),
+                ext_constraints: Vec::with_capacity(constraint_layout.ext_indices.len()),
+                base_coefficients: Vec::with_capacity(base_alpha_powers.len()),
+            },
+            |bufs, (group, quotient_chunk)| {
+                let i_start = group * Pack::<SC, A, Strat>::WIDTH;
+                let i_range = i_start..i_start + Pack::<SC, A, Strat>::WIDTH;
+
+                let is_first_row =
+                    *Pack::<SC, A, Strat>::from_slice(&sels.is_first_row[i_range.clone()]);
+                let is_last_row =
+                    *Pack::<SC, A, Strat>::from_slice(&sels.is_last_row[i_range.clone()]);
+                let is_transition =
+                    *Pack::<SC, A, Strat>::from_slice(&sels.is_transition[i_range.clone()]);
+                let inv_vanishing = *Pack::<SC, A, Strat>::from_slice(&sels.inv_vanishing[i_range]);
+
+                bufs.main.clear();
+                bufs.main.extend(
+                    trace_on_quotient_domain.vertically_packed_row::<Pack<SC, A, Strat>>(i_start),
+                );
+                bufs.main.extend(
+                    trace_on_quotient_domain
+                        .vertically_packed_row::<Pack<SC, A, Strat>>(i_start + next_step),
+                );
+                let main = RowMajorMatrixView::new(&bufs.main, width);
+
+                let preprocessed_view = match preprocessed_on_quotient_domain {
+                    Some(preprocessed) => {
+                        bufs.preprocessed.clear();
+                        bufs.preprocessed.extend(
+                            preprocessed.vertically_packed_row::<Pack<SC, A, Strat>>(i_start),
+                        );
+                        bufs.preprocessed.extend(
+                            preprocessed
+                                .vertically_packed_row::<Pack<SC, A, Strat>>(i_start + next_step),
+                        );
+                        RowMajorMatrixView::new(&bufs.preprocessed, preprocessed.width())
+                    }
+                    None => RowMajorMatrixView::new(&[], 0),
+                };
+                let periodic_values: &[Pack<SC, A, Strat>] = if periodic_packed.is_empty() {
+                    &[]
+                } else {
+                    &periodic_packed[i_start / pack_width]
+                };
+
+                let (quotient, base_constraints, ext_constraints) = Strat::eval_row_group(
+                    air,
+                    main,
+                    preprocessed_view,
+                    periodic_values,
+                    public_values,
+                    is_first_row,
+                    is_last_row,
+                    is_transition,
+                    inv_vanishing,
+                    &base_alpha_powers,
+                    &ext_alpha_powers,
+                    core::mem::take(&mut bufs.base_constraints),
+                    core::mem::take(&mut bufs.ext_constraints),
+                    &mut bufs.base_coefficients,
+                    constraint_layout.total_constraints(),
+                );
+
+                // The contents were folded into `quotient` above; reclaim the Vecs and
+                // `clear` them (`len = 0`, capacity kept) so the next row group reuses
+                // the allocations.
+                bufs.base_constraints = base_constraints;
+                bufs.base_constraints.clear();
+                bufs.ext_constraints = ext_constraints;
+                bufs.ext_constraints.clear();
+
+                // "Transpose" D packed base coefficients into WIDTH scalar extension coefficients.
+                for (idx_in_packing, q) in quotient_chunk.iter_mut().enumerate() {
+                    *q = Strat::extract(&quotient, idx_in_packing);
+                }
+            },
+        );
+    quotient_values
+}

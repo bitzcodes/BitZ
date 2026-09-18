@@ -1,0 +1,46 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+## [0.6.0] - 2026-06-11
+### Merged PRs
+- Monolith: implement Monolith for Mersenne31 and Goldilocks (#1478)
+- Core: couple more compile time assertions (#1525)
+- Chore(deps): update sha3 requirement from 0.11.0 to 0.12.0 (#1670)
+- Chore: update CHANGELOGs (#1785)
+
+## [0.5.3] - 2026-05-15
+### Merged PRs
+- Core: couple more compile time assertions (#1525)
+
+## [0.5.2] - 2026-03-27
+## [0.5.1] - 2026-03-16
+## [0.5.0] - 2026-03-10
+## [0.4.2] - 2026-01-05
+### Merged PRs
+- Feat: use compile-time asserts for const generic parameters (#1232) (Himess)
+
+### Authors
+- Himess
+
+## [0.4.1] - 2025-12-18
+### Authors
+
+## [0.4.0] - 2025-12-12
+### Merged PRs
+- Clippy wants us to put things inside of fmt now instead of just extra arguments... (#916) (AngusG)
+- Chore: add descriptions to all sub-crate manifests (#906) (Himess)
+- Clippy: small step (#1102) (Thomas Coratger)
+- Clippy: add semicolon_if_nothing_returned (#1107) (Thomas Coratger)
+- Clippy: add `needless_pass_by_value` (#1112) (Thomas Coratger)
+- Allow users to impl either permute or permute_mut (#1175) (AngusG)
+
+### Authors
+- AngusG
+- Himess
+- Thomas Coratger
+

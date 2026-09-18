@@ -1,0 +1,49 @@
+/target
+/.tools/perfetto/
+/crates/*/target/
+/bench_results/
+/benches/results/
+
+# Generated benchmark results.
+/benchmarks/results/**/*.json
+/benchmarks/results/**/*.jsonl
+/benchmarks/results/**/*.csv
+/PerfRuns/
+/src/sumcheck/performance.csv
+/outputs/figures/native-mul-ratios.csv
+
+# Generated arithmetic validation and benchmark artifacts.
+/vendor/field/validation/
+/experiments/
+/outputs/field-native-x86-validation/
+*.tar.gz
+
+# LaTeX build intermediates
+/paper/*.fdb_latexmk
+docs/**/*.aux
+docs/**/*.fdb_latexmk
+docs/**/*.fls
+docs/**/*.log
+docs/**/*.out
+docs/**/*.toc
+Perfruns/
+.tmp
+flock-zkperf-traces
+
+output/
+outputs/
+docs/
+.history/*
+benchmark-results/
+tmp/
+# Python bytecode caches.
+__pycache__/
+*.py[cod]
+
+/vendor/field/target/
+
+/vendor/flock-mod/target/
+
+# Materialized dependencies are tracked; generated outputs are not.
+/vendor/**/target/
+/vendor/**/.git

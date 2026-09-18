@@ -1,0 +1,400 @@
+//! Shared data between batch-STARK prover and verifier.
+//!
+//! This module is intended to store per-instance data that is common to both
+//! proving and verification, such as lookup tables and preprocessed traces.
+//!
+//! The preprocessed support integrates with `p3-uni-stark`'s transparent
+//! preprocessed columns API, but batches all preprocessed traces into a single
+//! global commitment (one matrix per instance that uses preprocessed columns).
+
+use alloc::vec;
+use alloc::vec::Vec;
+
+use p3_air::Air;
+use p3_air::symbolic::{AirLayout, SymbolicExpressionExt};
+use p3_commit::Pcs;
+use p3_field::{Algebra, BasedVectorSpace};
+use p3_lookup::{InteractionSymbolicBuilder, LogUpGadget, Lookups};
+use p3_matrix::Matrix;
+use p3_uni_stark::Val;
+use p3_util::log2_strict_usize;
+
+use crate::config::{Challenge, Commitment, Domain, StarkGenericConfig as SGC};
+use crate::prover::StarkInstance;
+use crate::symbolic::get_log_num_quotient_chunks;
+
+/// Per-instance metadata for a preprocessed trace that lives inside a
+/// global preprocessed commitment.
+#[derive(Clone)]
+pub struct PreprocessedInstanceMeta {
+    /// Index of this instance's preprocessed matrix inside the global [`Pcs`]
+    /// commitment / prover data.
+    pub matrix_index: usize,
+    /// Width (number of columns) of the preprocessed trace.
+    pub width: usize,
+    /// Log2 of the extended trace degree for this instance's preprocessed trace.
+    ///
+    /// This matches the log2 of the main trace degree (with ZK padding)
+    /// for that instance.
+    pub degree_bits: usize,
+}
+
+/// Global preprocessed data shared by all batch-STARK instances.
+///
+/// This batches all per-instance preprocessed traces into a single [`Pcs`]
+/// commitment, while keeping a mapping from instance index to matrix index
+/// and per-matrix metadata.
+pub struct GlobalPreprocessed<SC: SGC> {
+    /// Single [`Pcs`] commitment to all preprocessed traces (one matrix per
+    /// instance that defines preprocessed columns).
+    pub commitment: Commitment<SC>,
+    /// For each STARK instance, optional metadata describing its preprocessed
+    /// trace inside the global commitment.
+    ///
+    /// `instances[i] == None` means instance `i` has no preprocessed columns.
+    pub instances: Vec<Option<PreprocessedInstanceMeta>>,
+    /// Mapping from preprocessed matrix index to the corresponding instance index.
+    ///
+    /// This allows building per-matrix opening schedules and routing opened
+    /// values back to instances.
+    pub matrix_to_instance: Vec<usize>,
+}
+
+/// Struct storing data common to both the prover and verifier.
+// TODO: Optionally cache a single challenger seed for transparent
+//       preprocessed data (per-instance widths + global root), so
+//       prover and verifier don't have to recompute/rehash it each run.
+pub struct CommonData<SC: SGC> {
+    /// Optional global preprocessed commitment shared by all instances.
+    ///
+    /// When `None`, no instance uses preprocessed columns.
+    pub preprocessed: Option<GlobalPreprocessed<SC>>,
+    /// The lookups used by each STARK instance.
+    /// There is one `Lookups<Val<SC>>` per STARK instance.
+    /// They are stored in the same order as the STARK instance inputs provided to `new`.
+    pub lookups: Vec<Lookups<Val<SC>>>,
+}
+
+/// Prover-exclusive data not shared with the verifier.
+///
+/// This contains the PCS prover data for preprocessed traces, which is only
+/// needed during proving.
+pub struct ProverOnlyData<SC: SGC> {
+    /// PCS prover data for preprocessed traces.
+    ///
+    /// Present only when at least one instance has preprocessed columns.
+    pub preprocessed_prover_data:
+        Option<<SC::Pcs as Pcs<Challenge<SC>, SC::Challenger>>::ProverData>,
+}
+
+/// Combined prover data containing both common and prover-only data.
+///
+/// This is a convenience struct that bundles [`CommonData`] (shared with verifier)
+/// and [`ProverOnlyData`] (prover-exclusive) together.
+pub struct ProverData<SC: SGC> {
+    /// Data shared between prover and verifier.
+    pub common: CommonData<SC>,
+    /// Prover-exclusive data.
+    pub prover_only: ProverOnlyData<SC>,
+}
+
+impl<SC: SGC> CommonData<SC> {
+    pub const fn new(
+        preprocessed: Option<GlobalPreprocessed<SC>>,
+        lookups: Vec<Lookups<Val<SC>>>,
+    ) -> Self {
+        Self {
+            preprocessed,
+            lookups,
+        }
+    }
+
+    /// Create [`CommonData`] with no preprocessed columns or lookups.
+    ///
+    /// Use this when none of your [`Air`] implementations have preprocessed columns or lookups.
+    pub fn empty(num_instances: usize) -> Self {
+        let lookups = vec![Lookups::default(); num_instances];
+        Self {
+            preprocessed: None,
+            lookups,
+        }
+    }
+}
+
+impl<SC: SGC> ProverOnlyData<SC> {
+    /// Create empty [`ProverOnlyData`] with no preprocessed prover data.
+    pub const fn empty() -> Self {
+        Self {
+            preprocessed_prover_data: None,
+        }
+    }
+}
+
+impl<SC: SGC> ProverData<SC> {
+    /// Create [`ProverData`] with no preprocessed columns or lookups.
+    ///
+    /// Use this when none of your [`Air`] implementations have preprocessed columns or lookups.
+    pub fn empty(num_instances: usize) -> Self {
+        Self {
+            common: CommonData::empty(num_instances),
+            prover_only: ProverOnlyData::empty(),
+        }
+    }
+}
+
+impl<SC> ProverData<SC>
+where
+    SC: SGC,
+    Challenge<SC>: BasedVectorSpace<Val<SC>>,
+{
+    /// Build [`ProverData`] directly from STARK instances.
+    ///
+    /// This automatically:
+    /// - Derives trace degrees from trace heights
+    /// - Computes extended degrees (base + ZK padding)
+    /// - Sets up preprocessed columns for [`Air`] implementations that define them, committing
+    ///   to them in a single global [`Pcs`] commitment.
+    /// - Deduces symbolic lookups from the STARKs
+    ///
+    /// This is a convenience function mainly used for tests.
+    pub fn from_instances<A>(config: &SC, instances: &[StarkInstance<'_, SC, A>]) -> Self
+    where
+        SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
+        A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>> + Clone,
+    {
+        let degrees: Vec<usize> = instances.iter().map(|i| i.trace.height()).collect();
+        let log_ext_degrees: Vec<usize> = degrees
+            .iter()
+            .map(|&d| log2_strict_usize(d) + config.is_zk())
+            .collect();
+        let airs: Vec<A> = instances.iter().map(|i| i.air.clone()).collect();
+        Self::from_airs_and_degrees(config, &airs, &log_ext_degrees)
+    }
+
+    /// Build [`ProverData`] from [`Air`] implementations and their extended trace degree bits.
+    ///
+    /// # Arguments
+    ///
+    /// * `trace_ext_degree_bits` - Log2 of extended trace degrees (including ZK padding)
+    ///
+    /// # Returns
+    ///
+    /// Prover data containing the global preprocessed commitment (if at least
+    /// one [`Air`] defines preprocessed columns) and the PCS prover data.
+    pub fn from_airs_and_degrees<A>(
+        config: &SC,
+        airs: &[A],
+        trace_ext_degree_bits: &[usize],
+    ) -> Self
+    where
+        SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
+        A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>,
+    {
+        Self::from_airs_and_degrees_with_lookup_budgets(
+            config,
+            airs,
+            trace_ext_degree_bits,
+            &vec![0; airs.len()],
+            // Every override is zero, so packing cannot move the quotient bucket (the
+            // `debug_assert_eq!` below still pins that) and the blowup ceiling is
+            // unreachable from here.
+            usize::MAX,
+        )
+    }
+
+    /// As [`Self::from_airs_and_degrees`], but each AIR may specify a lookup-packing budget
+    /// floor: `pack_same_bus` is called with `max(free_budget, lookup_budget_overrides[i])`
+    /// instead of only the free (quotient-chunk-preserving) budget. A `0` override reproduces
+    /// [`Self::from_airs_and_degrees`] exactly. A caller raising an override past the free
+    /// ceiling deliberately spends more quotient chunks on that instance to commit fewer aux
+    /// columns.
+    ///
+    /// # Arguments
+    ///
+    /// * `lookup_budget_overrides` - Per-AIR fraction-pin degree floors; one entry per AIR.
+    /// * `log_blowup` - The PCS's `log_blowup`. A rate-`2^-log_blowup` low-degree test only
+    ///   certifies degree `< |domain| * 2^-log_blowup`, so a quotient split into more than
+    ///   `2^log_blowup` chunks asks FRI to certify a degree it has no rate budget for. Any
+    ///   instance whose override raises the chunk count past that ceiling panics here.
+    ///
+    /// # Panics
+    ///
+    /// If an override raises an instance's quotient chunk count past `1 << log_blowup`. This
+    /// is a hard [`assert!`] rather than a `debug_assert!`: overrides are a rare, explicit,
+    /// caller-side choice, so the recomputation costs nothing on the default path, and a
+    /// release build must not silently emit a rate-violating proof.
+    pub fn from_airs_and_degrees_with_lookup_budgets<A>(
+        config: &SC,
+        airs: &[A],
+        trace_ext_degree_bits: &[usize],
+        lookup_budget_overrides: &[usize],
+        log_blowup: usize,
+    ) -> Self
+    where
+        SymbolicExpressionExt<Val<SC>, SC::Challenge>: Algebra<SC::Challenge>,
+        A: Air<InteractionSymbolicBuilder<Val<SC>, SC::Challenge>>,
+    {
+        assert_eq!(
+            airs.len(),
+            trace_ext_degree_bits.len(),
+            "airs and trace_ext_degree_bits must have the same length"
+        );
+        assert_eq!(
+            airs.len(),
+            lookup_budget_overrides.len(),
+            "airs and lookup_budget_overrides must have the same length"
+        );
+
+        let pcs = config.pcs();
+        let is_zk = config.is_zk();
+
+        let mut instances_meta: Vec<Option<PreprocessedInstanceMeta>> =
+            Vec::with_capacity(airs.len());
+        let mut matrix_to_instance: Vec<usize> = Vec::new();
+        let mut domains_and_traces: Vec<(Domain<SC>, _)> = Vec::new();
+
+        for (i, (air, &ext_db)) in airs.iter().zip(trace_ext_degree_bits.iter()).enumerate() {
+            // Derive base trace degree bits from extended degree bits.
+            let base_db = ext_db - is_zk;
+            let maybe_prep = air.preprocessed_trace();
+
+            let Some(preprocessed) = maybe_prep else {
+                instances_meta.push(None);
+                continue;
+            };
+
+            let width = preprocessed.width();
+            if width == 0 {
+                instances_meta.push(None);
+                continue;
+            }
+
+            let degree = 1 << base_db;
+            let ext_degree = 1 << ext_db;
+            assert_eq!(
+                preprocessed.height(),
+                degree,
+                "preprocessed trace height must equal trace degree for instance {}",
+                i
+            );
+
+            let domain = pcs.natural_domain_for_degree(ext_degree);
+            let matrix_index = domains_and_traces.len();
+
+            domains_and_traces.push((domain, preprocessed));
+            matrix_to_instance.push(i);
+
+            instances_meta.push(Some(PreprocessedInstanceMeta {
+                matrix_index,
+                width,
+                degree_bits: ext_db,
+            }));
+        }
+
+        let (preprocessed, preprocessed_prover_data) = if domains_and_traces.is_empty() {
+            (None, None)
+        } else {
+            let (commitment, prover_data) = pcs.commit_preprocessing(domains_and_traces);
+            (
+                Some(GlobalPreprocessed {
+                    commitment,
+                    instances: instances_meta,
+                    matrix_to_instance,
+                }),
+                Some(prover_data),
+            )
+        };
+
+        // Build each AIR's lookups, then fold same-bus globals into shared columns.
+        //
+        // The budget is the largest fraction-pin degree that keeps the quotient
+        // chunk count fixed, so folding only removes columns, never adds work.
+        // An AIR with no spare degree gets a budget that folds nothing.
+        // Prover and verifier fold deterministically, so the layout needs no exchange.
+        let lookup_gadget = LogUpGadget::new();
+        let lookups: Vec<Lookups<Val<SC>>> = airs
+            .iter()
+            .zip(trace_ext_degree_bits.iter())
+            .zip(lookup_budget_overrides.iter())
+            .enumerate()
+            .map(|(i, ((air, &ext_db), &override_budget))| {
+                // Base trace length `N` (before any ZK extension), matching what the
+                // prover and verifier feed the degree model for this instance.
+                let trace_len = 1usize << (ext_db - is_zk);
+                let unpacked = Lookups::<Val<SC>>::from_air::<SC::Challenge, A>(air);
+
+                // `log_chunks` fixes the quotient bucket: n_chunks = 2^log_chunks.
+                let log_chunks =
+                    get_log_num_quotient_chunks::<Val<SC>, SC::Challenge, A, LogUpGadget>(
+                        air,
+                        AirLayout::from_air(air),
+                        trace_len,
+                        &unpacked,
+                        is_zk,
+                        &lookup_gadget,
+                    );
+
+                // Largest fraction-pin degree still inside that bucket.
+                //
+                //     log2_ceil((d + is_zk).max(2) - 1) <= log_chunks
+                //  => d <= 2^log_chunks + 1 - is_zk
+                let free_budget = (1usize << log_chunks) + 1 - is_zk;
+                let budget = free_budget.max(override_budget);
+                let packed = unpacked.pack_same_bus(&lookup_gadget, budget);
+
+                if override_budget <= free_budget {
+                    // No deliberate override: the fold must not have moved the quotient bucket,
+                    // exactly as before.
+                    debug_assert_eq!(
+                        get_log_num_quotient_chunks::<Val<SC>, SC::Challenge, A, LogUpGadget>(
+                            air,
+                            AirLayout::from_air(air),
+                            trace_len,
+                            &packed,
+                            is_zk,
+                            &lookup_gadget,
+                        ),
+                        log_chunks,
+                        "same-bus packing must preserve the quotient chunk count when no override is set"
+                    );
+                } else {
+                    // A deliberate override is allowed to raise the bucket, but only within the
+                    // PCS's rate budget: the low-degree test certifies degree
+                    // `< |domain| * 2^-log_blowup`, so a quotient split into more than
+                    // `2^log_blowup` chunks has no soundness margin left. This is the bound
+                    // `StarkSecurityParams::new` states as a buildability condition; without
+                    // this check nothing else on the prove or verify path detects a violation.
+                    let packed_log_chunks =
+                        get_log_num_quotient_chunks::<Val<SC>, SC::Challenge, A, LogUpGadget>(
+                            air,
+                            AirLayout::from_air(air),
+                            trace_len,
+                            &packed,
+                            is_zk,
+                            &lookup_gadget,
+                        );
+                    // The committed chunk count is `2^(log_chunks + is_zk)`.
+                    let log_num_chunks = packed_log_chunks + is_zk;
+                    assert!(
+                        log_num_chunks <= log_blowup,
+                        "instance {i}: lookup-budget override raised the quotient bucket to \
+                         2^{log_num_chunks} chunks, past the PCS blowup 2^{log_blowup}; \
+                         the prover cannot commit a quotient"
+                    );
+                }
+
+                packed
+            })
+            .collect();
+
+        Self {
+            common: CommonData {
+                preprocessed,
+                lookups,
+            },
+            prover_only: ProverOnlyData {
+                preprocessed_prover_data,
+            },
+        }
+    }
+}

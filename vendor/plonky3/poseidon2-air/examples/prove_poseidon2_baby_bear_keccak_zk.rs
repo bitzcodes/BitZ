@@ -1,0 +1,113 @@
+use core::fmt::Debug;
+
+use p3_baby_bear::{
+    BABYBEAR_POSEIDON2_HALF_FULL_ROUNDS, BABYBEAR_POSEIDON2_PARTIAL_ROUNDS_16,
+    BABYBEAR_S_BOX_DEGREE, BabyBear, GenericPoseidon2LinearLayersBabyBear,
+};
+use p3_challenger::{HashChallenger, SerializingChallenger32};
+use p3_commit::ExtensionMmcs;
+use p3_field::extension::BinomialExtensionField;
+use p3_fri::{FriParameters, HidingFriPcs};
+use p3_keccak::{Keccak256Hash, KeccakF};
+use p3_merkle_tree::MerkleTreeHidingMmcs;
+use p3_poseidon2_air::{RoundConstants, VectorizedPoseidon2Air};
+use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
+use p3_uni_stark::{StarkConfig, prove, verify};
+use rand::SeedableRng;
+use rand::rngs::{SmallRng, StdRng};
+#[cfg(target_family = "unix")]
+use tikv_jemallocator::Jemalloc;
+use tracing_forest::ForestLayer;
+use tracing_forest::util::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Registry};
+
+#[cfg(target_family = "unix")]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+const WIDTH: usize = 16;
+const SBOX_DEGREE: u64 = BABYBEAR_S_BOX_DEGREE;
+const SBOX_REGISTERS: usize = 1;
+const HALF_FULL_ROUNDS: usize = BABYBEAR_POSEIDON2_HALF_FULL_ROUNDS;
+const PARTIAL_ROUNDS: usize = BABYBEAR_POSEIDON2_PARTIAL_ROUNDS_16;
+
+const NUM_ROWS: usize = 1 << 16;
+const VECTOR_LEN: usize = 1 << 3;
+const NUM_PERMUTATIONS: usize = NUM_ROWS * VECTOR_LEN;
+
+type Dft = p3_dft::Radix2DitParallel<BabyBear>;
+
+fn main() -> Result<(), impl Debug> {
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
+
+    Registry::default()
+        .with(env_filter)
+        .with(ForestLayer::default())
+        .init();
+
+    type Val = BabyBear;
+    type Challenge = BinomialExtensionField<Val, 4>;
+
+    type ByteHash = Keccak256Hash;
+    let byte_hash = ByteHash {};
+
+    type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
+    let u64_hash = U64Hash::new(KeccakF {});
+
+    type FieldHash = SerializingHasher<U64Hash>;
+    let field_hash = FieldHash::new(u64_hash);
+
+    type MyCompress = CompressionFunctionFromHasher<U64Hash, 2, 4>;
+    let compress = MyCompress::new(u64_hash);
+
+    type ValMmcs = MerkleTreeHidingMmcs<
+        [Val; p3_keccak::VECTOR_LEN],
+        [u64; p3_keccak::VECTOR_LEN],
+        FieldHash,
+        MyCompress,
+        StdRng,
+        2,
+        4,
+        4,
+    >;
+    let mut rng = SmallRng::seed_from_u64(1);
+    let constants = RoundConstants::from_rng(&mut rng);
+    let val_mmcs = ValMmcs::new(field_hash, compress, 0, StdRng::seed_from_u64(1));
+
+    type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
+    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
+
+    type Challenger = SerializingChallenger32<Val, HashChallenger<u8, ByteHash, 32>>;
+    let challenger = Challenger::from_hasher(vec![], byte_hash);
+
+    let air: VectorizedPoseidon2Air<
+        Val,
+        GenericPoseidon2LinearLayersBabyBear,
+        WIDTH,
+        SBOX_DEGREE,
+        SBOX_REGISTERS,
+        HALF_FULL_ROUNDS,
+        PARTIAL_ROUNDS,
+        VECTOR_LEN,
+    > = VectorizedPoseidon2Air::new(constants);
+
+    let fri_params = FriParameters::new_benchmark_zk(challenge_mmcs);
+
+    let trace = air.generate_vectorized_trace_rows(NUM_PERMUTATIONS, fri_params.log_blowup);
+
+    let dft = Dft::default();
+
+    type Pcs = HidingFriPcs<Val, Dft, ValMmcs, ChallengeMmcs, StdRng>;
+    let pcs = Pcs::new(dft, val_mmcs, fri_params, 4, StdRng::seed_from_u64(2));
+
+    type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
+    let config = MyConfig::new(pcs, challenger);
+
+    let proof = prove(&config, &air, trace, &[]);
+
+    verify(&config, &air, &proof, &[])
+}

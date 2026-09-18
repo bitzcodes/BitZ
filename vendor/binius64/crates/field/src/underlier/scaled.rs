@@ -1,0 +1,312 @@
+// Copyright 2024-2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
+
+use std::{
+	array,
+	fmt::{self, LowerHex},
+	mem,
+	ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Not},
+};
+
+use binius_utils::{
+	DeserializeBytes, FixedSizeSerializeBytes, SerializationError, SerializeBytes,
+	bytes::{Buf, BufMut},
+	checked_arithmetics::checked_log_2,
+};
+use bytemuck::{Pod, Zeroable};
+use rand::{
+	Rng,
+	distr::{Distribution, StandardUniform},
+};
+
+use super::{U1, Underlier};
+use crate::{
+	Random,
+	divisible::{Divisible, mapget},
+};
+
+/// A type that represents N elements of the same underlier type.
+/// Used as an underlier for 256-bit and 512-bit packed fields in the portable implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct ScaledUnderlier<U, const N: usize>(pub [U; N]);
+
+impl<U: Default, const N: usize> Default for ScaledUnderlier<U, N> {
+	fn default() -> Self {
+		Self(array::from_fn(|_| U::default()))
+	}
+}
+
+impl<U: Random, const N: usize> Distribution<ScaledUnderlier<U, N>> for StandardUniform {
+	fn sample<R: Rng + ?Sized>(&self, mut rng: &mut R) -> ScaledUnderlier<U, N> {
+		ScaledUnderlier(array::from_fn(|_| U::random(&mut rng)))
+	}
+}
+
+impl<U, const N: usize> From<ScaledUnderlier<U, N>> for [U; N] {
+	fn from(val: ScaledUnderlier<U, N>) -> Self {
+		val.0
+	}
+}
+
+impl<T, U: From<T>, const N: usize> From<[T; N]> for ScaledUnderlier<U, N> {
+	fn from(value: [T; N]) -> Self {
+		Self(value.map(U::from))
+	}
+}
+
+impl<T: Copy, U: From<[T; 2]>> From<[T; 4]> for ScaledUnderlier<U, 2> {
+	fn from(value: [T; 4]) -> Self {
+		Self([[value[0], value[1]], [value[2], value[3]]].map(Into::into))
+	}
+}
+
+unsafe impl<U: Zeroable, const N: usize> Zeroable for ScaledUnderlier<U, N> {}
+unsafe impl<U: Pod, const N: usize> Pod for ScaledUnderlier<U, N> {}
+
+impl<U: BitAnd<Output = U> + Copy, const N: usize> BitAnd for ScaledUnderlier<U, N> {
+	type Output = Self;
+
+	fn bitand(self, rhs: Self) -> Self::Output {
+		Self(array::from_fn(|i| self.0[i] & rhs.0[i]))
+	}
+}
+
+impl<U: BitAndAssign + Copy, const N: usize> BitAndAssign for ScaledUnderlier<U, N> {
+	fn bitand_assign(&mut self, rhs: Self) {
+		for i in 0..N {
+			self.0[i] &= rhs.0[i];
+		}
+	}
+}
+
+impl<U: BitOr<Output = U> + Copy, const N: usize> BitOr for ScaledUnderlier<U, N> {
+	type Output = Self;
+
+	fn bitor(self, rhs: Self) -> Self::Output {
+		Self(array::from_fn(|i| self.0[i] | rhs.0[i]))
+	}
+}
+
+impl<U: BitOrAssign + Copy, const N: usize> BitOrAssign for ScaledUnderlier<U, N> {
+	fn bitor_assign(&mut self, rhs: Self) {
+		for i in 0..N {
+			self.0[i] |= rhs.0[i];
+		}
+	}
+}
+
+impl<U: BitXor<Output = U> + Copy, const N: usize> BitXor for ScaledUnderlier<U, N> {
+	type Output = Self;
+
+	fn bitxor(self, rhs: Self) -> Self::Output {
+		Self(array::from_fn(|i| self.0[i] ^ rhs.0[i]))
+	}
+}
+
+impl<U: BitXorAssign + Copy, const N: usize> BitXorAssign for ScaledUnderlier<U, N> {
+	fn bitxor_assign(&mut self, rhs: Self) {
+		for i in 0..N {
+			self.0[i] ^= rhs.0[i];
+		}
+	}
+}
+
+impl<U: Not<Output = U>, const N: usize> Not for ScaledUnderlier<U, N> {
+	type Output = Self;
+
+	fn not(self) -> Self::Output {
+		Self(self.0.map(U::not))
+	}
+}
+
+impl<U: Underlier + Pod, const N: usize> Underlier for ScaledUnderlier<U, N> {
+	const LOG_BITS: usize = U::LOG_BITS + checked_log_2(N);
+
+	const ZERO: Self = Self([U::ZERO; N]);
+	const ONE: Self = {
+		let mut arr = [U::ZERO; N];
+		arr[0] = U::ONE;
+		Self(arr)
+	};
+	const ONES: Self = Self([U::ONES; N]);
+
+	fn interleave(self, other: Self, log_block_len: usize) -> (Self, Self) {
+		if log_block_len < U::LOG_BITS {
+			// Case 1: Delegate to element-wise interleave
+			let pairs: [(U, U); N] =
+				array::from_fn(|i| self.0[i].interleave(other.0[i], log_block_len));
+			(Self(array::from_fn(|i| pairs[i].0)), Self(array::from_fn(|i| pairs[i].1)))
+		} else {
+			// Case 2: Interleave at element level by swapping array elements
+			// Each super-block of 2*block_len elements gets transposed as a 2x2 matrix of blocks
+			let block_len = 1 << (log_block_len - U::LOG_BITS);
+
+			let mut a = self.0;
+			let mut b = other.0;
+			for super_block in 0..(N / (2 * block_len)) {
+				let base = super_block * 2 * block_len;
+				for offset in 0..block_len {
+					mem::swap(&mut a[base + block_len + offset], &mut b[base + offset]);
+				}
+			}
+
+			(Self(a), Self(b))
+		}
+	}
+}
+
+impl<U, const N: usize> From<u8> for ScaledUnderlier<U, N>
+where
+	U: From<u8>,
+{
+	fn from(val: u8) -> Self {
+		Self(array::from_fn(|_| U::from(val)))
+	}
+}
+
+/// Zero-extends an `M128` into the least-significant limb, leaving the rest zero.
+///
+/// This is the embedding of a base-field underlier into a `ScaledUnderlier<M128, _>`-backed
+/// extension field, as used by `impl_field_extension!`'s `from_bases_sparse` (`GhashSq256b` off
+/// the AVX2 path).
+impl<const N: usize> From<crate::arch::M128> for ScaledUnderlier<crate::arch::M128, N> {
+	fn from(val: crate::arch::M128) -> Self {
+		let mut limbs = [<crate::arch::M128 as Underlier>::ZERO; N];
+		limbs[0] = val;
+		Self(limbs)
+	}
+}
+
+/// Zero-extends a single bit into the least-significant `M128` limb, leaving the rest zero.
+impl<const N: usize> From<U1> for ScaledUnderlier<crate::arch::M128, N> {
+	fn from(val: U1) -> Self {
+		Self::from(crate::arch::M128::from(val))
+	}
+}
+
+impl<U: Underlier + LowerHex, const N: usize> LowerHex for ScaledUnderlier<U, N> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		// Most-significant limb first. Print from the highest non-zero limb so there are no
+		// spurious leading zeros, then zero-pad each remaining limb to its full bit width.
+		let width = U::BITS / 4;
+		let top = self
+			.0
+			.iter()
+			.rposition(|limb| *limb != U::ZERO)
+			.unwrap_or(0);
+		write!(f, "{:x}", self.0[top])?;
+		for limb in self.0[..top].iter().rev() {
+			write!(f, "{limb:0width$x}")?;
+		}
+		Ok(())
+	}
+}
+
+impl<U, T, const N: usize> Divisible<T> for ScaledUnderlier<U, N>
+where
+	U: Divisible<T> + Pod + Send + Sync,
+	T: Send + 'static,
+{
+	const LOG_N: usize = U::LOG_N + checked_log_2(N);
+
+	#[inline]
+	fn value_iter(value: Self) -> impl ExactSizeIterator<Item = T> + Send + Clone {
+		mapget::value_iter(value)
+	}
+
+	#[inline]
+	fn ref_iter(value: &Self) -> impl ExactSizeIterator<Item = T> + Send + Clone + '_ {
+		mapget::value_iter(*value)
+	}
+
+	#[inline]
+	fn slice_iter(slice: &[Self]) -> impl ExactSizeIterator<Item = T> + Send + Clone + '_ {
+		mapget::slice_iter(slice)
+	}
+
+	#[inline]
+	unsafe fn get_unchecked(&self, index: usize) -> T {
+		let u_index = index >> U::LOG_N;
+		let sub_index = index & (U::N - 1);
+		// Safety: `index < Self::N` by the caller's contract, so `sub_index < <U as
+		// Divisible<T>>::N` and `u_index < N`.
+		unsafe { Divisible::<T>::get_unchecked(self.0.get_unchecked(u_index), sub_index) }
+	}
+
+	#[inline]
+	unsafe fn set_unchecked(&mut self, index: usize, val: T) {
+		let u_index = index >> U::LOG_N;
+		let sub_index = index & (U::N - 1);
+		// Safety: `index < Self::N` by the caller's contract, so `sub_index < <U as
+		// Divisible<T>>::N` and `u_index < N`.
+		unsafe { Divisible::<T>::set_unchecked(self.0.get_unchecked_mut(u_index), sub_index, val) };
+	}
+
+	#[inline]
+	fn broadcast(val: T) -> Self {
+		Self([Divisible::<T>::broadcast(val); N])
+	}
+
+	#[inline]
+	fn from_iter(mut iter: impl Iterator<Item = T>) -> Self {
+		Self(array::from_fn(|_| Divisible::<T>::from_iter(&mut iter)))
+	}
+}
+
+impl<U: SerializeBytes, const N: usize> SerializeBytes for ScaledUnderlier<U, N> {
+	fn serialize(&self, write_buf: impl BufMut) -> Result<(), SerializationError> {
+		self.0.serialize(write_buf)
+	}
+}
+
+impl<U: DeserializeBytes, const N: usize> DeserializeBytes for ScaledUnderlier<U, N> {
+	fn deserialize(read_buf: impl Buf) -> Result<Self, SerializationError> {
+		<[U; N]>::deserialize(read_buf).map(Self)
+	}
+}
+
+impl<U: FixedSizeSerializeBytes, const N: usize> FixedSizeSerializeBytes for ScaledUnderlier<U, N> {
+	const BYTE_SIZE: usize = U::BYTE_SIZE * N;
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_interleave_within_element() {
+		// Test case 1: log_block_len < U::LOG_BITS
+		// ScaledUnderlier<u8, 4> has LOG_BITS = 5 (32 bits total)
+		// u8 has LOG_BITS = 3
+		let a = ScaledUnderlier::<u8, 4>([0b01010101, 0b11110000, 0b00001111, 0b10101010]);
+		let b = ScaledUnderlier::<u8, 4>([0b10101010, 0b00001111, 0b11110000, 0b01010101]);
+
+		// At log_block_len = 0 (1-bit blocks), should delegate to u8::interleave
+		let (c, d) = a.interleave(b, 0);
+
+		// Verify element-wise interleave occurred
+		for i in 0..4 {
+			let (expected_c, expected_d) = a.0[i].interleave(b.0[i], 0);
+			assert_eq!(c.0[i], expected_c);
+			assert_eq!(d.0[i], expected_d);
+		}
+	}
+
+	#[test]
+	fn test_interleave_across_elements() {
+		// Test case 2: log_block_len >= U::LOG_BITS
+		let a = ScaledUnderlier::<u8, 4>([0, 1, 2, 3]);
+		let b = ScaledUnderlier::<u8, 4>([4, 5, 6, 7]);
+
+		// At log_block_len = 3 (8-bit blocks = 1 element), swap individual elements
+		let (c, d) = a.interleave(b, 3);
+		assert_eq!(c.0, [0, 4, 2, 6]);
+		assert_eq!(d.0, [1, 5, 3, 7]);
+
+		// At log_block_len = 4 (16-bit blocks = 2 elements), swap pairs
+		let (c, d) = a.interleave(b, 4);
+		assert_eq!(c.0, [0, 1, 4, 5]);
+		assert_eq!(d.0, [2, 3, 6, 7]);
+	}
+}

@@ -1,0 +1,132 @@
+[package]
+name = "binius-examples"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+# `cargo run -p binius-examples` has three bins to choose from; the circuits are the usual one.
+default-run = "binius-examples"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+binius-circuits = { path = "../circuits" }
+binius-core = { path = "../core" }
+binius-frontend = { path = "../frontend" }
+binius-hash = { path = "../hash" }
+binius-hash-prover = { path = "../hash-prover" }
+binius-prover = { path = "../prover", default-features = false }
+binius-transcript = { path = "../transcript" }
+binius-utils = { path = "../utils", features = ["platform-diagnostics"] }
+binius-verifier = { path = "../verifier" }
+bitcoin.workspace = true
+blake2.workspace = true
+blake3.workspace = true
+clap.workspace = true
+digest.workspace = true
+ethsign = "0.9.0"
+hex.workspace = true
+jwt-simple.workspace = true
+k256 = { workspace = true, features = ["arithmetic"] }
+keccak.workspace = true
+num-bigint = { workspace = true }
+peakmem-alloc = "0.3.0"
+rand = { workspace = true, features = ["thread_rng"] }
+sha2.workspace = true
+sha3.workspace = true
+tracing-forest.workspace = true
+tracing-profile.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+hex-literal.workspace = true
+
+[[bench]]
+name = "blake2b"
+harness = false
+
+[[bench]]
+name = "keccak"
+harness = false
+
+[[bench]]
+name = "ethsign"
+harness = false
+
+[[bench]]
+name = "blake2s"
+harness = false
+
+[[bench]]
+name = "hashsign"
+harness = false
+
+[[bench]]
+name = "sha256_compressions"
+harness = false
+
+[[bench]]
+name = "blake3_compressions"
+harness = false
+
+[[bench]]
+name = "keccak_permutations"
+harness = false
+
+[[bench]]
+name = "sha256"
+harness = false
+
+[[bench]]
+name = "sha256sign"
+harness = false
+
+[[bench]]
+name = "sha512"
+harness = false
+
+[[bench]]
+name = "sha3"
+harness = false
+
+[[bench]]
+name = "sha3_512"
+harness = false
+
+[features]
+default = []
+perfetto = ["tracing-profile/perfetto"]
+
+# Tutorial examples
+[[example]]
+name = "basics_masked_and"
+path = "examples/tutorials/basics_masked_and.rs"
+
+[[example]]
+name = "basics_word_semantics"
+path = "examples/tutorials/basics_word_semantics.rs"
+
+[[example]]
+name = "basics_nondeterministic"
+path = "examples/tutorials/basics_nondeterministic.rs"
+
+[[example]]
+name = "basics_xor_packing"
+path = "examples/tutorials/basics_xor_packing.rs"
+
+[[example]]
+name = "circuits_control_flow"
+path = "examples/tutorials/circuits_control_flow.rs"
+
+[[example]]
+name = "circuits_gadgets"
+path = "examples/tutorials/circuits_gadgets.rs"
+
+[[example]]
+name = "end_to_end_example"
+path = "examples/tutorials/end_to_end_example.rs"

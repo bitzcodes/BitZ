@@ -1,0 +1,25 @@
+[package]
+name = "binius-spartan-verifier"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+binius-core = { path = "../core" }
+binius-field = { path = "../field" }
+binius-hash = { path = "../hash", default-features = false }
+binius-iop = { path = "../iop" }
+binius-ip = { path = "../ip" }
+binius-math = { path = "../math" }
+binius-transcript = { path = "../transcript" }
+binius-spartan-frontend = { path = "../spartan-frontend" }
+binius-utils = { path = "../utils" }
+digest.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+binius-spartan-frontend = { path = "../spartan-frontend" }
+rand.workspace = true

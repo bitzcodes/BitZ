@@ -1,0 +1,352 @@
+// Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
+
+//! Example circuits and the harness that runs them.
+//!
+//! Each module under [`circuits`] builds one circuit and knows how to fill its witness; [`cli`]
+//! turns that into a runnable binary and [`snapshot`] records the circuit's statistics so a change
+//! in size shows up as a diff.
+
+pub mod circuits;
+pub mod cli;
+pub mod snapshot;
+
+use anyhow::Result;
+use binius_core::constraint_system::{ConstraintSystem, ValueVec};
+use binius_frontend::{CircuitBuilder, WitnessFiller};
+use binius_hash::sha256::Sha256HashSuite;
+use binius_hash_prover::ParallelHashSuite;
+use binius_prover::{KeyCollection, OptimalPackedB128, Prover, zk_config::ZKProver};
+use binius_utils::{DeserializeBytes, SerializeBytes};
+use binius_verifier::{
+	Verifier,
+	config::StdChallenger,
+	transcript::{ProverTranscript, VerifierTranscript},
+	zk_config::ZKVerifier,
+};
+use clap::ValueEnum;
+pub use cli::Cli;
+use digest::Output;
+use tracing::level_filters::LevelFilter;
+use tracing_forest::ForestLayer;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Initialize tracing with `tracing-forest`'s tree-formatted profiling output.
+///
+/// Installs a [`ForestLayer`], which prints a timing tree (span durations and their share of
+/// the total) for each root span as it closes. This replaces the human-readable
+/// `PrintTreeLayer` from `tracing-profile`.
+///
+/// Span verbosity defaults to `DEBUG` and can be overridden with `RUST_LOG`
+/// (e.g. `RUST_LOG=binius=trace`), matching the previous behavior.
+///
+/// Calling this when a global subscriber is already installed is a no-op, so it is safe to
+/// invoke from every example entry point.
+pub fn init_tracing() {
+	// `ureq` logs every HTTP request at DEBUG, which would bury the trace tree of any circuit
+	// that fetches its instance data over the network.
+	let env_filter = EnvFilter::builder()
+		.with_default_directive(LevelFilter::DEBUG.into())
+		.from_env_lossy()
+		.add_directive("ureq=off".parse().expect("literal directive"));
+
+	let _ = tracing_subscriber::registry()
+		.with(env_filter)
+		.with(ForestLayer::default())
+		.try_init();
+}
+
+/// Selects which Merkle hash suite the prover and verifier use.
+///
+/// A hash suite fixes both halves of the Merkle tree at once:
+/// - the leaf hash applied to the committed values, and
+/// - the two-to-one compression that folds a pair of child nodes into their parent.
+///
+/// It does not select a compression function alone, which is why the flag is `--hash-suite`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum HashSuiteType {
+	/// SHA-256 leaves with a SHA-256 two-to-one compression.
+	Sha256,
+	/// Blake3 leaves with a Blake3 two-to-one compression.
+	Blake3,
+}
+
+/// Standard verifier using SHA256 compression
+pub type StdVerifier = Verifier<Sha256HashSuite>;
+/// Standard prover using SHA256 compression
+pub type StdProver = Prover<OptimalPackedB128, Sha256HashSuite>;
+/// Standard ZK verifier using SHA256 compression
+pub type StdZKVerifier = ZKVerifier<Sha256HashSuite>;
+/// Standard ZK prover using SHA256 compression
+pub type StdZKProver = ZKProver<OptimalPackedB128, Sha256HashSuite>;
+
+/// Set up a non-ZK prover and verifier for the given constraint system using `H` as the
+/// Merkle hash suite.
+///
+/// Providing `key_collection` skips the expensive key-collection building phase during prover
+/// setup.
+pub fn setup<H>(
+	cs: ConstraintSystem,
+	log_inv_rate: usize,
+	key_collection: Option<KeyCollection>,
+) -> Result<(Verifier<H>, Prover<OptimalPackedB128, H>)>
+where
+	H: ParallelHashSuite + Clone,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let _setup_guard = tracing::info_span!("Setup", log_inv_rate).entered();
+	let verifier = Verifier::<H>::setup(cs, log_inv_rate)?;
+	let prover = if let Some(key_collection) = key_collection {
+		Prover::setup_with_key_collection(verifier.clone(), key_collection)?
+	} else {
+		Prover::setup(verifier.clone())?
+	};
+	Ok((verifier, prover))
+}
+
+/// Set up a ZK prover and verifier for the given constraint system using `H` as the Merkle
+/// hash suite.
+pub fn setup_zk<H>(
+	cs: ConstraintSystem,
+	log_inv_rate: usize,
+) -> Result<(ZKVerifier<H>, ZKProver<OptimalPackedB128, H>)>
+where
+	H: ParallelHashSuite + Clone,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let _setup_guard = tracing::info_span!("ZK setup", log_inv_rate).entered();
+	let verifier = ZKVerifier::<H>::setup(cs, log_inv_rate)?;
+	let prover = ZKProver::setup(&verifier)?;
+	Ok((verifier, prover))
+}
+
+/// Set up only the verifier (no prover) for the given constraint system using `H` as the Merkle
+/// hash suite. Cheaper than `setup` when proving is not needed.
+pub fn setup_verifier<H>(cs: ConstraintSystem, log_inv_rate: usize) -> Result<Verifier<H>>
+where
+	H: ParallelHashSuite + Clone,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let _setup_guard = tracing::info_span!("Setup", log_inv_rate).entered();
+	Ok(Verifier::<H>::setup(cs, log_inv_rate)?)
+}
+
+/// Set up only the ZK verifier (no prover) for the given constraint system using `H` as the
+/// Merkle hash suite. Cheaper than `setup_zk` when proving is not needed.
+pub fn setup_zk_verifier<H>(cs: ConstraintSystem, log_inv_rate: usize) -> Result<ZKVerifier<H>>
+where
+	H: ParallelHashSuite + Clone,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let _setup_guard = tracing::info_span!("ZK setup", log_inv_rate).entered();
+	Ok(ZKVerifier::<H>::setup(cs, log_inv_rate)?)
+}
+
+/// Run the prover and return the raw proof transcript bytes.
+pub fn create_proof<H>(prover: &Prover<OptimalPackedB128, H>, witness: &ValueVec) -> Result<Vec<u8>>
+where
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let challenger = StdChallenger::default();
+	let mut prover_transcript = ProverTranscript::new(challenger);
+	prover.prove(witness, &mut prover_transcript)?;
+	Ok(prover_transcript.finalize())
+}
+
+/// Run the ZK prover and return the raw proof transcript bytes.
+pub fn create_proof_zk<H>(
+	prover: &ZKProver<OptimalPackedB128, H>,
+	witness: &ValueVec,
+	message: Option<&[u8]>,
+) -> Result<Vec<u8>>
+where
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let challenger = StdChallenger::default();
+	let _scope = tracing::info_span!(
+		"Prove",
+		operation = "prove",
+		component = "prove",
+		scope_kind = "operation",
+		perfetto_category = "operation",
+		tag_proving = true,
+	)
+	.entered();
+	let mut prover_transcript = ProverTranscript::new(challenger);
+	let mut rng = rand::rng();
+	match message {
+		Some(message) => prover.prove_sig(witness, message, &mut rng, &mut prover_transcript)?,
+		None => prover.prove(witness, &mut rng, &mut prover_transcript)?,
+	}
+	Ok(prover_transcript.finalize())
+}
+
+/// Verify a proof given its raw transcript bytes.
+pub fn check_proof<H>(
+	verifier: &Verifier<H>,
+	witness: &ValueVec,
+	proof_bytes: Vec<u8>,
+) -> Result<()>
+where
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let challenger = StdChallenger::default();
+	let mut verifier_transcript = VerifierTranscript::new(challenger, proof_bytes);
+	verifier.verify(witness.inout(), &mut verifier_transcript)?;
+	verifier_transcript.finalize()?;
+	Ok(())
+}
+
+/// Verify a ZK proof given its raw transcript bytes.
+pub fn check_proof_zk<H>(
+	verifier: &ZKVerifier<H>,
+	witness: &ValueVec,
+	proof_bytes: Vec<u8>,
+	message: Option<&[u8]>,
+) -> Result<()>
+where
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let challenger = StdChallenger::default();
+	let _scope = tracing::info_span!("Verify").entered();
+	let mut verifier_transcript = VerifierTranscript::new(challenger, proof_bytes);
+	match message {
+		Some(message) => verifier.verify_sig(witness.inout(), message, &mut verifier_transcript)?,
+		None => verifier.verify(witness.inout(), &mut verifier_transcript)?,
+	}
+	verifier_transcript.finalize()?;
+	Ok(())
+}
+
+pub fn prove_verify<H>(
+	verifier: &Verifier<H>,
+	prover: &Prover<OptimalPackedB128, H>,
+	witness: &ValueVec,
+) -> Result<()>
+where
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let proof_bytes = create_proof(prover, witness)?;
+	tracing::info!("Proof size: {} KiB", proof_bytes.len() / 1024);
+	check_proof(verifier, witness, proof_bytes)?;
+	Ok(())
+}
+
+pub fn prove_verify_zk<H>(
+	verifier: &ZKVerifier<H>,
+	prover: &ZKProver<OptimalPackedB128, H>,
+	witness: &ValueVec,
+	message: Option<&[u8]>,
+) -> Result<()>
+where
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes + DeserializeBytes,
+{
+	let proof_bytes = create_proof_zk(prover, witness, message)?;
+	tracing::info!("Proof size: {} KiB", proof_bytes.len() / 1024);
+	check_proof_zk(verifier, witness, proof_bytes, message)?;
+	Ok(())
+}
+
+/// Trait for standardizing circuit examples in the Binius framework.
+///
+/// This trait provides a common pattern for implementing circuit examples by separating:
+/// - **Circuit parameters** (`Params`): compile-time configuration that affects circuit structure
+/// - **Instance data** (`Instance`): runtime data used to populate the witness
+/// - **Circuit building**: logic to construct the circuit based on parameters
+/// - **Witness population**: logic to fill in witness values based on instance data
+///
+/// # Example Implementation
+///
+/// ```rust,ignore
+/// struct MyExample {
+///     params: MyParams,
+///     // Store any gadgets or wire references needed for witness population
+/// }
+///
+/// #[derive(clap::Args)]
+/// struct MyParams {
+///     #[arg(long)]
+///     max_size: usize,
+/// }
+///
+/// #[derive(clap::Args)]
+/// struct MyInstance {
+///     #[arg(long)]
+///     input_value: Option<String>,
+/// }
+///
+/// impl ExampleCircuit for MyExample {
+///     type Params = MyParams;
+///     type Instance = MyInstance;
+///
+///     fn build(params: MyParams, builder: &mut CircuitBuilder) -> Result<Self> {
+///         // Construct circuit based on parameters
+///         Ok(Self { params })
+///     }
+///
+///     fn populate_witness(&self, instance: MyInstance, filler: &mut WitnessFiller) -> Result<()> {
+///         // Fill witness values based on instance data
+///         Ok(())
+///     }
+/// }
+/// ```
+///
+/// # Lifecycle
+///
+/// 1. Parse CLI arguments to get `Params` and `Instance`
+/// 2. Call `build()` with parameters to construct the circuit
+/// 3. Build the constraint system
+/// 4. Set up prover and verifier
+/// 5. Call `populate_witness()` to fill witness values
+/// 6. Generate and verify proof
+pub trait ExampleCircuit: Sized {
+	/// Circuit parameters that affect the structure of the circuit.
+	/// These are typically compile-time constants or bounds.
+	type Params: clap::Args;
+
+	/// Instance data used to populate the witness.
+	/// This represents the actual input values for a specific proof.
+	type Instance: clap::Args;
+
+	/// Build the circuit with the given parameters.
+	///
+	/// This method should:
+	/// - Add witnesses, constants, and constraints to the builder
+	/// - Store any wire references needed for witness population
+	/// - Return a Self instance that can later populate witness values
+	fn build(params: Self::Params, builder: &mut CircuitBuilder) -> Result<Self>;
+
+	/// Populate witness values for a specific instance.
+	///
+	/// This method should:
+	/// - Process the instance data (e.g., parse inputs, compute hashes)
+	/// - Fill all witness values using the provided filler
+	/// - Validate that instance data is compatible with circuit parameters
+	fn populate_witness(
+		&self,
+		instance: Self::Instance,
+		filler: &mut WitnessFiller<'_>,
+	) -> Result<()>;
+
+	/// Generate a concise parameter summary for perfetto trace filenames.
+	///
+	/// This method should return a short string (5-10 chars max) that captures
+	/// the most important parameters for this circuit configuration.
+	/// Used to differentiate traces with different parameter settings.
+	///
+	/// Format suggestions:
+	/// - Bytes: "2048b", "4096b"
+	/// - Counts: "10p" (permutations), "5s" (signatures)
+	///
+	/// Returns None if no meaningful parameters to include in filename.
+	fn param_summary(params: &Self::Params) -> Option<String> {
+		let _ = params;
+		None
+	}
+}

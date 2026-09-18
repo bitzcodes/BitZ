@@ -1,0 +1,391 @@
+use crate::poly::coefficient::{Coefficient, FieldRepresentation, PolynomialField};
+
+use crate::utils::{cfg_iter_mut, inner_transparent_field::InnerTransparentField, sub};
+use num_traits::Zero;
+use thiserror::Error;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+
+use crate::poly::mle::{DenseMultilinearExtension, dense::CollectDenseMleWithZero};
+
+/// A `enum` specifying the possible failure modes of the arithmetics.
+#[derive(Debug, Clone, Error)]
+pub enum ArithErrors {
+    #[error("Invalid parameters: {0}")]
+    InvalidParameters(String),
+}
+
+/// This function build the eq(x, r) polynomial for any given r.
+///
+/// Evaluate
+///      eq(x,y) = \prod_i=1^num_var (x_i * y_i + (1-x_i)*(1-y_i))
+/// over r, which is
+///      eq(x,y) = \prod_i=1^num_var (x_i * r_i + (1-x_i)*(1-r_i))
+pub fn build_eq_x_r<F>(
+    r: &[F],
+    cfg: &F::Config,
+) -> Result<DenseMultilinearExtension<F>, ArithErrors>
+where
+    F: PolynomialField,
+{
+    let evals = build_eq_x_r_vec(r, cfg)?;
+    let mle =
+        DenseMultilinearExtension::from_evaluations_vec(r.len(), evals, F::zero_with_cfg(cfg));
+
+    Ok(mle)
+}
+
+/// This function build the eq(x, r) polynomial for any given r, and output the
+/// evaluation of eq(x, r) in its vector form.
+///
+/// Evaluate
+///      eq(x,y) = \prod_i=1^num_var (x_i * y_i + (1-x_i)*(1-y_i))
+/// over r, which is
+///      eq(x,y) = \prod_i=1^num_var (x_i * r_i + (1-x_i)*(1-r_i))
+pub fn build_eq_x_r_vec<F>(r: &[F], cfg: &F::Config) -> Result<Vec<F>, ArithErrors>
+where
+    F: PolynomialField,
+{
+    // we build eq(x,r) from its evaluations
+    // we want to evaluate eq(x,r) over x \in {0, 1}^num_vars
+    // for example, with num_vars = 4, x is a binary vector of 4, then
+    //  0 0 0 0 -> (1-r0)   * (1-r1)    * (1-r2)    * (1-r3)
+    //  1 0 0 0 -> r0       * (1-r1)    * (1-r2)    * (1-r3)
+    //  0 1 0 0 -> (1-r0)   * r1        * (1-r2)    * (1-r3)
+    //  1 1 0 0 -> r0       * r1        * (1-r2)    * (1-r3)
+    //  ....
+    //  1 1 1 1 -> r0       * r1        * r2        * r3
+    // we will need 2^num_var evaluations
+
+    let mut eval = Vec::new();
+    build_eq_x_r_helper(r, &mut eval, cfg)?;
+
+    Ok(eval)
+}
+
+/// A helper function to build the `eq(x, r)` evaluation table in place.
+///
+/// This is Procedure 2 of "A Time-Space Tradeoff for the Sumcheck Prover"
+/// (Bagad, Dao, Domb, Thaler): a single buffer of `2^{r.len()}` field
+/// elements is allocated once, and the valid prefix is doubled one variable
+/// at a time. Each parent value `p` expands into its two children with a
+/// *single* multiplication:
+///
+///   child(x_i = 1) = p * r_i
+///   child(x_i = 0) = p - child(x_i = 1)   (= p * (1 - r_i))
+///
+/// The previous version was recursive: it allocated a fresh vector at every
+/// one of the `r.len()` levels and performed two multiplications per parent
+/// (one for each child). This version does one allocation and one
+/// multiplication per parent, while producing the identical output.
+fn build_eq_x_r_helper<F>(r: &[F], buf: &mut Vec<F>, cfg: &F::Config) -> Result<(), ArithErrors>
+where
+    F: PolynomialField,
+{
+    if r.is_empty() {
+        return Err(ArithErrors::InvalidParameters("r length is 0".into()));
+    }
+
+    // Single allocation for the whole `2^{r.len()}` evaluation table.
+    buf.clear();
+    buf.resize(1usize << r.len(), F::zero_with_cfg(cfg));
+    buf[0] = F::one_with_cfg(cfg);
+
+    // Fold in one variable `r_i` per round, doubling the valid prefix
+    // `[0, 1 << i)`. `r_i` becomes bit `i` of the output index: the lower
+    // half keeps `x_i = 0` and the upper half (offset `half`) gets
+    // `x_i = 1`. This matches the convention
+    // `eval[\sum_i x_i 2^i] = \prod_i eq(x_i, r_i)`.
+    for (i, ri) in r.iter().enumerate() {
+        let half = 1usize << i;
+        let (lo, hi) = buf.split_at_mut(half);
+        let expand = |lo_j: &mut F, hi_j: &mut F| {
+            // child for `x_i = 1`
+            let one_child = lo_j.clone() * ri;
+            // child for `x_i = 0`: parent - one_child = parent * (1 - r_i)
+            *lo_j -= &one_child;
+            *hi_j = one_child;
+        };
+        // The levels are independent per element, so a level may run in
+        // parallel; below `EQ_PARALLEL_MIN_HALF` parents the pool dispatch
+        // costs more than the level (a 15-variable table has 12 such
+        // levels), so those run inline. Same products either way.
+        #[cfg(feature = "parallel")]
+        if half >= EQ_PARALLEL_MIN_HALF && rayon::current_num_threads() > 1 {
+            lo.par_iter_mut()
+                .zip(hi.par_iter_mut())
+                .for_each(|(lo_j, hi_j)| expand(lo_j, hi_j));
+            continue;
+        }
+        lo.iter_mut()
+            .zip(hi.iter_mut())
+            .for_each(|(lo_j, hi_j)| expand(lo_j, hi_j));
+    }
+
+    Ok(())
+}
+
+/// Parents per level from which [`build_eq_x_r_helper`] splits the level
+/// across the pool.
+#[cfg(feature = "parallel")]
+const EQ_PARALLEL_MIN_HALF: usize = 1 << 12;
+
+/// This function build the eq(x, r) polynomial for any given r.
+///
+/// Evaluate
+///      eq(x,y) = \prod_i=1^num_var (x_i * y_i + (1-x_i)*(1-y_i))
+/// over r, which is
+///      eq(x,y) = \prod_i=1^num_var (x_i * r_i + (1-x_i)*(1-r_i))
+pub fn build_eq_x_r_inner<F>(
+    r: &[F],
+    cfg: &F::Config,
+) -> Result<DenseMultilinearExtension<F::Inner>, ArithErrors>
+where
+    F: PolynomialField,
+    F::Inner: Zero,
+{
+    let evals = build_eq_x_r_inner_vec(r, cfg)?;
+    let mle = DenseMultilinearExtension {
+        num_vars: r.len(),
+        evaluations: evals,
+    };
+
+    Ok(mle)
+}
+
+/// This function build the eq(x, r) polynomial for any given r, and output the
+/// evaluation of eq(x, r) in its vector form.
+///
+/// Evaluate
+///      eq(x,y) = \prod_i=1^num_var (x_i * y_i + (1-x_i)*(1-y_i))
+/// over r, which is
+///      eq(x,y) = \prod_i=1^num_var (x_i * r_i + (1-x_i)*(1-r_i))
+fn build_eq_x_r_inner_vec<F>(r: &[F], cfg: &F::Config) -> Result<Vec<F::Inner>, ArithErrors>
+where
+    F: PolynomialField,
+    F::Inner: Zero,
+{
+    // we build eq(x,r) from its evaluations
+    // we want to evaluate eq(x,r) over x \in {0, 1}^num_vars
+    // for example, with num_vars = 4, x is a binary vector of 4, then
+    //  0 0 0 0 -> (1-r0)   * (1-r1)    * (1-r2)    * (1-r3)
+    //  1 0 0 0 -> r0       * (1-r1)    * (1-r2)    * (1-r3)
+    //  0 1 0 0 -> (1-r0)   * r1        * (1-r2)    * (1-r3)
+    //  1 1 0 0 -> r0       * r1        * (1-r2)    * (1-r3)
+    //  ....
+    //  1 1 1 1 -> r0       * r1        * r2        * r3
+    // we will need 2^num_var evaluations
+
+    let mut eval = Vec::new();
+    build_eq_x_r_inner_helper(r, &mut eval, cfg)?;
+
+    Ok(eval)
+}
+
+/// A helper function to build eq(x, r) recursively.
+/// This function takes `r.len()` steps, and for each step it requires a maximum
+/// `r.len()-1` multiplications.
+fn build_eq_x_r_inner_helper<F>(
+    r: &[F],
+    buf: &mut Vec<F::Inner>,
+    cfg: &F::Config,
+) -> Result<(), ArithErrors>
+where
+    F: PolynomialField,
+    F::Inner: Zero,
+{
+    if r.is_empty() {
+        return Err(ArithErrors::InvalidParameters("r length is 0".into()));
+    }
+
+    // Single allocation for the whole `2^{r.len()}` evaluation table; see
+    // `build_eq_x_r_helper` for the in-place doubling scheme (Procedure 2 of
+    // the "Speedup Sumcheck" paper). Values are stored in `F::Inner` form;
+    // each is wrapped back into `F` only to perform the one multiplication
+    // and subtraction per parent.
+    buf.clear();
+    buf.resize(1usize << r.len(), F::Inner::zero());
+    buf[0] = F::one_with_cfg(cfg).into_inner();
+
+    for (i, ri) in r.iter().enumerate() {
+        let half = 1usize << i;
+        let (lo, hi) = buf.split_at_mut(half);
+        cfg_iter_mut!(lo)
+            .zip(cfg_iter_mut!(hi))
+            .for_each(|(lo_j, hi_j)| {
+                let parent = F::new_unchecked_with_cfg(lo_j.clone(), cfg);
+                // child for `x_i = 1`
+                let one_child = ri.clone() * &parent;
+                // child for `x_i = 0`: parent - one_child = parent * (1 - r_i)
+                *lo_j = (parent - &one_child).into_inner();
+                *hi_j = one_child.into_inner();
+            });
+    }
+
+    Ok(())
+}
+
+/// Build the shift selector MLE `next_c_mle(r, *)` with the first `num_vars`
+/// variables fixed to `r`.
+///
+/// For each `b in {0,1}^{num_vars}`:
+///   next_c_mle(b) = eq(r, b - c)   if b >= c
+///   next_c_mle(b) = 0              if b < c
+///
+/// Uses the identity `next_c_mle(r, b) = eq(r, b - c)` for `b >= c` and
+/// `0` for `b < c`.
+pub fn build_next_c_r_mle<F>(
+    r: &[F],
+    c: usize,
+    field_cfg: &F::Config,
+) -> Result<DenseMultilinearExtension<F::Inner>, ArithErrors>
+where
+    F: PolynomialField,
+    F::Inner: Zero,
+{
+    let num_vars = r.len();
+    let n = 1 << num_vars;
+    assert!(c < n, "shift c={c} must be < domain size {n}");
+    let zero_inner = F::zero_with_cfg(field_cfg).into_inner();
+
+    let eq_r = build_eq_x_r_inner(r, field_cfg)?;
+    if c == 0 {
+        return Ok(eq_r);
+    }
+
+    // next_c_mle(r, 0) = 0 for b < c
+    // next_c_mle(r, b - c) = eq(r, b - c) for b >= c
+    let mut evaluations = Vec::with_capacity(n);
+    evaluations.resize(c, zero_inner);
+    evaluations.extend_from_slice(&eq_r.evaluations[..sub!(n, c)]);
+
+    Ok(DenseMultilinearExtension {
+        num_vars,
+        evaluations,
+    })
+}
+
+/// Evaluate eq polynomial.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn eq_eval<R: Coefficient>(x: &[R], y: &[R], one: R) -> Result<R, ArithErrors> {
+    if x.len() != y.len() {
+        return Err(ArithErrors::InvalidParameters(
+            "x and y have different length".to_string(),
+        ));
+    }
+
+    let mut res = one.clone();
+    for (xi, yi) in x.iter().zip(y.iter()) {
+        let xi_yi = xi.clone() * yi;
+        res *= xi_yi.clone() + xi_yi - xi - yi + one.clone();
+    }
+
+    Ok(res)
+}
+
+/// Evaluate an MLE at a point using a precomputed eq table.
+///
+/// Given `evaluations[b]` (in `F::Inner` form) and `eq_table[b] = eq(b, r)`
+/// (precomputed via [`build_eq_x_r_vec`]), returns `\sum_{b} eq_table[b] *
+/// evaluations[b]`.
+///
+/// This is equivalent to `DenseMultilinearExtension::evaluate_with_config`
+/// but avoids cloning the evaluation vector (the fix-variables algorithm is
+/// destructive). When multiple MLEs share the same evaluation point, build the
+/// eq table once and call this function for each MLE.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn mle_eval_with_eq_table<F: InnerTransparentField>(
+    evaluations: &[F::Inner],
+    eq_table: &[F],
+    cfg: &F::Config,
+) -> F {
+    let mut acc = F::zero_with_cfg(cfg);
+    assert_eq!(
+        evaluations.len(),
+        eq_table.len(),
+        "evaluations and eq_table must have the same length"
+    );
+    for (eval, eq_val) in evaluations.iter().zip(eq_table.iter()) {
+        let mut term = eq_val.clone();
+        term.mul_assign_by_inner(eval);
+        acc += &term;
+    }
+    acc
+}
+
+/// Returns a multilinear polynomial in 2n variables that evaluates to 1
+/// if and only if the second n-bit vector is equal to the first vector plus one
+#[allow(clippy::arithmetic_side_effects)]
+pub fn next_mle_inner<F: FieldRepresentation>(
+    num_vars: u32,
+    zero: F,
+    one: F,
+) -> Result<DenseMultilinearExtension<F::Inner>, ArithErrors> {
+    if !num_vars.is_multiple_of(2) {
+        return Err(ArithErrors::InvalidParameters(
+            "num_vars must be even".to_string(),
+        ));
+    }
+
+    let mut mle = (0..1 << num_vars)
+        .map(|_| zero.inner().clone())
+        .collect_dense_mle_with_zero(zero.inner());
+
+    let half_vars = num_vars / 2;
+
+    for i in 0usize..(1 << half_vars) - 1 {
+        let next = i + 1;
+
+        let i_concat_next = (next << half_vars) | i;
+
+        mle[i_concat_next] = one.inner().clone();
+    }
+
+    Ok(mle)
+}
+
+/// Evaluates the next MLE in O(n), by reusing suffix equality and prefix carry
+/// products across carry positions.
+///
+/// Improved from O(n²) approach here: https://github.com/TomWambsgans/Whirlaway/blob/9e3592b/crates/air/src/utils.rs#L92
+///
+/// `next_mle(u, v) = 1` iff `Val(v) = Val(u) + 1` and `Val(u) < 2^n - 1`.
+///
+/// # Arguments
+/// - `u`: first n-bit vector (LE convention: index 0 = LSB).
+/// - `v`: second n-bit vector. Must have `v.len() == u.len()`.
+///
+/// # Algorithm
+/// Uses prefix/suffix products for O(n) evaluation:
+///   `next_mle(u, v) = sum_{j=0}^{n-1}
+///       [prod_{i<j} u_i * (1 - v_i)]      -- bits below j: were 1, flip to 0
+///     * (1 - u_j) * v_j                   -- bit j: 0 → 1
+///     * [prod_{i>j} eq(u_i, v_i)]`        -- bits above j: unchanged
+///
+/// # Panics
+/// Panics if `u.len() != v.len()`.
+#[allow(clippy::arithmetic_side_effects)]
+pub fn next_mle_eval<R: Coefficient>(u: &[R], v: &[R], zero: R, one: R) -> R {
+    let n = u.len();
+    assert_eq!(n, v.len(), "u and v must have the same length");
+    if n == 0 {
+        return zero;
+    }
+
+    // suffix_eq[j] = prod_{i=j}^{n-1} eq(u_i, v_i)
+    let mut suffix_eq = vec![one.clone(); n + 1];
+    for i in (0..n).rev() {
+        suffix_eq[i] = suffix_eq[i + 1].clone()
+            * (u[i].clone() * &v[i] + (one.clone() - &u[i]) * (one.clone() - &v[i]));
+    }
+
+    // prefix_carry accumulates prod_{i<j} u_i * (1 - v_i)
+    let mut prefix_carry = one.clone();
+    let mut result = zero;
+    for j in 0..n {
+        result += prefix_carry.clone() * (one.clone() - &u[j]) * &v[j] * &suffix_eq[j + 1];
+        prefix_carry *= u[j].clone() * (one.clone() - &v[j]);
+    }
+    result
+}

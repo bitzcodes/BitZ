@@ -1,0 +1,446 @@
+[package]
+name = "bitz"
+version = "0.1.0"
+edition = "2024"
+description = "BitZ: integer-MLE-evaluation PCS over an F2 commitment via a GF(2^128) exponent-fold GKR forest, opened with a flock-backed ring-switch + recursive Ligerito PCS"
+
+[dependencies]
+field = { path = "vendor/field" }
+clap = { version = "4", features = ["derive", "env", "string"], optional = true }
+anyhow = "1"
+derive_more = { version = "2.1.1", features = ["full"] }
+blake3 = { version = "1.8", features = ["rayon"] }
+itertools = "0.14"
+num-traits = "0.2"
+thiserror = "2.0"
+rayon = { version = "1.10", optional = true }
+rand = "0.10"
+rand_core = "0.10"
+# The ring-switch + recursive Ligerito opener (commit / Ligerito hot paths).
+# Pinned to the flock fork so builds do not require a sibling checkout.
+# The k=4 Johnson configuration is generated in this crate, so the dependency
+# does not need a private `Slim3` enum variant; see README.md.
+# flock-core itself pins bincode 1.3 and serde 1.
+flock-core = { path = "vendor/flock-mod/crates/flock-core" }
+# The host proof stream carries flock's serde `LigeritoProof` as a
+# length-prefixed bincode blob (bincode 1.3, matching flock's own pin).
+bincode = "1.3"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+# Backend-independent SHA-256/BitZ circuit synthesis, copied into this
+# workspace so fresh checkouts do not require a sibling repository.
+circuit = { path = "crates/circuit", default-features = false }
+
+# Optional Plonky3 stack used by the PCS and native SHA-256 comparisons.
+# Pin all P3 crates to the same benchmark fork revision.
+p3-air = { path = "vendor/plonky3/air", optional = true }
+p3-baby-bear = { path = "vendor/plonky3/baby-bear", optional = true }
+p3-challenger = { path = "vendor/plonky3/challenger", optional = true }
+p3-commit = { path = "vendor/plonky3/commit", optional = true }
+p3-dft = { path = "vendor/plonky3/dft", features = ["parallel"], optional = true }
+p3-field = { path = "vendor/plonky3/field", optional = true }
+p3-fri = { path = "vendor/plonky3/fri", optional = true }
+p3-goldilocks = { path = "vendor/plonky3/goldilocks", optional = true }
+p3-matrix = { path = "vendor/plonky3/matrix", optional = true }
+p3-merkle-tree = { path = "vendor/plonky3/merkle-tree", optional = true }
+p3-multi-stark = { path = "vendor/plonky3/multi-stark", optional = true }
+p3-multilinear-util = { path = "vendor/plonky3/multilinear-util", optional = true }
+p3-sha256-air = { path = "vendor/plonky3/sha256-air", features = ["parallel"], optional = true }
+p3-sumcheck = { path = "vendor/plonky3/sumcheck", features = ["parallel"], optional = true }
+p3-symmetric = { path = "vendor/plonky3/symmetric", optional = true }
+p3-uni-stark = { path = "vendor/plonky3/uni-stark", features = ["parallel"], optional = true }
+p3-util = { path = "vendor/plonky3/util", optional = true }
+p3-whir = { path = "vendor/plonky3/whir", features = ["parallel"], optional = true }
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"], optional = true }
+
+# Benchmark-only native Limber adapters. The normal BitZ dependency graph does
+# not include Bellpepper or either Limber PCS engine.
+bellpepper = { version = "0.4.1", optional = true }
+bellpepper-core = { version = "0.4.0", optional = true }
+ff = { version = "0.13.1", features = ["derive", "bits"], optional = true }
+limber = { path = "vendor/limber", default-features = false, optional = true }
+
+
+# Optional Binius64 stack for the PCS and native SHA-256 comparisons.
+# Pin every crate to the same benchmark fork revision.
+binius-compute = { path = "vendor/binius64/crates/compute", optional = true }
+binius-circuits = { path = "vendor/binius64/crates/circuits", optional = true }
+binius-core = { path = "vendor/binius64/crates/core", optional = true }
+binius-field = { path = "vendor/binius64/crates/field", optional = true }
+binius-frontend = { path = "vendor/binius64/crates/frontend", optional = true }
+binius-hash = { path = "vendor/binius64/crates/hash", optional = true }
+binius-iop = { path = "vendor/binius64/crates/iop", optional = true }
+binius-iop-prover = { path = "vendor/binius64/crates/iop-prover", optional = true }
+binius-ip = { path = "vendor/binius64/crates/ip", optional = true }
+binius-ip-prover = { path = "vendor/binius64/crates/ip-prover", optional = true }
+binius-math = { path = "vendor/binius64/crates/math", optional = true }
+binius-prover = { path = "vendor/binius64/crates/prover", optional = true }
+binius-transcript = { path = "vendor/binius64/crates/transcript", optional = true }
+binius-utils = { path = "vendor/binius64/crates/utils", optional = true }
+binius-verifier = { path = "vendor/binius64/crates/verifier", optional = true }
+tracing = "0.1.38"
+tracing-subscriber = { version = "0.3.18", optional = true }
+perfetto-sdk = { version = "1.1.1", optional = true }
+tracing-perfetto-sdk = { version = "1.0.0", optional = true }
+csv = { version = "1.4", optional = true }
+
+libc = "0.2" # getrusage: peak resident set of CLI sweep children
+
+[dev-dependencies]
+# Independent correctness oracles and excluded benchmark adapters only.
+num-bigint = "0.4"
+num-integer = "0.1"
+clap = { version = "4", features = ["derive", "env", "string"] }
+csv = "1.4"
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+sha2 = "0.10"
+tempfile = "3"
+
+[[bench]]
+name = "sha256_ecdsa"
+harness = false
+required-features = ["span-metrics", "ecdsa"]
+
+[[bench]]
+name = "sha256_ecdsa_compare"
+harness = false
+required-features = ["span-metrics", "sha256-ecdsa-compare"]
+
+[[bench]]
+name = "pcs"
+required-features = ["span-metrics", "bench-peak-memory"]
+harness = false
+# Plain-main bench (no criterion): commit/prove/verify timings, serialized
+# proof size + codec round-trip, and peak heap per phase. Shapes via
+# BITZ_BENCH_SHAPES ("t:s:W" triples), reps via BITZ_BENCH_REPS.
+
+[[bench]]
+name = "field"
+required-features = ["span-metrics"]
+harness = false
+# GF(2^128)-GHASH vs GF(2^127)-b127 head-to-head on the prover's hot
+# patterns (batch/chain mul, squares, comb powers, wide-dot, eqf kernels).
+# Reps via BITZ_BENCH_REPS.
+
+[[bench]]
+name = "cm_and"
+required-features = ["span-metrics", "bench-peak-memory"]
+harness = false
+# CM-AND relation (paper \Relation_CM): batched 32-bit x AND y = z via ONE
+# linear constraint per gate, with w = x XOR y as an F2-VIRTUAL block -
+# committed bits are x|y|z only, w is derived by the virtual BitZ opening.
+# Exponents via BITZ_CM_EXPONENTS; reps via BITZ_BENCH_REPS.
+
+[[bench]]
+name = "eq_tables"
+harness = false
+required-features = ["span-metrics", "bench-internals"]
+# Controlled legacy-versus-current equality-table builder benchmark.
+# Widths 8, 12, and 16; alternating median samples and explicit PR 1 gates.
+
+[[bench]]
+name = "multiswap"
+required-features = ["span-metrics"]
+harness = false
+# Limber's wired MultiSwap Mod-R1CS (6209 rows, k=0) through Spartan over a
+# transcript-sampled 113-bit prime + the runtime-prime BitZ bit opening.
+# Unified output schema (benches/common/output.rs). Reps via BITZ_BENCH_REPS
+# (alias BITZ_MULTISWAP_REPS); profile via BITZ_BENCH_LAMBDA (114 = the
+# pinned Limber114, the only two-prime profile); run RAYON_NUM_THREADS=1
+# for Limber parity.
+
+[[bench]]
+name = "lambda_sweep"
+required-features = ["span-metrics"]
+harness = false
+# One SHA-256 witness proved under Lambda100 / Sha128ReferenceSchedule /
+# Lambda128 (compile-time profiles) in the unified schema - the
+# prover-time / proof-size tradeoff table for the security target.
+# BITZ_BENCH_LAMBDA restricts the run to one of them. Exponent via
+# BITZ_BENCH_SHAPES (default 12); reps via BITZ_BENCH_REPS.
+
+[[bench]]
+name = "sha256_compressions"
+required-features = ["span-metrics"]
+harness = false
+# Independent SHA-256 compression batches through the structured Spartan +
+# virtual BitZ path. Unified output schema (benches/common/output.rs). Exponents
+# via BITZ_BENCH_SHAPES (alias BITZ_SHA_LOG2S); reps via BITZ_BENCH_REPS
+# (alias BITZ_SHA_REPS); profile via BITZ_BENCH_LAMBDA.
+
+[[bench]]
+name = "sha256_chain"
+required-features = ["span-metrics"]
+harness = false
+# CHAINED SHA-256 compressions (the Merkle–Damgård chain over 2^k blocks,
+# intermediate chaining values as witness) through the same linear PIOP +
+# direct product opening, on the chained virtual map. Unified output
+# schema (benches/common/output.rs). Exponents via BITZ_BENCH_SHAPES; reps via
+# BITZ_BENCH_REPS; profile via BITZ_BENCH_LAMBDA.
+
+[[bench]]
+name = "sha256_e2e_compare"
+harness = false
+required-features = ["span-metrics", "bench-internals", "native-sha256-compare"]
+# Claim-equivalent fixed-IV native SHA-256 comparison across BitZ, full
+# Plonky3 SHA AIR/WHIR, Binius64, and integer-mod Limber/Brakedown.
+# Exponents via BITZ_SHA_COMPARE_EXPONENTS (default 7,8,10..16), one warmup and
+# 21 measured verified samples by default.
+
+[[bench]]
+name = "sha256_chain_compare"
+harness = false
+required-features = ["span-metrics", "binius64-bench"]
+
+[[test]]
+name = "sha256_chain_comparison"
+required-features = ["span-metrics", "binius64-bench"]
+
+[[bench]]
+name = "hybrid_u32_sha256"
+harness = false
+required-features = ["span-metrics", "hybrid"]
+# Shared-opening hybrid, separate BitZ + Binius, and all-Binius comparison.
+# Chained SHA-256 plus x*y = z + 2^32*w with four u32 limbs.
+# Counts and repetitions via --mul-log, --sha-log, and --iterations.
+
+
+[[test]]
+name = "native_mul_compare"
+path = "tests/native_mul_compare.rs"
+required-features = ["bench-internals", "native-mul-compare"]
+
+[[test]]
+name = "benchmark_reporting"
+path = "tests/benchmark_reporting.rs"
+required-features = ["bench-internals", "native-mul-compare", "sha256-ecdsa-compare", "hybrid"]
+
+[[test]]
+name = "benchmark_perfetto"
+required-features = ["bench-perfetto"]
+
+[[test]]
+name = "native_sha256_compare"
+path = "tests/native_sha256_compare.rs"
+required-features = ["bench-internals", "native-sha256-compare"]
+
+[[bench]]
+name = "sha256_product_layout"
+harness = false
+required-features = ["span-metrics", "bench-internals"]
+# Fixed-q controlled sweep for 2^14 compressions and t+s=29. Defaults to
+# t=7..=27, one warmup + 21 samples; t=28 is memory-skipped. Select t with
+# BITZ_SHA_PRODUCT_TS.
+
+[[example]]
+name = "binius_probe"
+required-features = ["span-metrics", "hybrid"]
+
+[[example]]
+name = "binius_config_audit"
+required-features = ["binius64-bench"]
+
+[[example]]
+name = "grind_probe"
+required-features = ["parallel", "span-metrics"]
+
+[[example]]
+name = "hybrid_probe"
+required-features = ["span-metrics", "hybrid"]
+
+[[example]]
+name = "reference_measure"
+required-features = ["span-metrics"]
+
+[[example]]
+name = "cm_probe"
+required-features = ["span-metrics"]
+
+[[example]]
+name = "u64_mul_probe"
+required-features = ["span-metrics"]
+
+[[example]]
+name = "taps_ab"
+required-features = ["span-metrics"]
+
+[[example]]
+name = "quad_ab"
+required-features = ["span-metrics"]
+
+[[example]]
+name = "rlc_ab"
+required-features = ["span-metrics"]
+
+[[example]]
+name = "spartan_probe"
+required-features = ["span-metrics", "parallel"]
+
+[[example]]
+name = "prof_probe"
+required-features = ["span-metrics"]
+
+[features]
+default = ["parallel"]
+# Numeric span metrics require the native trace processor at runtime.
+span-metrics = ["dep:perfetto-sdk", "dep:tracing-perfetto-sdk", "dep:tracing-subscriber", "dep:csv"]
+# Additionally save per-trial diagnostic artifacts through BenchmarkOutput.
+bench-perfetto = ["span-metrics"]
+hybrid = ["span-metrics", "binius64-bench", "dep:csv", "dep:clap"]
+parallel = ["dep:rayon"]
+unchecked = []
+# Benchmark-only allocator instrumentation. The latency binary deliberately
+# omits this feature so allocation accounting cannot bias the timing gate.
+bench-peak-memory = []
+# Exposes narrowly scoped policy controls used by controlled benchmark binaries.
+bench-internals = []
+# Composed SHA-256/P-256 arithmetization and its split Spartan adapter.
+ecdsa = ["circuit/full"]
+sha256-ecdsa-compare = ["span-metrics", "ecdsa", "parallel"]
+# Enables the Plonky3 BabyBear/Goldilocks WHIR stack for the controlled PCS
+# comparison without adding it to normal library or benchmark builds.
+plonky3-whir-bench = [
+    "dep:p3-baby-bear",
+    "dep:p3-challenger",
+    "dep:p3-commit",
+    "dep:p3-dft",
+    "dep:p3-field",
+    "dep:p3-goldilocks",
+    "dep:p3-matrix",
+    "dep:p3-merkle-tree",
+    "dep:p3-multilinear-util",
+    "dep:p3-sumcheck",
+    "dep:p3-symmetric",
+    "dep:p3-whir",
+    "dep:postcard",
+]
+plonky3-sha256-bench = [
+    "plonky3-whir-bench",
+    "dep:p3-air",
+    "dep:p3-multi-stark",
+    "dep:p3-sha256-air",
+    "dep:p3-util",
+]
+# Univariate Goldilocks STARK + FRI for independent wrapping u32 multiplication.
+plonky3-fri-bench = [
+    "dep:p3-air",
+    "dep:p3-challenger",
+    "dep:p3-commit",
+    "dep:p3-dft",
+    "dep:p3-field",
+    "dep:p3-fri",
+    "dep:p3-goldilocks",
+    "dep:p3-matrix",
+    "dep:p3-merkle-tree",
+    "dep:p3-symmetric",
+    "dep:p3-uni-stark",
+    "dep:postcard",
+]
+native-mul-compare = [
+    "span-metrics",
+    "plonky3-fri-bench",
+    "plonky3-whir-bench",
+    "dep:p3-air",
+    "dep:p3-multi-stark",
+    "binius64-bench",
+    # Limber's own wrapping-multiplication rows, proved in process through
+    # its Brakedown Mod-PCS engine (benches/mul/native/limber.rs).
+    "dep:limber",
+]
+native-sha256-compare = [
+    "span-metrics",
+    "plonky3-sha256-bench",
+    "binius64-bench",
+    "dep:bellpepper",
+    "dep:bellpepper-core",
+    "dep:ff",
+    "dep:limber",
+]
+# Selects the audited degree-4/unique-decoding WHIR comparison profile.  The
+# default `plonky3-whir-bench` profile remains degree-5/Johnson-bound so normal
+# comparison invocations keep their existing configuration.
+plonky3-whir-degree4-bench = ["plonky3-whir-bench"]
+# Selects the degree-2 Goldilocks challenge field for the u32 WHIR campaign.
+# Without it the u32 adapter uses the degree-5 Goldilocks extension.
+plonky3-whir-goldilocks-degree2-bench = ["plonky3-whir-bench"]
+# Enables the Binius64 BaseFold + ring-switch benchmark adapter.
+binius64-bench = [
+    "dep:binius-compute",
+    "dep:binius-circuits",
+    "dep:binius-core",
+    "dep:binius-field",
+    "dep:binius-frontend",
+    "dep:binius-hash",
+    "dep:binius-iop",
+    "dep:binius-iop-prover",
+    "dep:binius-ip",
+    "dep:binius-ip-prover",
+    "dep:binius-math",
+    "dep:binius-prover",
+    "dep:binius-transcript",
+    "dep:binius-utils",
+    "dep:binius-verifier",
+    "dep:tracing-subscriber",
+]
+
+# Match the upstream zinc-plus release profile — without fat LTO +
+# codegen-units=1 the vendored field kernels and the sumcheck driver lose
+# cross-unit inlining, measured ~1.2-1.5x slower at matched shapes.
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Limber needs this upstream halo2curves revision for its mixed-add API.
+# Cargo resolves patches from the root manifest, so mirror Limber's pin here.
+[patch.crates-io]
+halo2curves = { git = "https://github.com/privacy-ethereum/halo2curves.git", rev = "02c235f0bb52800c28d9c3370400b5435dbe2220" }
+
+
+# Release-equivalent benchmark codegen with profiler-readable DWARF. Keeping
+# symbols in the built-in bench profile lets xctrace resolve Rust hot paths.
+[profile.bench]
+lto = true
+codegen-units = 1
+debug = 2
+strip = false
+split-debuginfo = "unpacked"
+
+# Release codegen + DWARF, for profilers (sample/samply). Separate target
+# dir, so alternating profile/measure runs never invalidates release caches.
+[profile.profiling]
+inherits = "release"
+debug = 2
+
+[[bin]]
+name = "bitz"
+path = "src/bin/bitz.rs"
+required-features = ["span-metrics"]
+
+[[bin]]
+name = "hybrid-u32-sha256"
+path = "src/bin/hybrid_u32_sha256.rs"
+required-features = ["span-metrics", "hybrid"]
+
+[[test]]
+name = "binius_integer_pcs"
+path = "tests/binius_integer_pcs.rs"
+required-features = ["bench-internals", "binius64-bench"]
+
+[[bench]]
+name = "ligerito_bounds"
+harness = false
+required-features = ["span-metrics", "ecdsa", "hybrid", "bench-internals"]
+
+[[bench]]
+name = "mul_bitz"
+harness = false
+required-features = ["span-metrics", "bench-internals"]
+
+[[bench]]
+name = "mul_compare"
+harness = false
+required-features = ["native-mul-compare", "bench-internals"]
+
+[[test]]
+name = "mul_bench"
+required-features = ["span-metrics", "bench-internals"]

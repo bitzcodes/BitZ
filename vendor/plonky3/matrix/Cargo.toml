@@ -1,0 +1,56 @@
+[package]
+name = "p3-matrix"
+description = "A matrix library providing common matrix operations and traits for finite field elements."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+
+itertools.workspace = true
+p3-field.workspace = true
+p3-maybe-rayon.workspace = true
+p3-util.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+tracing.workspace = true
+
+[dev-dependencies]
+p3-baby-bear = { path = "../baby-bear" }
+p3-goldilocks = { path = "../goldilocks" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "transpose_benchmark"
+path = "benches/transpose_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "columnwise_dot_product"
+path = "benches/columnwise_dot_product.rs"
+harness = false
+
+[[bench]]
+name = "interpolation"
+path = "benches/interpolation.rs"
+harness = false
+
+[[bench]]
+name = "vertical_packing"
+path = "benches/vertical_packing.rs"
+harness = false
+
+[[bench]]
+name = "bitrev_vertical_packing"
+path = "benches/bitrev_vertical_packing.rs"
+harness = false
+
+[lints]
+workspace = true

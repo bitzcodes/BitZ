@@ -1,0 +1,46 @@
+[package]
+name = "p3-keccak-air"
+description = "An AIR for the Keccak-f permutation, assuming a field size between 2^16 and 2^32."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+parallel = ["p3-maybe-rayon/parallel"]
+
+[dependencies]
+p3-air.workspace = true
+p3-field.workspace = true
+p3-matrix.workspace = true
+p3-maybe-rayon.workspace = true
+p3-util.workspace = true
+
+rand.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+p3-baby-bear = { path = "../baby-bear" }
+p3-challenger = { path = "../challenger" }
+p3-circle = { path = "../circle" }
+p3-commit = { path = "../commit" }
+p3-dft = { path = "../dft" }
+p3-fri = { path = "../fri" }
+p3-goldilocks = { path = "../goldilocks" }
+p3-keccak = { path = "../keccak" }
+p3-merkle-tree = { path = "../merkle-tree" }
+p3-mersenne-31 = { path = "../mersenne-31" }
+p3-monty-31 = { path = "../monty-31" }
+p3-sha256 = { path = "../sha256" }
+p3-symmetric = { path = "../symmetric" }
+p3-uni-stark = { path = "../uni-stark" }
+
+proptest.workspace = true
+tracing-forest = { workspace = true, features = ["ansi", "smallvec"] }
+tracing-subscriber = { workspace = true, features = ["std", "env-filter"] }
+
+[lints]
+workspace = true

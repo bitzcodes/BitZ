@@ -1,0 +1,38 @@
+[package]
+name = "flock-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP."
+
+[features]
+# Count hash invocations (Merkle leaf/pair compressions, FS transcript
+# absorption and squeezes, PoW evaluations) via global relaxed atomics. Counts
+# whichever hash each component is configured with — see `hash::HashKind`. Off
+# by default; used by flock-prover's benches/verifier_hash_count.rs.
+hash-count = []
+
+# Compile the insecure `RandomChallenger` (no Fiat-Shamir binding) into a
+# non-test build. Off by default so real proofs *cannot* reference it — see
+# `src/challenger.rs`. The crate's own `#[cfg(test)]` code gets it for free;
+# this feature only exists for bench/example isolation (e.g. flock-prover's
+# `chain_bench` example). NEVER enable it for a build that produces real proofs.
+unsound-challenger = []
+
+[dependencies]
+field = { path = "../../../field", features = ["serde"] }
+rayon = { workspace = true }
+sha2 = { workspace = true }
+rand_core = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+# Used by `LigeritoSecurityConfig` serde round-trip tests.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

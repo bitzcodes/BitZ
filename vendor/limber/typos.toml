@@ -1,0 +1,9 @@
+[default.extend-words]
+Groth = "Groth"
+# "IntEval" / "inteval" is the protocol name from §4 of the SNARKs-for-
+# Integers paper (Integer Evaluation), not a misspelling of "interval".
+inteval = "inteval"
+IntEval = "IntEval"
+# "MiMC" is the MiMC-7 hash function (Albrecht et al.), not a typo of "mimic".
+mimc = "mimc"
+MiMC = "MiMC"

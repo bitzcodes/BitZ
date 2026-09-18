@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+flamegraph.svg
+
+# Python
+__pycache__/
+
+# Proptest data
+proptest-regressions/

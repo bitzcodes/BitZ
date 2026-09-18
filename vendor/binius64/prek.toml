@@ -1,0 +1,54 @@
+# Configuration file for `prek`, a git hook framework written in Rust.
+# See https://prek.j178.dev for more information.
+#:schema https://www.schemastore.org/prek.json
+
+[[repos]]
+repo = "local"
+hooks = [
+  {
+    id = "copyright",
+    name = "Check copyright notices",
+    language = "python",
+    entry = "python tools/check_copyright_notice.py",
+    pass_filenames = false,
+    stages = ["pre-commit"]
+  },
+  {
+    id = "rustfmt",
+    name = "Run `rustfmt`",
+    types = ["rust"],
+    # language = "system", not "rust" because we need to pin nightly toolchain
+    language = "system",
+    entry = "cargo +nightly-2026-07-01 fmt --check",
+    pass_filenames = false,
+    stages = ["pre-commit"]
+  },
+  {
+    id = "clippy",
+    name = "Run cargo clippy on changed packages",
+    types = ["rust"],
+    language = "system",
+    entry = "bash tools/clippy-changed-packages.sh",
+    pass_filenames = true,
+    stages = ["pre-push"]
+  },
+  {
+    id = "rustdoc",
+    name = "Check Rust docs build",
+    types = ["rust"],
+    language = "system",
+    # RUSTDOCFLAGS="-D warnings" promotes rustdoc lints (broken intra-doc links,
+    # missing crate-level docs) to errors, matching the `rust-doc` CI job.
+    entry = "cargo doc --document-private-items --no-deps",
+    env = { RUSTDOCFLAGS = "-D warnings" },
+    pass_filenames = false,
+    stages = ["pre-push"]
+  }
+]
+
+[[repos]]
+repo = "https://github.com/crate-ci/typos"
+rev = "v1.32.0"
+hooks = [
+  { id = "typos" }
+]

@@ -1,0 +1,63 @@
+use core::hint::black_box;
+
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use p3_baby_bear::BabyBear;
+use p3_field::PrimeCharacteristicRing;
+use p3_goldilocks::Goldilocks;
+use p3_util::transpose::transpose;
+
+/// Benchmark matrix sizes for BabyBear field elements (4 bytes each):
+const BENCHMARK_SIZES: &[(usize, usize, &str)] = &[
+    (128, 128, "small_square_128x128"),
+    (1024, 1024, "medium_square_1024x1024"),
+    (4096, 2048, "large_wide_4096x2048"),
+    (2048, 4096, "large_tall_2048x4096"),
+];
+
+fn bench_transpose_babybear(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transpose_babybear");
+
+    for &(width, height, name) in BENCHMARK_SIZES {
+        let size = width * height;
+
+        let input: Vec<_> = (0..size as u64).map(BabyBear::from_u64).collect();
+        let mut output = BabyBear::zero_vec(size);
+
+        group.bench_with_input(BenchmarkId::new("transpose_util", name), &size, |b, _| {
+            b.iter(|| {
+                transpose(black_box(&input), &mut output, width, height);
+                black_box(output[0])
+            });
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_transpose_goldilocks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transpose_goldilocks");
+
+    for &(width, height, name) in BENCHMARK_SIZES {
+        let size = width * height;
+
+        let input: Vec<_> = (0..size as u64).map(Goldilocks::from_u64).collect();
+        let mut output = Goldilocks::zero_vec(size);
+
+        group.bench_with_input(BenchmarkId::new("transpose_util", name), &size, |b, _| {
+            b.iter(|| {
+                transpose(black_box(&input), &mut output, width, height);
+                black_box(output[0])
+            });
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_transpose_babybear,
+    bench_transpose_goldilocks
+);
+
+criterion_main!(benches);

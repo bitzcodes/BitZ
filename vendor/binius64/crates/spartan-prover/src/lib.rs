@@ -1,0 +1,534 @@
+// Copyright 2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
+
+//! Spartan-based proof generation for Binius64 constraint systems.
+//!
+//! This crate provides the [`Prover`] struct for generating zero-knowledge proofs
+//! using the Spartan protocol adapted for Binius64's constraint system. It is the
+//! prover-side counterpart to `binius_spartan_verifier`.
+//!
+//! # When to use this crate
+//!
+//! Use this crate when you have a constraint system built with `binius_spartan_frontend`
+//! and need to generate a Spartan-based proof. This is an alternative to the main
+//! `binius_prover` crate.
+//!
+//! # Key types
+//!
+//! - [`Prover`] - Main proving interface; call [`Prover::setup`] with a verifier, then
+//!   [`Prover::prove`] with witness data
+//! - [`IOPProver`] - Core IOP proving logic, independent of the compilation strategy
+//!
+//! # Related crates
+//!
+//! - `binius_spartan_verifier` - Verification counterpart
+//! - `binius_spartan_frontend` - Constraint system builder for Spartan
+//! - `binius_prover` - Alternative proving backend
+
+#![warn(rustdoc::missing_crate_level_docs)]
+
+mod error;
+mod wiring;
+pub mod wrapper;
+
+use std::{
+	iter::{repeat_n, repeat_with},
+	marker::PhantomData,
+	ops::Deref,
+};
+
+use binius_compute::{Allocator, BufferPool, VecLike};
+use binius_field::{BinaryField, Field, PackedField};
+use binius_hash_prover::ParallelHashSuite;
+use binius_iop_prover::{basefold::compiler::BaseFoldProverCompiler, channel::IOPProverChannel};
+use binius_ip_prover::{
+	channel::IPProverChannel,
+	sumcheck::{quadratic_mlecheck_prover, zk_mlecheck},
+};
+use binius_math::{
+	FieldBuffer, FieldSlice, FieldVec,
+	inner_product::inner_product_buffers,
+	multilinear::eq::eq_ind_partial_eval,
+	ntt::{NeighborsLastMultiThread, domain_context::GaoMateerPreExpanded},
+	univariate::evaluate_univariate,
+};
+use binius_spartan_frontend::constraint_system::{
+	MulConstraint, Witness, WitnessIndex, WitnessSegment,
+};
+use binius_spartan_verifier::{
+	Verifier,
+	constraint_system::{BlindingInfo, ConstraintSystemPadded},
+	wiring::evaluate_wiring_mle_public,
+};
+use binius_transcript::{ProverTranscript, fiat_shamir::Challenger};
+use binius_utils::{SerializeBytes, checked_arithmetics::checked_log_2, rayon::prelude::*};
+use digest::Output;
+pub use error::*;
+use itertools::chain;
+use rand::CryptoRng;
+
+use crate::wiring::{WiringTranspose, fold_constraints};
+
+type ProverNTT<F> = NeighborsLastMultiThread<GaoMateerPreExpanded<F>>;
+
+/// IOP prover for a particular constraint system.
+///
+/// This struct encapsulates the constraint system and pre-computed wiring transpose,
+/// providing the core proving logic independent of the specific IOP compilation strategy.
+/// Most users should use [`Prover`] instead, which wraps this with a BaseFold compiler.
+#[derive(Debug)]
+pub struct IOPProver<F: Field> {
+	constraint_system: ConstraintSystemPadded<F>,
+	precommit_wiring_transpose: WiringTranspose,
+	private_wiring_transpose: WiringTranspose,
+}
+
+/// Struct for proving instances of a particular constraint system.
+///
+/// The [`Self::setup`] constructor pre-processes reusable structures for proving instances of the
+/// given constraint system. Then [`Self::prove`] is called one or more times with individual
+/// instances.
+pub struct Prover<P, H>
+where
+	P: PackedField<Scalar: BinaryField>,
+	H: ParallelHashSuite,
+{
+	iop_prover: IOPProver<P::Scalar>,
+	basefold_compiler: BaseFoldProverCompiler<P, ProverNTT<P::Scalar>>,
+	/// The pool that recycles this prover's working buffers. It lives for the prover's lifetime,
+	/// so blocks freed by one `prove` call are reused by the next.
+	pool: BufferPool,
+	/// The prover creates its Merkle transcript channels with the hash suite `H`.
+	_hash_marker: PhantomData<H>,
+}
+
+impl<F: Field> IOPProver<F> {
+	/// Constructs an IOP prover for a constraint system.
+	pub fn new(constraint_system: ConstraintSystemPadded<F>) -> Self {
+		let precommit_wiring_transpose = WiringTranspose::transpose(
+			WitnessSegment::Precommit,
+			constraint_system.precommit_size(),
+			constraint_system.mul_constraints(),
+		);
+		let private_wiring_transpose = WiringTranspose::transpose(
+			WitnessSegment::Private,
+			constraint_system.private_size(),
+			constraint_system.mul_constraints(),
+		);
+		Self {
+			constraint_system,
+			precommit_wiring_transpose,
+			private_wiring_transpose,
+		}
+	}
+
+	pub const fn constraint_system(&self) -> &ConstraintSystemPadded<F> {
+		&self.constraint_system
+	}
+
+	/// Packs and commits the precommit segment of a witness on the channel.
+	///
+	/// This must be called before [`Self::prove`], and the returned oracle handle and packed
+	/// buffer must be passed into `prove`. Callers that wrap the IOP (e.g. the ZK wrapper) can
+	/// invoke this separately so the precommit oracle handle is available before the rest of
+	/// the protocol runs.
+	pub fn commit_precommit<P, Channel, A>(
+		&self,
+		witness: &Witness<F>,
+		rng: &mut impl CryptoRng,
+		channel: &mut Channel,
+		alloc: &A,
+	) -> (Channel::Oracle, FieldVec<P, A>)
+	where
+		F: BinaryField,
+		P: PackedField<Scalar = F>,
+		Channel: IOPProverChannel<P, A>,
+		A: Allocator,
+	{
+		let cs = &self.constraint_system;
+		let precommit_blinding = *cs.blinding_info();
+		let precommit_packed = pack_and_blind_witness::<_, _, P>(
+			alloc,
+			cs.log_precommit() as usize,
+			witness.precommit(),
+			cs.n_precommit() as usize,
+			&precommit_blinding,
+			rng,
+		);
+		let precommit_oracle = channel.send_oracle(precommit_packed.as_view());
+		(precommit_oracle, precommit_packed)
+	}
+
+	/// Proves using an IOP channel interface.
+	///
+	/// This is the core proving logic, independent of the specific IOP compilation strategy.
+	/// For most users, [`Prover::prove`] is the simpler interface.
+	///
+	/// # Arguments
+	///
+	/// * `witness` - The witness values for the constraint system
+	/// * `precommit_oracle` - Oracle handle obtained from [`Self::commit_precommit`]
+	/// * `precommit_packed` - Packed precommit buffer obtained from [`Self::commit_precommit`]
+	/// * `rng` - Random number generator for blinding
+	/// * `channel` - The IOP prover channel (public input must be observed on transcript before
+	///   creating the channel; the precommit oracle must already have been committed on it via
+	///   [`Self::commit_precommit`])
+	pub fn prove<P, Channel, A>(
+		&self,
+		witness: &Witness<F>,
+		precommit_oracle: Channel::Oracle,
+		precommit_packed: FieldVec<P, A>,
+		mut rng: impl CryptoRng,
+		channel: &mut Channel,
+		alloc: &A,
+	) -> Result<(), Error>
+	where
+		F: BinaryField,
+		P: PackedField<Scalar = F>,
+		Channel: IOPProverChannel<P, A>,
+		A: Allocator,
+	{
+		let _prove_guard =
+			tracing::info_span!("Prove", operation = "prove", perfetto_category = "operation")
+				.entered();
+
+		let cs = &self.constraint_system;
+
+		// Check that the witness segments have the expected sizes
+		let expected_public_size = 1 << cs.log_public() as usize;
+		let expected_precommit_size = cs.precommit_size();
+		let expected_private_size = cs.private_size();
+		if witness.public().len() != expected_public_size {
+			return Err(Error::ArgumentError {
+				arg: "witness".to_string(),
+				msg: format!(
+					"public segment has {} elements, expected {}",
+					witness.public().len(),
+					expected_public_size
+				),
+			});
+		}
+		if witness.precommit().len() != expected_precommit_size {
+			return Err(Error::ArgumentError {
+				arg: "witness".to_string(),
+				msg: format!(
+					"precommit segment has {} elements, expected {}",
+					witness.precommit().len(),
+					expected_precommit_size
+				),
+			});
+		}
+		if witness.private().len() != expected_private_size {
+			return Err(Error::ArgumentError {
+				arg: "witness".to_string(),
+				msg: format!(
+					"private segment has {} elements, expected {}",
+					witness.private().len(),
+					expected_private_size
+				),
+			});
+		}
+
+		let log_mul_constraints = checked_log_2(cs.mul_constraints().len());
+
+		// Create mask buffer for the ZK mulcheck mask polynomial.
+		let (m_n, m_d) = cs.mask_dims();
+		let mask_degree = 2; // quadratic composition
+		let log_masks_buffer_size = m_n + m_d;
+
+		let masks_buffer = {
+			// Growing a pooled buffer past the block it was handed would reallocate and free that
+			// block at the element's alignment rather than the pool's, so the fill below takes
+			// exactly the allocated count.
+			let packed_len = 1 << log_masks_buffer_size.saturating_sub(P::LOG_WIDTH);
+			let mut values = alloc.alloc::<P>(packed_len);
+			values.extend(repeat_with(|| P::random(&mut rng)).take(packed_len));
+			FieldBuffer::new(log_masks_buffer_size, values)
+		};
+
+		let mulcheck_mask =
+			zk_mlecheck::Mask::new(log_mul_constraints, mask_degree, masks_buffer.as_view());
+
+		// Pack private witness into field elements and add blinding
+		let blinding_info = cs.blinding_info();
+		let private_packed = pack_and_blind_witness::<_, _, P>(
+			alloc,
+			cs.log_private() as usize,
+			witness.private(),
+			cs.n_private() as usize,
+			blinding_info,
+			&mut rng,
+		);
+
+		// Send the private and mask oracles to the channel. The precommit oracle was committed
+		// by the caller via `commit_precommit` and passed in as `precommit_oracle`.
+		let private_oracle = channel.send_oracle(private_packed.as_view());
+		let mask_oracle = channel.send_oracle(masks_buffer.as_view());
+
+		// Prove the multiplication constraints
+		let (mulcheck_evals, mask_eval, r_x) = prove_mulcheck::<F, P, _, _>(
+			cs.mul_constraints(),
+			witness.public(),
+			precommit_packed.as_view(),
+			private_packed.as_view(),
+			mulcheck_mask,
+			&mut *channel,
+			alloc,
+		);
+
+		// λ is the batching challenge for the constraint operands
+		let lambda = channel.sample();
+
+		// Batch together the constraint operand evaluation claims.
+		let batched_sum = evaluate_univariate(&mulcheck_evals, &lambda);
+
+		// Compute eq indicator tensor for r_x (shared across all segment evaluations)
+		let r_x_tensor = eq_ind_partial_eval::<F>(&r_x);
+
+		// Compute rₓ^⊤ (M_A + λ M_B + λ² M_C) x
+		let public_eval = evaluate_wiring_mle_public(
+			cs.mul_constraints(),
+			witness.public(),
+			&lambda,
+			r_x_tensor.as_ref(),
+		);
+
+		// Compute the precommit segment's contribution to the wiring check.
+		// The prover sends this as a scalar; the oracle relation then verifies it.
+		let precommit_wiring_poly =
+			fold_constraints(alloc, &self.precommit_wiring_transpose, lambda, r_x_tensor.as_ref());
+		let precommit_claim = inner_product_buffers(&precommit_packed, &precommit_wiring_poly);
+		channel.send_one(precommit_claim);
+
+		let private_claim = batched_sum - public_eval - precommit_claim;
+
+		// Fold private wiring constraints
+		let private_wiring_poly =
+			fold_constraints(alloc, &self.private_wiring_transpose, lambda, r_x_tensor.as_ref());
+
+		// Compute the mask folding polynomial (libra_eval tensor)
+		let n_vars = r_x.len();
+		let libra_eval_tensor =
+			zk_mlecheck::expand_libra_eval::<A, P>(alloc, &r_x, n_vars, mask_degree, m_n, m_d);
+
+		// Prove all oracle relations, handing the channel each committed buffer for the combined
+		// opening.
+		channel.prove_oracle_relation(
+			precommit_oracle.clone(),
+			precommit_wiring_poly,
+			precommit_claim,
+		);
+		channel.finalize_oracle(precommit_oracle, precommit_packed);
+		channel.prove_oracle_relation(private_oracle.clone(), private_wiring_poly, private_claim);
+		channel.finalize_oracle(private_oracle, private_packed);
+		channel.prove_oracle_relation(mask_oracle.clone(), libra_eval_tensor, mask_eval);
+		channel.finalize_oracle(mask_oracle, masks_buffer);
+
+		Ok(())
+	}
+}
+
+impl<F, P, H> Prover<P, H>
+where
+	F: BinaryField,
+	P: PackedField<Scalar = F>,
+	H: ParallelHashSuite,
+	Output<H::LeafHash>: SerializeBytes,
+{
+	/// Constructs a prover corresponding to a constraint system verifier.
+	///
+	/// See [`Prover`] struct documentation for details.
+	pub fn setup(verifier: &Verifier<F, H>) -> Result<Self, Error> {
+		let log_num_shares = binius_utils::rayon::current_num_threads().ilog2() as usize;
+
+		// Rebuild the verifier's evaluation domain, which its compiler fixed as the Gao-Mateer
+		// basis of that dimension.
+		let domain_context =
+			GaoMateerPreExpanded::generate(verifier.iop_compiler().max_log_domain_size());
+		let ntt = NeighborsLastMultiThread::new(domain_context, log_num_shares);
+
+		// Create the BaseFold ZK compiler from verifier compiler (reuses oracle_specs and
+		// fri_params)
+		let basefold_compiler =
+			BaseFoldProverCompiler::from_verifier_compiler(verifier.iop_compiler(), ntt);
+
+		let iop_prover = IOPProver::new(verifier.constraint_system().clone());
+
+		Ok(Prover {
+			iop_prover,
+			basefold_compiler,
+			pool: BufferPool::new(),
+			_hash_marker: PhantomData,
+		})
+	}
+
+	/// Returns a reference to the IOP prover.
+	pub const fn iop_prover(&self) -> &IOPProver<P::Scalar> {
+		&self.iop_prover
+	}
+
+	/// Returns a reference to the BaseFold ZK prover compiler.
+	pub const fn iop_compiler(&self) -> &BaseFoldProverCompiler<P, ProverNTT<F>> {
+		&self.basefold_compiler
+	}
+
+	/// Generates a proof for a witness against the constraint system.
+	///
+	/// # Arguments
+	///
+	/// * `witness` - The witness values for the constraint system
+	/// * `rng` - Random number generator for blinding
+	/// * `transcript` - The prover transcript for Fiat-Shamir
+	///
+	/// # Preconditions
+	///
+	/// * The witness length must match the constraint system size
+	pub fn prove<Challenger_: Challenger>(
+		&self,
+		witness: &Witness<F>,
+		mut rng: impl CryptoRng,
+		transcript: &mut ProverTranscript<Challenger_>,
+	) -> Result<(), Error> {
+		// Prover observes the public input (includes it in Fiat-Shamir).
+		let public = witness.public();
+		transcript.observe().write_slice(public);
+
+		// Working buffers for this proof are drawn from the prover's pool, recycling blocks freed
+		// by earlier proofs. The channel gets the same pool, so the Merkle trees it commits draw
+		// their nodes from it too.
+		let alloc = &self.pool;
+		// Create ZK channel (owns the RNG for mask generation), commit the precommit oracle,
+		// and delegate to the IOP prover.
+		let mut channel = self
+			.basefold_compiler
+			.create_channel_from_transcript::<H, Challenger_, _, _>(transcript, &mut rng, alloc);
+		let (precommit_oracle, precommit_packed) =
+			self.iop_prover
+				.commit_precommit::<P, _, _>(witness, &mut rng, &mut channel, &alloc);
+		// The IOP prover only queues the oracle relations; `finish` runs the single combined
+		// opening.
+		self.iop_prover.prove::<P, _, _>(
+			witness,
+			precommit_oracle,
+			precommit_packed,
+			rng,
+			&mut channel,
+			&alloc,
+		)?;
+		channel.finish();
+		Ok(())
+	}
+}
+
+fn prove_mulcheck<F, P, Channel, A>(
+	mul_constraints: &[MulConstraint<WitnessIndex>],
+	public: &[F],
+	precommit_packed: FieldSlice<'_, P>,
+	private_packed: FieldSlice<'_, P>,
+	mask: zk_mlecheck::Mask<P, impl Deref<Target = [P]>>,
+	channel: &mut Channel,
+	alloc: &A,
+) -> ([F; 3], F, Vec<F>)
+where
+	F: BinaryField,
+	P: PackedField<Scalar = F>,
+	Channel: IPProverChannel<F>,
+	A: Allocator,
+{
+	let mulcheck_witness = wiring::build_mulcheck_witness(
+		alloc,
+		mul_constraints,
+		public,
+		precommit_packed,
+		private_packed,
+	);
+
+	// Sample random evaluation point for mulcheck
+	let r_mulcheck = channel.sample_many(mask.n_vars());
+
+	// Prove the mul-gate zerocheck a * b - c = 0 over the shared store.
+	let mlecheck_prover = quadratic_mlecheck_prover(
+		alloc,
+		[mulcheck_witness.a, mulcheck_witness.b, mulcheck_witness.c],
+		|[a, b, c]| a * b - c, // composition
+		|[a, b, _c]| a * b,    // infinity_composition (quadratic term only)
+		r_mulcheck,
+		F::ZERO, // eval_claim: zerocheck
+	);
+
+	// Run the ZK MLE-check protocol
+	let mlecheck_output = zk_mlecheck::prove(mlecheck_prover, mask, channel);
+
+	// Extract the reduced evaluation point and multilinear evaluations
+	let mut r_x = mlecheck_output.challenges;
+	r_x.reverse(); // Match verifier's order
+
+	let [a_eval, b_eval, c_eval]: [F; 3] = mlecheck_output
+		.multilinear_evals
+		.try_into()
+		.expect("mlecheck returns 3 evaluations");
+
+	// Write the multilinear evaluations to channel
+	channel.send_many(&[a_eval, b_eval, c_eval]);
+
+	let mulcheck_evals = [a_eval, b_eval, c_eval];
+	let mask_eval = mlecheck_output.mask_eval;
+
+	(mulcheck_evals, mask_eval, r_x)
+}
+
+/// Packs witness values into a [`FieldBuffer`] and adds blinding values for dummy wires.
+fn pack_and_blind_witness<A: Allocator, F: Field, P: PackedField<Scalar = F>>(
+	alloc: &A,
+	log_private: usize,
+	private: &[F],
+	n_private: usize,
+	blinding_info: &BlindingInfo,
+	mut rng: impl CryptoRng,
+) -> FieldVec<P, A> {
+	// Growing a pooled buffer past the block it was handed would reallocate and free that block at
+	// the element's alignment rather than the pool's, so the fill below must fit exactly.
+	let packed_len = 1 << log_private.saturating_sub(P::LOG_WIDTH);
+	let mut packed = alloc.alloc::<P>(packed_len);
+	if log_private < P::LOG_WIDTH {
+		// The whole segment lives in one packed element's low lanes.
+		debug_assert_eq!(packed_len, 1);
+		let elems_iter = private.iter().copied();
+		let zeros_iter = repeat_n(F::ZERO, (1 << log_private) - private.len());
+
+		packed.push(P::from_scalars(chain!(elems_iter, zeros_iter)));
+	} else {
+		// Zero the block once, then overwrite the prefix holding real scalars. The zip stops at the
+		// last real chunk, so the zero tail is the padding the buffer wants anyway. Collecting into
+		// a `Vec` first and copying that in would cost a second allocation and a full memcpy — the
+		// very thing pooling is here to remove.
+		debug_assert!(private.len() <= 1 << log_private);
+		packed.resize(packed_len, P::zero());
+		private
+			.par_chunks(P::WIDTH)
+			.zip(packed.par_iter_mut())
+			.for_each(|(chunk, out)| *out = P::from_scalars(chunk.iter().copied()));
+	}
+
+	let mut buffer = FieldBuffer::new(log_private, packed);
+
+	// Add blinding values after the actual private wires
+	// Set random values for non-constraint dummy wires
+	for i in 0..blinding_info.n_dummy_wires {
+		buffer.set(n_private + i, F::random(&mut rng));
+	}
+
+	// Set random values for dummy constraint wires (A * B = C)
+	let constraint_wire_base = n_private + blinding_info.n_dummy_wires;
+	for i in 0..blinding_info.n_dummy_constraints {
+		let a = F::random(&mut rng);
+		let b = F::random(&mut rng);
+		let c = a * b;
+
+		buffer.set(constraint_wire_base + 3 * i, a);
+		buffer.set(constraint_wire_base + 3 * i + 1, b);
+		buffer.set(constraint_wire_base + 3 * i + 2, c);
+	}
+
+	buffer
+}

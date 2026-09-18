@@ -1,0 +1,41 @@
+[package]
+name = "binius-spartan-prover"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+binius-compute = { path = "../compute" }
+binius-core = { path = "../core" }
+binius-field = { path = "../field" }
+binius-hash = { path = "../hash" }
+binius-hash-prover = { path = "../hash-prover" }
+binius-iop = { path = "../iop" }
+binius-iop-prover = { path = "../iop-prover", default-features = false }
+binius-ip = { path = "../ip" }
+binius-ip-prover = { path = "../ip-prover", default-features = false }
+binius-math = { path = "../math" }
+binius-transcript = { path = "../transcript" }
+binius-spartan-frontend = { path = "../spartan-frontend" }
+binius-spartan-verifier = { path = "../spartan-verifier" }
+binius-utils = { path = "../utils" }
+digest.workspace = true
+itertools.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+binius-hash = { path = "../hash" }
+binius-iop = { path = "../iop" }
+binius-ip = { path = "../ip" }
+binius-math = { path = "../math", features = ["test-utils"] }
+binius-spartan-verifier = { path = "../spartan-verifier" }
+rand = { workspace = true, features = ["thread_rng"] }
+smallvec.workspace = true
+
+[features]
+default = []

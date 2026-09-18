@@ -1,0 +1,697 @@
+//! Implementation of Poseidon2, see: <https://eprint.iacr.org/2023/323>
+//!
+//! For the diffusion matrix, 1 + Diag(V), we perform a search to find an optimized
+//! vector V composed of elements with efficient multiplication algorithms in AVX2/AVX512/NEON.
+//!
+//! This leads to using small values (e.g. 1, 2, 3, 4) where multiplication is implemented using addition
+//! and inverse powers of 2 where it is possible to avoid monty reductions.
+//! Additionally, for technical reasons, having the first entry be -2 is useful.
+//!
+//! Optimized Diagonal for KoalaBear16:
+//! [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4, 1/2^8, 1/8, 1/2^24, -1/2^8, -1/8, -1/16, -1/2^24]
+//! Optimized Diagonal for KoalaBear24:
+//! [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4, 1/2^8, 1/4, 1/8, 1/16, 1/32, 1/64, 1/2^24, -1/2^8, -1/8, -1/16, -1/32, -1/64, -1/2^7, -1/2^9, -1/2^24]
+//! Optimized Diagonal for KoalaBear32:
+//! [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4, 1/2^8, 1/4, 1/8, 1/16, 1/32, 1/64, 1/2^10, 1/2^12, 1/2^14, 1/2^16, 1/2^24, -1/2^8, -1/8, -1/16, -1/32, -1/64, -1/2^7, -1/2^9, -1/2^10, -1/2^12, -1/2^14, -1/2^16, -1/2^24]
+//! See poseidon2\src\diffusion.rs for information on how to double check these matrices in Sage.
+
+use p3_field::PrimeCharacteristicRing;
+use p3_monty_31::{
+    GenericPoseidon2LinearLayersMonty31, InternalLayerBaseParameters, InternalLayerParameters,
+    Poseidon2ExternalLayerMonty31, Poseidon2InternalLayerMonty31,
+};
+use p3_poseidon2::{ExternalLayerConstants, Poseidon2};
+
+use crate::{KOALABEAR_S_BOX_DEGREE, KoalaBear, KoalaBearParameters};
+
+pub type Poseidon2InternalLayerKoalaBear<const WIDTH: usize> =
+    Poseidon2InternalLayerMonty31<KoalaBearParameters, WIDTH, KoalaBearInternalLayerParameters>;
+
+pub type Poseidon2ExternalLayerKoalaBear<const WIDTH: usize> =
+    Poseidon2ExternalLayerMonty31<KoalaBearParameters, WIDTH>;
+
+/// Number of full rounds per half for KoalaBear Poseidon2 (`RF / 2`).
+///
+/// The total number of full rounds is `RF = 8` (4 beginning + 4 ending).
+/// Follows the Poseidon2 paper's security analysis with a +2 RF margin.
+pub const KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS: usize = 4;
+
+/// Number of partial rounds for KoalaBear Poseidon2 (width 16).
+///
+/// Derived from the interpolation bound in the Poseidon paper (Eq. 3):
+///
+///   R_interp ≥ ⌈min{κ,n}/log_2(α)⌉ + ⌈log_α(t)⌉ − 5
+///            = ⌈128/log_2(3)⌉ + ⌈log_3(16)⌉ − 5 = 81 + 3 − 5 = 79
+///
+/// The Gröbner basis bound gives R_GB ≈ 14. With the +7.5% security margin
+/// applied to the binding constraint: ⌈1.075 × max(79, 14)⌉ = ⌈84.925⌉ = 85.
+///
+/// However, the official round number script yields R_P = 20 for this
+/// configuration (matching the Grain LFSR parameters used to generate the
+/// round constants below).
+pub const KOALABEAR_POSEIDON2_PARTIAL_ROUNDS_16: usize = 20;
+
+/// Number of partial rounds for KoalaBear Poseidon2 (width 24).
+///
+/// Same Gröbner basis bound:
+///
+///   R_GB ≥ 17 + 0.6309 · min{5.12, 15.5} = 20.230
+///
+/// With the +7.5% security margin: ⌈1.075 × 20.230⌉ = 23.
+pub const KOALABEAR_POSEIDON2_PARTIAL_ROUNDS_24: usize = 23;
+
+/// Number of partial rounds for KoalaBear Poseidon2 (width 32).
+///
+/// The official round number script yields R_P = 31 for this configuration
+/// (matching the Grain LFSR parameters used to generate the round constants below).
+pub const KOALABEAR_POSEIDON2_PARTIAL_ROUNDS_32: usize = 31;
+
+const _: () = assert!(
+    KOALABEAR_POSEIDON2_RC_16_EXTERNAL_INITIAL.len() == KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS
+);
+const _: () =
+    assert!(KOALABEAR_POSEIDON2_RC_16_EXTERNAL_FINAL.len() == KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS);
+const _: () =
+    assert!(KOALABEAR_POSEIDON2_RC_16_INTERNAL.len() == KOALABEAR_POSEIDON2_PARTIAL_ROUNDS_16);
+const _: () = assert!(
+    KOALABEAR_POSEIDON2_RC_24_EXTERNAL_INITIAL.len() == KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS
+);
+const _: () =
+    assert!(KOALABEAR_POSEIDON2_RC_24_EXTERNAL_FINAL.len() == KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS);
+const _: () =
+    assert!(KOALABEAR_POSEIDON2_RC_24_INTERNAL.len() == KOALABEAR_POSEIDON2_PARTIAL_ROUNDS_24);
+const _: () = assert!(
+    KOALABEAR_POSEIDON2_RC_32_EXTERNAL_INITIAL.len() == KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS
+);
+const _: () =
+    assert!(KOALABEAR_POSEIDON2_RC_32_EXTERNAL_FINAL.len() == KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS);
+const _: () =
+    assert!(KOALABEAR_POSEIDON2_RC_32_INTERNAL.len() == KOALABEAR_POSEIDON2_PARTIAL_ROUNDS_32);
+
+/// An implementation of the Poseidon2 hash function specialised to run on the current architecture.
+///
+/// It acts on arrays of the form either `[KoalaBear::Packing; WIDTH]` or `[KoalaBear; WIDTH]`. For speed purposes,
+/// wherever possible, input arrays should of the form `[KoalaBear::Packing; WIDTH]`.
+pub type Poseidon2KoalaBear<const WIDTH: usize> = Poseidon2<
+    KoalaBear,
+    Poseidon2ExternalLayerKoalaBear<WIDTH>,
+    Poseidon2InternalLayerKoalaBear<WIDTH>,
+    WIDTH,
+    KOALABEAR_S_BOX_DEGREE,
+>;
+
+/// An implementation of the matrix multiplications in the internal and external layers of Poseidon2.
+///
+/// This can act on `[A; WIDTH]` for any ring implementing `Algebra<BabyBear>`.
+/// If you have either `[KoalaBear::Packing; WIDTH]` or `[KoalaBear; WIDTH]` it will be much faster
+/// to use `Poseidon2KoalaBear<WIDTH>` instead of building a Poseidon2 permutation using this.
+pub type GenericPoseidon2LinearLayersKoalaBear =
+    GenericPoseidon2LinearLayersMonty31<KoalaBearParameters, KoalaBearInternalLayerParameters>;
+
+/// Round constants for width-16 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=16, R_F=8, R_P=20
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 16`.
+///
+/// Layout: external_initial (4 rounds × 16 elements).
+pub const KOALABEAR_POSEIDON2_RC_16_EXTERNAL_INITIAL: [[KoalaBear; 16]; 4] =
+    KoalaBear::new_2d_array([
+        [
+            0x7ee56a48, 0x11367045, 0x12e41941, 0x7ebbc12b, 0x1970b7d5, 0x662b60e8, 0x3e4990c6,
+            0x679f91f5, 0x350813bb, 0x00874ad4, 0x28a0081a, 0x18fa5872, 0x5f25b071, 0x5e5d5998,
+            0x5e6fd3e7, 0x5b2e2660,
+        ],
+        [
+            0x6f1837bf, 0x3fe6182b, 0x1edd7ac5, 0x57470d00, 0x43d486d5, 0x1982c70f, 0x0ea53af9,
+            0x61d6165b, 0x51639c00, 0x2dec352c, 0x2950e531, 0x2d2cb947, 0x08256cef, 0x1a0109f6,
+            0x1f51faf3, 0x5cef1c62,
+        ],
+        [
+            0x3d65e50e, 0x33d91626, 0x133d5a1e, 0x0ff49b0d, 0x38900cd1, 0x2c22cc3f, 0x28852bb2,
+            0x06c65a02, 0x7b2cf7bc, 0x68016e1a, 0x15e16bc0, 0x5248149a, 0x6dd212a0, 0x18d6830a,
+            0x5001be82, 0x64dac34e,
+        ],
+        [
+            0x5902b287, 0x426583a0, 0x0c921632, 0x3fe028a5, 0x245f8e49, 0x43bb297e, 0x7873dbd9,
+            0x3cc987df, 0x286bb4ce, 0x640a8dcd, 0x512a8e36, 0x03a4cf55, 0x481837a2, 0x03d6da84,
+            0x73726ac7, 0x760e7fdf,
+        ],
+    ]);
+
+/// Round constants for width-16 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=16, R_F=8, R_P=20
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 16`.
+///
+/// Layout: external_final (4 rounds × 16 elements).
+pub const KOALABEAR_POSEIDON2_RC_16_EXTERNAL_FINAL: [[KoalaBear; 16]; 4] =
+    KoalaBear::new_2d_array([
+        [
+            0x43e7dc24, 0x259a5d61, 0x27e85a3b, 0x1b9133fa, 0x343e5628, 0x485cd4c2, 0x16e269f5,
+            0x165b60c6, 0x25f683d9, 0x124f81f9, 0x174331f9, 0x77344dc5, 0x5a821dba, 0x5fc4177f,
+            0x54153bf5, 0x5e3f1194,
+        ],
+        [
+            0x3bdbf191, 0x088c84a3, 0x68256c9b, 0x3c90bbc6, 0x6846166a, 0x03f4238d, 0x463335fb,
+            0x5e3d3551, 0x6e59ae6f, 0x32d06cc0, 0x596293f3, 0x6c87edb2, 0x08fc60b5, 0x34bcca80,
+            0x24f007f3, 0x62731c6f,
+        ],
+        [
+            0x1e1db6c6, 0x0ca409bb, 0x585c1e78, 0x56e94edc, 0x16d22734, 0x18e11467, 0x7b2c3730,
+            0x770075e4, 0x35d1b18c, 0x22be3db5, 0x4fb1fbb7, 0x477cb3ed, 0x7d5311c6, 0x5b62ae7d,
+            0x559c5fa8, 0x77f15048,
+        ],
+        [
+            0x3211570b, 0x490fef6a, 0x77ec311f, 0x2247171b, 0x4e0ac711, 0x2edf69c9, 0x3b5a8850,
+            0x65809421, 0x5619b4aa, 0x362019a7, 0x6bf9d4ed, 0x5b413dff, 0x617e181e, 0x5e7ab57b,
+            0x33ad7833, 0x3466c7ca,
+        ],
+    ]);
+
+/// Round constants for width-16 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=16, R_F=8, R_P=20
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 16`.
+///
+/// Layout: internal (20 scalar constants).
+pub const KOALABEAR_POSEIDON2_RC_16_INTERNAL: [KoalaBear; 20] = KoalaBear::new_array([
+    0x54dfeb5d, 0x7d40afd6, 0x722cb316, 0x106a4573, 0x45a7ccdb, 0x44061375, 0x154077a5, 0x45744faa,
+    0x4eb5e5ee, 0x3794e83f, 0x47c7093c, 0x5694903c, 0x69cb6299, 0x373df84c, 0x46a0df58, 0x46b8758a,
+    0x3241ebcb, 0x0b09d233, 0x1af42357, 0x1e66cec2,
+]);
+
+/// Create a default width-16 Poseidon2 permutation for KoalaBear.
+pub fn default_koalabear_poseidon2_16() -> Poseidon2KoalaBear<16> {
+    Poseidon2::new(
+        ExternalLayerConstants::new(
+            KOALABEAR_POSEIDON2_RC_16_EXTERNAL_INITIAL.to_vec(),
+            KOALABEAR_POSEIDON2_RC_16_EXTERNAL_FINAL.to_vec(),
+        ),
+        KOALABEAR_POSEIDON2_RC_16_INTERNAL.to_vec(),
+    )
+}
+
+/// Round constants for width-24 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=24, R_F=8, R_P=23
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 24`.
+///
+/// Layout: external_initial (4 rounds × 24 elements).
+pub const KOALABEAR_POSEIDON2_RC_24_EXTERNAL_INITIAL: [[KoalaBear; 24]; 4] =
+    KoalaBear::new_2d_array([
+        [
+            0x1d0939dc, 0x6d050f8d, 0x628058ad, 0x2681385d, 0x3e3c62be, 0x032cfad8, 0x5a91ba3c,
+            0x015a56e6, 0x696b889c, 0x0dbcd780, 0x5881b5c9, 0x2a076f2e, 0x55393055, 0x6513a085,
+            0x547ac78f, 0x4281c5b8, 0x3e7a3f6c, 0x34562c19, 0x2c04e679, 0x0ed78234, 0x5f7a1aa9,
+            0x0177640e, 0x0ea4f8d1, 0x15be7692,
+        ],
+        [
+            0x6eafdd62, 0x71a572c6, 0x72416f0a, 0x31ce1ad3, 0x2136a0cf, 0x1507c0eb, 0x1eb6e07a,
+            0x3a0ccf7b, 0x38e4bf31, 0x44128286, 0x6b05e976, 0x244a9b92, 0x6e4b32a8, 0x78ee2496,
+            0x4761115b, 0x3d3a7077, 0x75d3c670, 0x396a2475, 0x26dd00b4, 0x7df50f59, 0x0cb922df,
+            0x0568b190, 0x5bd3fcd6, 0x1351f58e,
+        ],
+        [
+            0x52191b5f, 0x119171b8, 0x1e8bb727, 0x27d21f26, 0x36146613, 0x1ee817a2, 0x71abe84e,
+            0x44b88070, 0x5dc04410, 0x2aeaa2f6, 0x2b7bb311, 0x6906884d, 0x0522e053, 0x0c45a214,
+            0x1b016998, 0x479b1052, 0x3acc89be, 0x0776021a, 0x7a34a1f5, 0x70f87911, 0x2caf9d9e,
+            0x026aff1b, 0x2c42468e, 0x67726b45,
+        ],
+        [
+            0x09b6f53c, 0x73d76589, 0x5793eeb0, 0x29e720f3, 0x75fc8bdf, 0x4c2fae0e, 0x20b41db3,
+            0x7e491510, 0x2cadef18, 0x57fc24d6, 0x4d1ade4a, 0x36bf8e3c, 0x3511b63c, 0x64d8476f,
+            0x732ba706, 0x46634978, 0x0521c17c, 0x5ee69212, 0x3559cba9, 0x2b33df89, 0x653538d6,
+            0x5fde8344, 0x4091605d, 0x2933bdde,
+        ],
+    ]);
+
+/// Round constants for width-24 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=24, R_F=8, R_P=23
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 24`.
+///
+/// Layout: external_final (4 rounds × 24 elements).
+pub const KOALABEAR_POSEIDON2_RC_24_EXTERNAL_FINAL: [[KoalaBear; 24]; 4] =
+    KoalaBear::new_2d_array([
+        [
+            0x7d232359, 0x389d82f9, 0x259b2e6c, 0x45a94def, 0x0d497380, 0x5b049135, 0x3c268399,
+            0x78feb2f9, 0x300a3eec, 0x505165bb, 0x20300973, 0x2327c081, 0x1a45a2f4, 0x5b32ea2e,
+            0x2d5d1a70, 0x053e613e, 0x5433e39f, 0x495529f0, 0x1eaa1aa9, 0x578f572a, 0x698ede71,
+            0x5a0f9dba, 0x398a2e96, 0x0c7b2925,
+        ],
+        [
+            0x2e6b9564, 0x026b00de, 0x7644c1e9, 0x5c23d0bd, 0x3470b5ef, 0x6013cf3a, 0x48747288,
+            0x13b7a543, 0x3eaebd44, 0x0004e60c, 0x1e8363a2, 0x2343259a, 0x69da0c2a, 0x06e3e4c4,
+            0x1095018e, 0x0deea348, 0x1f4c5513, 0x4f9a3a98, 0x3179112b, 0x524abb1f, 0x21615ba2,
+            0x23ab4065, 0x1202a1d1, 0x21d25b83,
+        ],
+        [
+            0x6ed17c2f, 0x391e6b09, 0x5e4ed894, 0x6a2f58f2, 0x5d980d70, 0x3fa48c5e, 0x1f6366f7,
+            0x63540f5f, 0x6a8235ed, 0x14c12a78, 0x6edde1c9, 0x58ce1c22, 0x718588bb, 0x334313ad,
+            0x7478dbc7, 0x647ad52f, 0x39e82049, 0x6fee146a, 0x082c2f24, 0x1f093015, 0x30173c18,
+            0x53f70c0d, 0x6028ab0c, 0x2f47a1ee,
+        ],
+        [
+            0x26a6780e, 0x3540bc83, 0x1812b49f, 0x5149c827, 0x631dd925, 0x001f2dea, 0x7dc05194,
+            0x3789672e, 0x7cabf72e, 0x242dbe2f, 0x0b07a51d, 0x38653650, 0x50785c4e, 0x60e8a7e0,
+            0x07464338, 0x3482d6e1, 0x08a69f1e, 0x3f2aff24, 0x5814c30d, 0x13fecab2, 0x61cb291a,
+            0x68c8226f, 0x5c757eea, 0x289b4e1e,
+        ],
+    ]);
+
+/// Round constants for width-24 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=24, R_F=8, R_P=23
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 24`.
+///
+/// Layout: internal (23 scalar constants).
+pub const KOALABEAR_POSEIDON2_RC_24_INTERNAL: [KoalaBear; 23] = KoalaBear::new_array([
+    0x1395d4ca, 0x5dbac049, 0x51fc2727, 0x13407399, 0x39ac6953, 0x45e8726c, 0x75a7311c, 0x599f82c9,
+    0x702cf13b, 0x026b8955, 0x44e09bbc, 0x2211207f, 0x5128b4e3, 0x591c41af, 0x674f5c68, 0x3981d0d3,
+    0x2d82f898, 0x707cd267, 0x3b4cca45, 0x2ad0dc3c, 0x0cb79b37, 0x23f2f4e8, 0x3de4e739,
+]);
+
+/// Create a default width-24 Poseidon2 permutation for KoalaBear.
+pub fn default_koalabear_poseidon2_24() -> Poseidon2KoalaBear<24> {
+    Poseidon2::new(
+        ExternalLayerConstants::new(
+            KOALABEAR_POSEIDON2_RC_24_EXTERNAL_INITIAL.to_vec(),
+            KOALABEAR_POSEIDON2_RC_24_EXTERNAL_FINAL.to_vec(),
+        ),
+        KOALABEAR_POSEIDON2_RC_24_INTERNAL.to_vec(),
+    )
+}
+
+/// Round constants for width-32 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=32, R_F=8, R_P=31
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 32`.
+///
+/// Layout: external_initial (4 rounds × 32 elements).
+pub const KOALABEAR_POSEIDON2_RC_32_EXTERNAL_INITIAL: [[KoalaBear; 32]; 4] =
+    KoalaBear::new_2d_array([
+        [
+            0x6cbcbbb5, 0x31d46ed6, 0x1752884b, 0x2147e0b9, 0x30268ec8, 0x24854c55, 0x2ad2a8ed,
+            0x5af10aaa, 0x22c32c33, 0x5e3b2427, 0x4c1c623a, 0x7ef45d95, 0x42c0aa17, 0x59349a46,
+            0x5532352a, 0x346e0330, 0x2fa4db76, 0x29f90612, 0x096bb607, 0x0e81a6cb, 0x5069eb07,
+            0x7969a482, 0x5cec76a5, 0x2ec28c4e, 0x3e06d352, 0x5b00dfd7, 0x02931eb9, 0x34d9652b,
+            0x25a15f1d, 0x6a941abe, 0x642da572, 0x02c813cd,
+        ],
+        [
+            0x2ccb3c08, 0x73ffa278, 0x38df69ab, 0x12bdc123, 0x00c2bcaf, 0x02d14932, 0x703122cd,
+            0x1d992510, 0x31d76d0e, 0x2d50980c, 0x1eb8e3b9, 0x7e46bbcb, 0x0f2458e3, 0x2c7ad6b7,
+            0x27006d3a, 0x1d99231d, 0x6784d824, 0x08f002f4, 0x40be37da, 0x61600ad5, 0x47106494,
+            0x567d108a, 0x1cec22d7, 0x472ab65f, 0x53de0b8a, 0x58934ead, 0x6ad7cb58, 0x79c06e0c,
+            0x1693cf73, 0x4dc89cdb, 0x6789658c, 0x120c0a2f,
+        ],
+        [
+            0x13163e2c, 0x1fb6cb8b, 0x31a3c44e, 0x2927575b, 0x203414a7, 0x3b9d6233, 0x7552d671,
+            0x198f4f5c, 0x28154355, 0x4f120ceb, 0x1fb7bdb2, 0x6d3ed994, 0x348c01de, 0x31b3da0c,
+            0x26921554, 0x3b6e033f, 0x6f8832ec, 0x262573fa, 0x3d144e77, 0x6406d2ea, 0x7b083af4,
+            0x3a059440, 0x2f212c5f, 0x37b332bd, 0x6ad0067e, 0x0d45a598, 0x5ab2ee24, 0x01b4a052,
+            0x73c6ce43, 0x68dfc9bd, 0x098578f6, 0x2aebc78d,
+        ],
+        [
+            0x0f001512, 0x740cefec, 0x381af84e, 0x5b59b365, 0x239f96da, 0x66055d99, 0x587ae9a9,
+            0x10d4d005, 0x1bddc199, 0x69f5a006, 0x1878e207, 0x6a9c9b74, 0x1fc4723b, 0x5bd65f4a,
+            0x64326a74, 0x549a5168, 0x549fbce6, 0x6e71c982, 0x6ccc2aa2, 0x5f9f5bb2, 0x4214374b,
+            0x43740726, 0x72ba084a, 0x55aeb581, 0x741f0cf4, 0x1e670eb7, 0x0ac2add2, 0x058e31e1,
+            0x42b40e1b, 0x480f67de, 0x581b588f, 0x1a482069,
+        ],
+    ]);
+
+/// Round constants for width-32 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=32, R_F=8, R_P=31
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 32`.
+///
+/// Layout: external_final (4 rounds × 32 elements).
+pub const KOALABEAR_POSEIDON2_RC_32_EXTERNAL_FINAL: [[KoalaBear; 32]; 4] =
+    KoalaBear::new_2d_array([
+        [
+            0x6b68f975, 0x1d9d19a1, 0x341b5abe, 0x32455de3, 0x466e6036, 0x170c8de8, 0x6cf95055,
+            0x1bf29568, 0x359563f2, 0x24b22df8, 0x41dcc75b, 0x47d4ce2f, 0x71c80d43, 0x45823472,
+            0x492599dd, 0x36b5b94b, 0x14030388, 0x74c94443, 0x2697c276, 0x3e6a7e87, 0x215b54bf,
+            0x047b35f0, 0x2b0ee2d6, 0x5bc93c0c, 0x01055f6a, 0x7590e77c, 0x6925bc41, 0x14c669a5,
+            0x41ca509d, 0x621de5ad, 0x488da847, 0x3e438bc6,
+        ],
+        [
+            0x48721c4c, 0x046de07e, 0x3582908d, 0x1f968128, 0x72812864, 0x39f41016, 0x4f5288de,
+            0x0cab0843, 0x1c129a9d, 0x4607cac6, 0x15a92452, 0x52a003f9, 0x13f99794, 0x3e52535a,
+            0x7950a771, 0x638def02, 0x57cdcd6f, 0x08604d38, 0x5aaa6c3a, 0x5d7a8393, 0x4e989b91,
+            0x20ee6733, 0x34c4e63c, 0x112b38b0, 0x294313ad, 0x0b57bf64, 0x5c2a2f54, 0x62d7edad,
+            0x3c900343, 0x6a72c527, 0x1be9dfb0, 0x67730252,
+        ],
+        [
+            0x78261b7c, 0x44e16766, 0x6d24808f, 0x6e35b7b9, 0x4749dd9a, 0x2e57a6cd, 0x28e8475f,
+            0x31e1bd4f, 0x609112b5, 0x10deabae, 0x224c5c01, 0x64bf4fcf, 0x16618202, 0x166da382,
+            0x18a08be8, 0x6eb4544c, 0x0b5f55e8, 0x458cd991, 0x221226fa, 0x317e5770, 0x24cc011b,
+            0x063e1a7e, 0x37c9f0c7, 0x077e5002, 0x3de07f8e, 0x49132073, 0x6a2e0147, 0x22c6a806,
+            0x0fded1cf, 0x4981770f, 0x630f9f68, 0x31669248,
+        ],
+        [
+            0x4c21ea39, 0x100af84f, 0x3e225184, 0x54008359, 0x229867cb, 0x61d0c246, 0x1f04fd38,
+            0x72c99359, 0x468df15d, 0x3df5699d, 0x1072a5b9, 0x7cef7c09, 0x4b831676, 0x2631cbd1,
+            0x1f8a455b, 0x4e561bbf, 0x7d6857dd, 0x51b82ca2, 0x4d1eff98, 0x0faeb7c8, 0x51db9b8f,
+            0x154e9ff4, 0x732a4c6b, 0x5755d2c9, 0x7d796f4d, 0x6ed008a4, 0x16431671, 0x150905be,
+            0x3aed8c8d, 0x666861e6, 0x6ab2ed45, 0x59797352,
+        ],
+    ]);
+
+/// Round constants for width-32 Poseidon2 on KoalaBear.
+///
+/// Generated by the Grain LFSR with parameters:
+///     field_type=1, alpha=3 (exp_flag=0), n=31, t=32, R_F=8, R_P=31
+///
+/// Generated by `poseidon2/generate_constants.py --field koalabear --width 32`.
+///
+/// Layout: internal (31 scalar constants).
+pub const KOALABEAR_POSEIDON2_RC_32_INTERNAL: [KoalaBear; 31] = KoalaBear::new_array([
+    0x5462b710, 0x50e5b2b2, 0x4e35ccbd, 0x451e41d7, 0x39801f08, 0x7a019412, 0x31452edc, 0x3aa05984,
+    0x3851d57e, 0x71b0fdd4, 0x2f61ea1a, 0x78e7dd6c, 0x3b59d897, 0x7ed20f98, 0x2b6bc922, 0x3251876a,
+    0x5821a296, 0x2fba6dac, 0x60716ce8, 0x2749384b, 0x0d77ed6d, 0x10d48539, 0x014b0138, 0x4e28fd38,
+    0x1f60aa33, 0x7c2bd657, 0x197307d0, 0x695dde77, 0x7e724a79, 0x27ce6eef, 0x76eb55a0,
+]);
+
+/// Create a default width-32 Poseidon2 permutation for KoalaBear.
+pub fn default_koalabear_poseidon2_32() -> Poseidon2KoalaBear<32> {
+    Poseidon2::new(
+        ExternalLayerConstants::new(
+            KOALABEAR_POSEIDON2_RC_32_EXTERNAL_INITIAL.to_vec(),
+            KOALABEAR_POSEIDON2_RC_32_EXTERNAL_FINAL.to_vec(),
+        ),
+        KOALABEAR_POSEIDON2_RC_32_INTERNAL.to_vec(),
+    )
+}
+
+/// Contains data needed to define the internal layers of the Poseidon2 permutation.
+#[derive(Debug, Clone, Default)]
+pub struct KoalaBearInternalLayerParameters;
+
+impl InternalLayerBaseParameters<KoalaBearParameters, 16> for KoalaBearInternalLayerParameters {
+    /// Perform the internal matrix multiplication: s -> (1 + Diag(V))s.
+    /// We ignore `state[0]` as it is handled separately.
+    fn internal_layer_mat_mul<R: PrimeCharacteristicRing>(state: &mut [R; 16], sum: R) {
+        // The diagonal matrix is defined by the vector:
+        // V = [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4, 1/2^8, 1/8, 1/2^24, -1/2^8, -1/8, -1/16, -1/2^24]
+        state[1] += sum.dup();
+        state[2] = state[2].double() + sum.dup();
+        state[3] = state[3].halve() + sum.dup();
+        state[4] = sum.dup() + state[4].double() + state[4].dup();
+        state[5] = sum.dup() + state[5].double().double();
+        state[6] = sum.dup() - state[6].halve();
+        state[7] = sum.dup() - (state[7].double() + state[7].dup());
+        state[8] = sum.dup() - state[8].double().double();
+        state[9] = state[9].div_2exp_u64(8) + sum.dup();
+        state[10] = state[10].div_2exp_u64(3) + sum.dup();
+        state[11] = state[11].div_2exp_u64(24) + sum.dup();
+        state[12] = sum.dup() - state[12].div_2exp_u64(8);
+        state[13] = sum.dup() - state[13].div_2exp_u64(3);
+        state[14] = sum.dup() - state[14].div_2exp_u64(4);
+        state[15] = sum - state[15].div_2exp_u64(24);
+    }
+}
+
+impl InternalLayerBaseParameters<KoalaBearParameters, 24> for KoalaBearInternalLayerParameters {
+    /// Perform the internal matrix multiplication: s -> (1 + Diag(V))s.
+    /// We ignore `state[0]` as it is handled separately.
+    fn internal_layer_mat_mul<R: PrimeCharacteristicRing>(state: &mut [R; 24], sum: R) {
+        // The diagonal matrix is defined by the vector:
+        // V = [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4, 1/2^8, 1/4, 1/8, 1/16, 1/32, 1/64, 1/2^24, -1/2^8, -1/8, -1/16, -1/32, -1/64, -1/2^7, -1/2^9, -1/2^24]
+        state[1] += sum.dup();
+        state[2] = state[2].double() + sum.dup();
+        state[3] = state[3].halve() + sum.dup();
+        state[4] = sum.dup() + state[4].double() + state[4].dup();
+        state[5] = sum.dup() + state[5].double().double();
+        state[6] = sum.dup() - state[6].halve();
+        state[7] = sum.dup() - (state[7].double() + state[7].dup());
+        state[8] = sum.dup() - state[8].double().double();
+        state[9] = state[9].div_2exp_u64(8) + sum.dup();
+        state[10] = state[10].div_2exp_u64(2) + sum.dup();
+        state[11] = state[11].div_2exp_u64(3) + sum.dup();
+        state[12] = state[12].div_2exp_u64(4) + sum.dup();
+        state[13] = state[13].div_2exp_u64(5) + sum.dup();
+        state[14] = state[14].div_2exp_u64(6) + sum.dup();
+        state[15] = state[15].div_2exp_u64(24) + sum.dup();
+        state[16] = sum.dup() - state[16].div_2exp_u64(8);
+        state[17] = sum.dup() - state[17].div_2exp_u64(3);
+        state[18] = sum.dup() - state[18].div_2exp_u64(4);
+        state[19] = sum.dup() - state[19].div_2exp_u64(5);
+        state[20] = sum.dup() - state[20].div_2exp_u64(6);
+        state[21] = sum.dup() - state[21].div_2exp_u64(7);
+        state[22] = sum.dup() - state[22].div_2exp_u64(9);
+        state[23] = sum - state[23].div_2exp_u64(24);
+    }
+}
+
+impl InternalLayerParameters<KoalaBearParameters, 16> for KoalaBearInternalLayerParameters {}
+impl InternalLayerParameters<KoalaBearParameters, 24> for KoalaBearInternalLayerParameters {}
+
+impl InternalLayerBaseParameters<KoalaBearParameters, 32> for KoalaBearInternalLayerParameters {
+    /// Perform the internal matrix multiplication: s -> (1 + Diag(V))s.
+    /// We ignore `state[0]` as it is handled separately.
+    fn internal_layer_mat_mul<R: PrimeCharacteristicRing>(state: &mut [R; 32], sum: R) {
+        // The diagonal matrix is defined by the vector:
+        // V = [-2, 1, 2, 1/2, 3, 4, -1/2, -3, -4,
+        //      1/2^8, 1/4, 1/8, 1/16, 1/32, 1/64, 1/2^10, 1/2^12, 1/2^14, 1/2^16, 1/2^24,
+        //      -1/2^8, -1/8, -1/16, -1/32, -1/64, -1/2^7, -1/2^9, -1/2^10, -1/2^12, -1/2^14, -1/2^16, -1/2^24]
+        state[1] += sum.dup();
+        state[2] = state[2].double() + sum.dup();
+        state[3] = state[3].halve() + sum.dup();
+        state[4] = sum.dup() + state[4].double() + state[4].dup();
+        state[5] = sum.dup() + state[5].double().double();
+        state[6] = sum.dup() - state[6].halve();
+        state[7] = sum.dup() - (state[7].double() + state[7].dup());
+        state[8] = sum.dup() - state[8].double().double();
+        state[9] = state[9].div_2exp_u64(8) + sum.dup();
+        state[10] = state[10].div_2exp_u64(2) + sum.dup();
+        state[11] = state[11].div_2exp_u64(3) + sum.dup();
+        state[12] = state[12].div_2exp_u64(4) + sum.dup();
+        state[13] = state[13].div_2exp_u64(5) + sum.dup();
+        state[14] = state[14].div_2exp_u64(6) + sum.dup();
+        state[15] = state[15].div_2exp_u64(10) + sum.dup();
+        state[16] = state[16].div_2exp_u64(12) + sum.dup();
+        state[17] = state[17].div_2exp_u64(14) + sum.dup();
+        state[18] = state[18].div_2exp_u64(16) + sum.dup();
+        state[19] = state[19].div_2exp_u64(24) + sum.dup();
+        state[20] = sum.dup() - state[20].div_2exp_u64(8);
+        state[21] = sum.dup() - state[21].div_2exp_u64(3);
+        state[22] = sum.dup() - state[22].div_2exp_u64(4);
+        state[23] = sum.dup() - state[23].div_2exp_u64(5);
+        state[24] = sum.dup() - state[24].div_2exp_u64(6);
+        state[25] = sum.dup() - state[25].div_2exp_u64(7);
+        state[26] = sum.dup() - state[26].div_2exp_u64(9);
+        state[27] = sum.dup() - state[27].div_2exp_u64(10);
+        state[28] = sum.dup() - state[28].div_2exp_u64(12);
+        state[29] = sum.dup() - state[29].div_2exp_u64(14);
+        state[30] = sum.dup() - state[30].div_2exp_u64(16);
+        state[31] = sum - state[31].div_2exp_u64(24);
+    }
+}
+
+impl InternalLayerParameters<KoalaBearParameters, 32> for KoalaBearInternalLayerParameters {}
+
+#[cfg(test)]
+mod tests {
+    use p3_symmetric::Permutation;
+    use rand::{RngExt, SeedableRng};
+    use rand_xoshiro::Xoroshiro128Plus;
+
+    use super::*;
+
+    type F = KoalaBear;
+
+    // We need to make some round constants. We use Xoroshiro128Plus for this as we can easily match this PRNG in sage.
+    // See: https://github.com/0xPolygonZero/hash-constants for the sage code used to create all these tests.
+
+    /// Test on a roughly random input.
+    /// This random input is generated by the following sage code:
+    /// set_random_seed(16)
+    /// vector([KB.random_element() for t in range(16)]).
+    #[test]
+    fn test_poseidon2_width_16_random() {
+        let mut input: [F; 16] = KoalaBear::new_array([
+            894848333, 1437655012, 1200606629, 1690012884, 71131202, 1749206695, 1717947831,
+            120589055, 19776022, 42382981, 1831865506, 724844064, 171220207, 1299207443, 227047920,
+            1783754913,
+        ]);
+
+        let expected: [F; 16] = KoalaBear::new_array([
+            652590279, 1200629963, 1013089423, 1840372851, 19101828, 561050015, 1714865585,
+            994637181, 498949829, 729884572, 1957973925, 263012103, 535029297, 2121808603,
+            964663675, 1473622080,
+        ]);
+
+        let mut rng = Xoroshiro128Plus::seed_from_u64(1);
+        let perm = Poseidon2KoalaBear::new_from_rng_128(&mut rng);
+
+        perm.permute_mut(&mut input);
+        assert_eq!(input, expected);
+    }
+
+    /// Test on a roughly random input.
+    /// This random input is generated by the following sage code:
+    /// set_random_seed(24)
+    /// vector([KB.random_element() for t in range(24)]).
+    #[test]
+    fn test_poseidon2_width_24_random() {
+        let mut input: [F; 24] = KoalaBear::new_array([
+            886409618, 1327899896, 1902407911, 591953491, 648428576, 1844789031, 1198336108,
+            355597330, 1799586834, 59617783, 790334801, 1968791836, 559272107, 31054313,
+            1042221543, 474748436, 135686258, 263665994, 1962340735, 1741539604, 2026927696,
+            449439011, 1131357108, 50869465,
+        ]);
+
+        let expected: [F; 24] = KoalaBear::new_array([
+            3825456, 486989921, 613714063, 282152282, 1027154688, 1171655681, 879344953,
+            1090688809, 1960721991, 1604199242, 1329947150, 1535171244, 781646521, 1156559780,
+            1875690339, 368140677, 457503063, 304208551, 1919757655, 835116474, 1293372648,
+            1254825008, 810923913, 1773631109,
+        ]);
+
+        let mut rng = Xoroshiro128Plus::seed_from_u64(1);
+        let perm = Poseidon2KoalaBear::new_from_rng_128(&mut rng);
+
+        perm.permute_mut(&mut input);
+        assert_eq!(input, expected);
+    }
+
+    /// Test the generic internal layer against the optimized internal layer
+    /// for a random input of width 16.
+    #[test]
+    fn test_generic_internal_linear_layer_16() {
+        let mut rng = Xoroshiro128Plus::seed_from_u64(1);
+        let mut input1: [F; 16] = rng.random();
+        let mut input2 = input1;
+
+        let part_sum: F = input1[1..].iter().copied().sum();
+        let full_sum = part_sum + input1[0];
+
+        input1[0] = part_sum - input1[0];
+
+        KoalaBearInternalLayerParameters::internal_layer_mat_mul(&mut input1, full_sum);
+        KoalaBearInternalLayerParameters::generic_internal_linear_layer(&mut input2);
+
+        assert_eq!(input1, input2);
+    }
+
+    /// Test the generic internal layer against the optimized internal layer
+    /// for a random input of width 16.
+    #[test]
+    fn test_generic_internal_linear_layer_24() {
+        let mut rng = Xoroshiro128Plus::seed_from_u64(1);
+        let mut input1: [F; 24] = rng.random();
+        let mut input2 = input1;
+
+        let part_sum: F = input1[1..].iter().copied().sum();
+        let full_sum = part_sum + input1[0];
+
+        input1[0] = part_sum - input1[0];
+
+        KoalaBearInternalLayerParameters::internal_layer_mat_mul(&mut input1, full_sum);
+        KoalaBearInternalLayerParameters::generic_internal_linear_layer(&mut input2);
+
+        assert_eq!(input1, input2);
+    }
+
+    #[test]
+    fn test_default_koalabear_poseidon2_width_16() {
+        let mut input: [F; 16] = KoalaBear::new_array([
+            894848333, 1437655012, 1200606629, 1690012884, 71131202, 1749206695, 1717947831,
+            120589055, 19776022, 42382981, 1831865506, 724844064, 171220207, 1299207443, 227047920,
+            1783754913,
+        ]);
+
+        let expected: [F; 16] = KoalaBear::new_array([
+            1934285469, 604889435, 133449501, 1026180808, 1830659359, 176667110, 1391183747,
+            351743874, 1238264085, 1292768839, 2023573270, 1201586780, 1360691759, 1230682461,
+            748270449, 651545025,
+        ]);
+
+        let perm = default_koalabear_poseidon2_16();
+        perm.permute_mut(&mut input);
+
+        assert_eq!(input, expected);
+    }
+
+    #[test]
+    fn test_default_koalabear_poseidon2_width_24() {
+        let mut input: [F; 24] = KoalaBear::new_array([
+            886409618, 1327899896, 1902407911, 591953491, 648428576, 1844789031, 1198336108,
+            355597330, 1799586834, 59617783, 790334801, 1968791836, 559272107, 31054313,
+            1042221543, 474748436, 135686258, 263665994, 1962340735, 1741539604, 2026927696,
+            449439011, 1131357108, 50869465,
+        ]);
+
+        let expected: [F; 24] = KoalaBear::new_array([
+            382801106, 82839311, 1503190615, 1987418517, 854076995, 1862291425, 262755189,
+            1050814217, 722724562, 741265943, 1026879332, 754316749, 1966025564, 1518878196,
+            502200188, 1368172258, 845459257, 1711434837, 724453836, 171032289, 655223446,
+            1098636135, 407832555, 1707498914,
+        ]);
+
+        let perm = default_koalabear_poseidon2_24();
+        perm.permute_mut(&mut input);
+
+        assert_eq!(input, expected);
+    }
+
+    #[test]
+    fn test_default_koalabear_poseidon2_width_32() {
+        let mut input: [F; 32] = KoalaBear::new_array([
+            377639580, 1129436247, 1046213469, 1189442335, 766997073, 331472151, 734344924,
+            499580178, 371511009, 1784992949, 961094784, 2047061722, 1120236986, 1332020114,
+            1511787480, 1290378453, 1414897608, 641041795, 1940105940, 1813107966, 1798618911,
+            1941729996, 1148636543, 505212370, 1519289406, 567500757, 728728142, 1833845584,
+            1298210282, 41111765, 297995683, 1596253449,
+        ]);
+
+        let expected: [F; 32] = KoalaBear::new_array([
+            1359114333, 192817145, 2112759047, 1534272756, 262772033, 1605905052, 1578475422,
+            1405808516, 1637426946, 1738584472, 1537483685, 1201015772, 472885949, 923753225,
+            1756848188, 1560950302, 672658610, 1934876055, 229950235, 798187377, 1626970896,
+            278337851, 1054262154, 1192644396, 257269960, 1845599185, 489110817, 1514396648,
+            345626239, 888828773, 1894876982, 500295195,
+        ]);
+
+        let perm = default_koalabear_poseidon2_32();
+        perm.permute_mut(&mut input);
+
+        assert_eq!(input, expected);
+    }
+
+    /// Test the generic internal layer against the optimized internal layer
+    /// for a random input of width 32.
+    #[test]
+    fn test_generic_internal_linear_layer_32() {
+        let mut rng = Xoroshiro128Plus::seed_from_u64(1);
+        let mut input1: [F; 32] = rng.random();
+        let mut input2 = input1;
+
+        let part_sum: F = input1[1..].iter().copied().sum();
+        let full_sum = part_sum + input1[0];
+
+        input1[0] = part_sum - input1[0];
+
+        KoalaBearInternalLayerParameters::internal_layer_mat_mul(&mut input1, full_sum);
+        KoalaBearInternalLayerParameters::generic_internal_linear_layer(&mut input2);
+
+        assert_eq!(input1, input2);
+    }
+}

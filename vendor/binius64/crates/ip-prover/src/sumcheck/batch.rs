@@ -1,0 +1,252 @@
+// Copyright 2024-2025 Irreducible Inc.
+// Copyright 2026 The Binius Developers
+
+use binius_field::Field;
+
+use crate::{
+	channel::IPProverChannel,
+	sumcheck::{
+		common::{MleCheckProver, SumcheckProver},
+		drive::{self, MleCheckRounds, SumcheckRounds},
+	},
+};
+
+/// Prover view of the execution result of a batched sumcheck.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BatchSumcheckOutput<F: Field> {
+	/// Verifier challenges for each round of the sumcheck protocol.
+	///
+	/// One challenge is generated per variable in the multivariate polynomial,
+	/// with challenges\[i\] corresponding to the i-th round of the protocol. This binding
+	/// order matches [`prove_single`](super::prove_single) and `batch_verify`; when folding
+	/// high-to-low, reverse to obtain the variable-indexed evaluation point.
+	pub challenges: Vec<F>,
+	/// Evaluation claims on non-transparent multilinears, per prover.
+	///
+	/// Each inner vector contains the evaluation values for one prover's
+	/// multilinear polynomials at the challenge point.
+	pub multilinear_evals: Vec<Vec<F>>,
+}
+
+impl<F: Field> BatchSumcheckOutput<F> {
+	/// Sends every prover's evaluation claims to the verifier, in prover order.
+	///
+	/// The per-prover grouping is prover-side bookkeeping only.
+	/// The elements reach the transcript as one flat run, which is how the verifier reads them.
+	pub fn send_evals(&self, channel: &mut impl IPProverChannel<F>) {
+		for evals in &self.multilinear_evals {
+			// Preserve per-prover ordering when emitting evaluation claims.
+			channel.send_many(evals);
+		}
+	}
+}
+
+/// Prove a batched sumcheck protocol execution, where all provers have the same number of rounds.
+///
+/// The batched sumcheck reduces a set of claims about the sums of multivariate polynomials over
+/// the boolean hypercube to their evaluation at a (shared) challenge point. This is achieved by
+/// constructing an `n_vars + 1`-variate polynomial whose coefficients in the "new variable" are the
+/// individual sum claims and evaluating it at a random point. Due to linearity of sums each claim
+/// can be proven separately with an individual [`SumcheckProver`] followed by weighted summation of
+/// the round polynomials.
+///
+/// This function performs the sumcheck protocol and returns the challenges and evaluation claims,
+/// but does not write the evaluation claims to the channel. Use [`batch_prove_and_write_evals`]
+/// if you need to write the evaluations to the channel.
+pub fn batch_prove<F, Prover>(
+	provers: Vec<Prover>,
+	channel: &mut impl IPProverChannel<F>,
+) -> BatchSumcheckOutput<F>
+where
+	F: Field,
+	Prover: SumcheckProver<F>,
+{
+	drive::batch(provers.into_iter().map(SumcheckRounds), channel)
+}
+
+/// Prove a batched sumcheck protocol and write evaluation claims to the channel.
+///
+/// This function combines [`batch_prove`] with writing the evaluation claims to the channel.
+/// It performs the batched sumcheck protocol execution and then writes all the multilinear
+/// evaluation values to the channel in order.
+///
+/// # Arguments
+///
+/// * `provers` - Vector of sumcheck provers, each handling one claim in the batch
+/// * `channel` - The channel for sending prover messages and sampling challenges
+///
+/// # Returns
+///
+/// Returns [`BatchSumcheckOutput`] containing the challenges and evaluation claims that were
+/// written to the channel.
+pub fn batch_prove_and_write_evals<F, Prover>(
+	provers: Vec<Prover>,
+	channel: &mut impl IPProverChannel<F>,
+) -> BatchSumcheckOutput<F>
+where
+	F: Field,
+	Prover: SumcheckProver<F>,
+{
+	let output = batch_prove(provers, channel);
+	output.send_evals(channel);
+	output
+}
+
+/// Prove a batched sumcheck for MLE-check provers sharing a common evaluation point.
+///
+/// This is the MLE-check analog of [`batch_prove`]: all provers are [`MleCheckProver`]s and must
+/// agree on the same evaluation point, so the batched protocol can fold every prover with the
+/// same per-round challenge and reduce all evaluation claims via a single batching coefficient.
+pub fn batch_prove_mle<F, MleCheckProver_>(
+	provers: Vec<MleCheckProver_>,
+	channel: &mut impl IPProverChannel<F>,
+) -> BatchSumcheckOutput<F>
+where
+	F: Field,
+	MleCheckProver_: MleCheckProver<F>,
+{
+	// All MLE-check provers must share the same evaluation point to batch safely. An empty batch
+	// has no point to agree on, and the driver returns without touching the channel.
+	if let Some(first_prover) = provers.first() {
+		let eval_point = first_prover.eval_point();
+		assert!(
+			provers
+				.iter()
+				.all(|prover| prover.eval_point() == eval_point),
+			"batched MLE-check provers must share the same evaluation point"
+		);
+	}
+
+	drive::batch(provers.into_iter().map(MleCheckRounds), channel)
+}
+
+#[cfg(test)]
+mod tests {
+	use binius_field::{
+		Field, PackedField,
+		arch::{OptimalB128, OptimalPackedB128},
+	};
+	use binius_ip::sumcheck::batch_verify_mle;
+	use binius_math::{
+		FieldBuffer,
+		multilinear::evaluate::evaluate,
+		test_utils::{random_field_buffer, random_scalars},
+		univariate::evaluate_univariate,
+	};
+	use binius_transcript::{ProverTranscript, fiat_shamir::HasherChallenger};
+
+	type StdChallenger = HasherChallenger<sha2::Sha256>;
+	use binius_compute::GlobalAllocator;
+	use rand::prelude::*;
+
+	use super::batch_prove_mle;
+	use crate::sumcheck::bivariate_product_mle;
+
+	fn product_eval_claim<F, P>(
+		multilinear_a: &FieldBuffer<P>,
+		multilinear_b: &FieldBuffer<P>,
+		eval_point: &[F],
+	) -> F
+	where
+		F: Field,
+		P: PackedField<Scalar = F>,
+	{
+		let n_vars = eval_point.len();
+		let product = multilinear_a
+			.as_ref()
+			.iter()
+			.zip(multilinear_b.as_ref())
+			.map(|(&l, &r)| l * r)
+			.collect::<Vec<_>>();
+		let product_buffer = FieldBuffer::new(n_vars, product);
+		evaluate(&product_buffer, eval_point)
+	}
+
+	#[test]
+	fn test_batch_prove_verify_mlecheck() {
+		type F = OptimalB128;
+		type P = OptimalPackedB128;
+
+		let n_vars = 6;
+		let mut rng = StdRng::seed_from_u64(0);
+		let alloc = GlobalAllocator;
+
+		let eval_point = random_scalars::<F>(&mut rng, n_vars);
+
+		let multilinear_a_0 = random_field_buffer::<P>(&mut rng, n_vars);
+		let multilinear_b_0 = random_field_buffer::<P>(&mut rng, n_vars);
+		let eval_claim_0 = product_eval_claim(&multilinear_a_0, &multilinear_b_0, &eval_point);
+
+		let multilinear_a_1 = random_field_buffer::<P>(&mut rng, n_vars);
+		let multilinear_b_1 = random_field_buffer::<P>(&mut rng, n_vars);
+		let eval_claim_1 = product_eval_claim(&multilinear_a_1, &multilinear_b_1, &eval_point);
+
+		let prover_0 = bivariate_product_mle::new(
+			&alloc,
+			[multilinear_a_0.clone(), multilinear_b_0.clone()],
+			eval_point.clone(),
+			eval_claim_0,
+		);
+		let prover_1 = bivariate_product_mle::new(
+			&alloc,
+			[multilinear_a_1.clone(), multilinear_b_1.clone()],
+			eval_point.clone(),
+			eval_claim_1,
+		);
+
+		let mut prover_transcript = ProverTranscript::new(StdChallenger::default());
+		let output = batch_prove_mle(vec![prover_0, prover_1], &mut prover_transcript);
+
+		let mut writer = prover_transcript.message();
+		for evals in &output.multilinear_evals {
+			writer.write_scalar_slice(evals);
+		}
+
+		let mut verifier_transcript = prover_transcript.into_verifier();
+		let sumcheck_output = batch_verify_mle(
+			&eval_point,
+			2, // degree 2 for bivariate product MLE-check
+			&[eval_claim_0, eval_claim_1],
+			&mut verifier_transcript,
+		)
+		.unwrap();
+
+		let mut reduced_eval_point = sumcheck_output.challenges.clone();
+		reduced_eval_point.reverse();
+
+		let flattened_evals: Vec<F> = output
+			.multilinear_evals
+			.iter()
+			.flat_map(|evals| evals.iter().copied())
+			.collect();
+		let evals_from_transcript: Vec<F> = verifier_transcript.message().read_vec(4).unwrap();
+		assert_eq!(
+			flattened_evals, evals_from_transcript,
+			"Multilinear evaluations should round-trip through the transcript"
+		);
+
+		let eval_a_0 = evaluate(&multilinear_a_0, &reduced_eval_point);
+		let eval_b_0 = evaluate(&multilinear_b_0, &reduced_eval_point);
+		let eval_a_1 = evaluate(&multilinear_a_1, &reduced_eval_point);
+		let eval_b_1 = evaluate(&multilinear_b_1, &reduced_eval_point);
+
+		assert_eq!(eval_a_0, output.multilinear_evals[0][0]);
+		assert_eq!(eval_b_0, output.multilinear_evals[0][1]);
+		assert_eq!(eval_a_1, output.multilinear_evals[1][0]);
+		assert_eq!(eval_b_1, output.multilinear_evals[1][1]);
+
+		let composed_evals = vec![eval_a_0 * eval_b_0, eval_a_1 * eval_b_1];
+		let expected_batched_eval =
+			evaluate_univariate(&composed_evals, &sumcheck_output.batch_coeff);
+
+		assert_eq!(
+			expected_batched_eval, sumcheck_output.eval,
+			"Batched evaluation should match reduced evaluation"
+		);
+
+		assert_eq!(
+			output.challenges, sumcheck_output.challenges,
+			"Prover and verifier challenges should match"
+		);
+	}
+}

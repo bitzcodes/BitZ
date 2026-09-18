@@ -1,0 +1,465 @@
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
+use itertools::Itertools;
+use p3_field::coset::TwoAdicMultiplicativeCoset;
+use p3_field::{ExtensionField, Field, TwoAdicField, batch_multiplicative_inverse};
+use p3_matrix::Matrix;
+use p3_matrix::dense::{RowMajorMatrix, RowMajorMatrixView};
+use p3_matrix::interpolation::Interpolate;
+use p3_util::{log2_ceil_usize, log2_strict_usize};
+
+/// Given a `PolynomialSpace`, `S`, and a subset `R`, a Lagrange selector `P_R` is
+/// a polynomial which is not equal to `0` for every element in `R` but is equal
+/// to `0` for every element of `S` not in `R`.
+///
+/// This struct contains evaluations of several Lagrange selectors for a fixed
+/// `PolynomialSpace` over some collection of points disjoint from that
+/// `PolynomialSpace`.
+///
+/// The Lagrange selector is normalized if it is equal to `1` for every element in `R`.
+/// The LagrangeSelectors given here are not normalized.
+#[derive(Debug)]
+pub struct LagrangeSelectors<T> {
+    /// A Lagrange selector corresponding to the first point in the space.
+    pub is_first_row: T,
+    /// A Lagrange selector corresponding to the last point in the space.
+    pub is_last_row: T,
+    /// A Lagrange selector corresponding the subset of all but the last point.
+    pub is_transition: T,
+    /// The inverse of the vanishing polynomial which is a Lagrange selector corresponding to the empty set
+    pub inv_vanishing: T,
+}
+
+/// Fixing a field, `F`, `PolynomialSpace<Val = F>` denotes an indexed subset of `F^n`
+/// with some additional algebraic structure.
+///
+/// We do not expect `PolynomialSpace` to store this subset, instead it usually contains
+/// some associated data which allows it to generate the subset or pieces of it.
+///
+/// Each `PolynomialSpace` should be part of a family of similar spaces for some
+/// collection of sizes (usually powers of two). Any space other than at the smallest size
+/// should be decomposable into a disjoint collection of smaller spaces. Additionally, the
+/// set of all `PolynomialSpace` of a given size should form a disjoint partition of some
+/// subset of `F^n` which supports a group structure.
+///
+/// The canonical example of a `PolynomialSpace` is a coset `gH` of
+/// a two-adic subgroup `H` of the multiplicative group `F*`. This satisfies the properties
+/// above as cosets partition the group and decompose as `gH = g(H^2) u gh(H^2)` for `h` any
+/// generator of `H`.
+///
+/// The other example in this code base is twin cosets which are sets of the form `gH u g^{-1}H`.
+/// The decomposition above extends easily to this case as `h` is a generator if and only if `h^{-1}`
+/// is and so `gH u g^{-1}H = (g(H^2) u g^{-1}(H^2)) u (gh(H^2) u (gh)^{-1}(H^2))`.
+pub trait PolynomialSpace: Copy {
+    /// The base field `F`.
+    type Val: Field;
+
+    /// The number of elements of the space.
+    fn size(&self) -> usize;
+
+    /// The first point in the space.
+    fn first_point(&self) -> Self::Val;
+
+    /// An algebraic function which takes the i'th element of the space and returns
+    /// the (i+1)'th evaluated on the given point.
+    ///
+    /// When `PolynomialSpace` corresponds to a coset, `gH` this
+    /// function is multiplication by `h` for a chosen generator `h` of `H`.
+    ///
+    /// This function may not exist for other classes of `PolynomialSpace` in which
+    /// case this will return `None`.
+    fn next_point<Ext: ExtensionField<Self::Val>>(&self, x: Ext) -> Option<Ext>;
+
+    /// Return another `PolynomialSpace` with size at least `min_size` disjoint from this space.
+    ///
+    /// When working with spaces of power of two size, this will return a space of size `2^ceil(log_2(min_size))`.
+    /// This will fail if `min_size` is too large. In particular, `log_2(min_size)` should be
+    /// smaller than the `2`-adicity of the field.
+    ///
+    /// This fixes a canonical choice for prover/verifier determinism and LDE caching.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `min_size` is too large for a disjoint domain to be constructed. Verifier-side
+    /// code processing untrusted input should prefer [`Self::try_create_disjoint_domain`], which
+    /// reports this condition as `None` instead of panicking.
+    fn create_disjoint_domain(&self, min_size: usize) -> Self {
+        self.try_create_disjoint_domain(min_size)
+            .unwrap_or_else(|| {
+                panic!("cannot construct a domain of size at least {min_size} disjoint from `self`")
+            })
+    }
+
+    /// The non-panicking counterpart to [`Self::create_disjoint_domain`].
+    ///
+    /// Returns `None` instead of panicking when `min_size` is too large for a disjoint domain
+    /// to be constructed (for two-adic domains, this happens when `log_2(min_size)` is not
+    /// smaller than the field's `2`-adicity). Intended for verifier-side code, which must
+    /// reject malformed or adversarial input rather than panic on it.
+    fn try_create_disjoint_domain(&self, min_size: usize) -> Option<Self>;
+
+    /// Split the `PolynomialSpace` into `num_chunks` smaller `PolynomialSpaces` of equal size.
+    ///
+    /// `num_chunks` must divide `self.size()` (which usually forces it to be a power of 2.) or
+    /// this function will panic.
+    fn split_domains(&self, num_chunks: usize) -> Vec<Self>;
+
+    /// Split a set of polynomial evaluations over this `PolynomialSpace` into a vector
+    /// of polynomial evaluations over each `PolynomialSpace` generated from `split_domains`.
+    ///
+    /// `evals.height()` must equal `self.size()` and `num_chunks` must divide `self.size()`.
+    /// `evals` are assumed to be in standard (not bit-reversed) order.
+    fn split_evals(
+        &self,
+        num_chunks: usize,
+        evals: RowMajorMatrix<Self::Val>,
+    ) -> Vec<RowMajorMatrix<Self::Val>>;
+
+    /// Compute the vanishing polynomial of the space, evaluated at the given point.
+    ///
+    /// This is a polynomial which evaluates to `0` on every point of the
+    /// space `self` and has degree equal to `self.size()`. In other words it is
+    /// a choice of element of the defining ideal of the given set with this extra
+    /// degree property.
+    ///
+    /// In the univariate case, it is equal, up to a linear factor, to the product over
+    /// all elements `x`, of `(X - x)`. In particular this implies it will not evaluate
+    /// to `0` at any point not in `self`.
+    fn vanishing_poly_at_point<Ext: ExtensionField<Self::Val>>(&self, point: Ext) -> Ext;
+
+    /// Compute several Lagrange selectors at a given point.
+    /// - The Lagrange selector of the first point.
+    /// - The Lagrange selector of the last point.
+    /// - The Lagrange selector of everything but the last point.
+    /// - The inverse of the vanishing polynomial.
+    ///
+    /// Note that these may not be normalized.
+    fn selectors_at_point<Ext: ExtensionField<Self::Val>>(
+        &self,
+        point: Ext,
+    ) -> LagrangeSelectors<Ext>;
+
+    /// Compute several Lagrange selectors at all points of the given disjoint `PolynomialSpace`.
+    /// - The Lagrange selector of the first point.
+    /// - The Lagrange selector of the last point.
+    /// - The Lagrange selector of everything but the last point.
+    /// - The inverse of the vanishing polynomial.
+    ///
+    /// Note that these may not be normalized.
+    fn selectors_on_coset(&self, coset: Self) -> LagrangeSelectors<Vec<Self::Val>>;
+
+    /// Evaluate the polynomial defined by `evals` (evaluations over `self`) at `point`.
+    fn evaluate_polynomial_at<Ext: ExtensionField<Self::Val>>(
+        &self,
+        evals: &[Self::Val],
+        point: Ext,
+    ) -> Ext;
+
+    /// Evaluate a periodic column polynomial at `point`.
+    ///
+    /// `col` contains the period-length evaluations: row `i` of the full trace
+    /// gets value `col[i % col.len()]`. The default expands to trace size and
+    /// delegates to [`Self::evaluate_polynomial_at`]; domains with algebraic
+    /// structure (e.g. two-adic cosets) can override for O(period) work.
+    ///
+    /// # Performance
+    ///
+    /// This default is O(`self.size()`) time and allocates a `self.size()`-length
+    /// vector, versus O(`col.len()`) for an override that exploits the domain's
+    /// algebraic structure (e.g. two-adic cosets folding onto a sub-coset). For a
+    /// small period on a large trace this is a large (potentially many-orders-of-
+    /// magnitude) verifier slowdown. Any new `PolynomialSpace` implementor should
+    /// override this method rather than rely on the default.
+    fn evaluate_periodic_column_at<Ext: ExtensionField<Self::Val>>(
+        &self,
+        col: &[Self::Val],
+        point: Ext,
+    ) -> Ext {
+        let n = self.size();
+        let period = col.len();
+        let evals: Vec<Self::Val> = (0..n).map(|i| col[i % period]).collect();
+        self.evaluate_polynomial_at(&evals, point)
+    }
+
+    /// Evaluate several periodic column polynomials at `point`.
+    ///
+    /// The default expands to one call to [`Self::evaluate_periodic_column_at`] per
+    /// column. Domains with algebraic structure (e.g. two-adic cosets) can override
+    /// to batch columns that share a period, paying for one interpolation instead
+    /// of one per column.
+    fn evaluate_periodic_columns_at<Ext: ExtensionField<Self::Val>>(
+        &self,
+        periodic_columns: &[Vec<Self::Val>],
+        point: Ext,
+    ) -> Vec<Ext> {
+        periodic_columns
+            .iter()
+            .map(|col| self.evaluate_periodic_column_at(col, point))
+            .collect()
+    }
+}
+
+impl<Val: TwoAdicField> PolynomialSpace for TwoAdicMultiplicativeCoset<Val> {
+    type Val = Val;
+
+    fn size(&self) -> usize {
+        self.size()
+    }
+
+    fn first_point(&self) -> Self::Val {
+        self.shift()
+    }
+
+    /// Getting the next point corresponds to multiplication by the generator.
+    fn next_point<Ext: ExtensionField<Val>>(&self, x: Ext) -> Option<Ext> {
+        Some(x * self.subgroup_generator())
+    }
+
+    /// Given the coset `gH`, return the disjoint coset `gfK` where `f`
+    /// is a fixed generator of `F^*` and `K` is the unique two-adic subgroup
+    /// of with size `2^(ceil(log_2(min_size)))`.
+    ///
+    /// Returns `None` if `min_size` > `1 << Val::TWO_ADICITY`.
+    fn try_create_disjoint_domain(&self, min_size: usize) -> Option<Self> {
+        // We provide a short proof that these cosets are always disjoint:
+        //
+        // Assume without loss of generality that `|H| <= min_size <= |K|`.
+        // Then we know that `gH` is entirely contained in `gK`. As cosets are
+        // either equal or disjoint, this means that `gH` is disjoint from `g'K`
+        // for every `g'` not contained in `gK`. As `f` is a generator of `F^*`
+        // it does not lie in `K` and so `gf` cannot lie in `gK`.
+        //
+        // Thus `gH` and `gfK` are disjoint.
+
+        // This is `None` if (and only if) `min_size` > `1 << Val::TWO_ADICITY`.
+        Self::new(self.shift() * Val::GENERATOR, log2_ceil_usize(min_size))
+    }
+
+    /// Given the coset `gH` and generator `h` of `H`, let `K = H^{num_chunks}`
+    /// be the unique group of order `|H|/num_chunks`.
+    ///
+    /// Then we decompose `gH` into `gK, ghK, gh^2K, ..., gh^{num_chunks}K`.
+    fn split_domains(&self, num_chunks: usize) -> Vec<Self> {
+        let log_chunks = log2_strict_usize(num_chunks);
+        debug_assert!(log_chunks <= self.log_size());
+        (0..num_chunks)
+            .map(|i| {
+                Self::new(
+                    self.shift() * self.subgroup_generator().exp_u64(i as u64),
+                    self.log_size() - log_chunks,
+                )
+                .unwrap() // This won't panic as `self.log_size() - log_chunks < self.log_size() < Val::TWO_ADICITY`
+            })
+            .collect()
+    }
+
+    fn split_evals(
+        &self,
+        num_chunks: usize,
+        evals: RowMajorMatrix<Self::Val>,
+    ) -> Vec<RowMajorMatrix<Self::Val>> {
+        debug_assert_eq!(evals.height(), self.size());
+        debug_assert!(log2_strict_usize(num_chunks) <= self.log_size());
+        let height = evals.height();
+        let width = evals.width();
+        let rows_per_chunk = height / num_chunks;
+
+        // Preallocate zeroed buffers per chunk; often faster for field elements.
+        let mut values: Vec<Vec<Self::Val>> = (0..num_chunks)
+            .map(|_| Self::Val::zero_vec(rows_per_chunk * width))
+            .collect();
+
+        // Distribute rows without using modulo: iterate blocks of size num_chunks.
+        for i in 0..rows_per_chunk {
+            let base_row = i * num_chunks;
+            let dst_start = i * width;
+            let dst_end = dst_start + width;
+            for (chunk, dst_vec) in values.iter_mut().enumerate().take(num_chunks) {
+                let r = base_row + chunk;
+                // Safety: r < height == rows_per_chunk * num_chunks
+                let row = unsafe { evals.row_slice_unchecked(r) };
+                dst_vec[dst_start..dst_end].copy_from_slice(&row);
+            }
+        }
+
+        values
+            .into_iter()
+            .map(|v| RowMajorMatrix::new(v, width))
+            .collect()
+    }
+
+    /// Compute the vanishing polynomial at the given point:
+    ///
+    /// `Z_{gH}(X) = g^{-|H|}\prod_{h \in H} (X - gh) = (g^{-1}X)^|H| - 1`
+    fn vanishing_poly_at_point<Ext: ExtensionField<Val>>(&self, point: Ext) -> Ext {
+        (point * self.shift_inverse()).exp_power_of_2(self.log_size()) - Ext::ONE
+    }
+
+    /// Compute several Lagrange selectors at the given point:
+    ///
+    /// Defining the vanishing polynomial by `Z_{gH}(X) = g^{-|H|}\prod_{h \in H} (X - gh) = (g^{-1}X)^|H| - 1` return:
+    /// - `Z_{gH}(X)/(g^{-1}X - 1)`: The Lagrange selector of the point `g`.
+    /// - `Z_{gH}(X)/(g^{-1}X - h^{-1})`: The Lagrange selector of the point `gh^{-1}` where `h` is the generator of `H`.
+    /// - `(g^{-1}X - h^{-1})`: The Lagrange selector of the subset consisting of everything but the point `gh^{-1}`.
+    /// - `1/Z_{gH}(X)`: The inverse of the vanishing polynomial.
+    fn selectors_at_point<Ext: ExtensionField<Val>>(&self, point: Ext) -> LagrangeSelectors<Ext> {
+        let unshifted_point = point * self.shift_inverse();
+        let z_h = unshifted_point.exp_power_of_2(self.log_size()) - Ext::ONE;
+        LagrangeSelectors {
+            is_first_row: z_h / (unshifted_point - Ext::ONE),
+            is_last_row: z_h / (unshifted_point - self.subgroup_generator().inverse()),
+            is_transition: unshifted_point - self.subgroup_generator().inverse(),
+            inv_vanishing: z_h.inverse(),
+        }
+    }
+
+    /// Compute the Lagrange selectors of our space at every point in the coset.
+    ///
+    /// This will error if our space is not the group `H` and if the given
+    /// coset is not disjoint from `H`.
+    fn selectors_on_coset(&self, coset: Self) -> LagrangeSelectors<Vec<Val>> {
+        assert_eq!(self.shift(), Val::ONE);
+        assert_ne!(coset.shift(), Val::ONE);
+        assert!(coset.log_size() >= self.log_size());
+        let rate_bits = coset.log_size() - self.log_size();
+
+        let s_pow_n = coset.shift().exp_power_of_2(self.log_size());
+        // evals of Z_H(X) = X^n - 1
+        let evals = Val::two_adic_generator(rate_bits)
+            .powers()
+            .take(1 << rate_bits)
+            .map(|x| s_pow_n * x - Val::ONE)
+            .collect_vec();
+
+        let xs = coset.iter().collect();
+
+        let single_point_selector = |i: u64| {
+            let coset_i = self.subgroup_generator().exp_u64(i);
+            let denoms = xs.iter().map(|&x| x - coset_i).collect_vec();
+            let invs = batch_multiplicative_inverse(&denoms);
+            evals
+                .iter()
+                .cycle()
+                .zip(invs)
+                .map(|(&z_h, inv)| z_h * inv)
+                .collect_vec()
+        };
+
+        let subgroup_last = self.subgroup_generator().inverse();
+
+        LagrangeSelectors {
+            is_first_row: single_point_selector(0),
+            is_last_row: single_point_selector(self.size() as u64 - 1),
+            is_transition: xs.into_iter().map(|x| x - subgroup_last).collect(),
+            inv_vanishing: batch_multiplicative_inverse(&evals)
+                .into_iter()
+                .cycle()
+                .take(coset.size())
+                .collect(),
+        }
+    }
+
+    fn evaluate_polynomial_at<Ext: ExtensionField<Val>>(&self, evals: &[Val], point: Ext) -> Ext {
+        let evals_mat = RowMajorMatrixView::new(evals, 1);
+        evals_mat.interpolate_coset(self.shift(), point)[0]
+    }
+
+    fn evaluate_periodic_column_at<Ext: ExtensionField<Val>>(
+        &self,
+        col: &[Val],
+        point: Ext,
+    ) -> Ext {
+        let log_period = log2_strict_usize(col.len());
+        let folds = self.log_size() - log_period;
+        let sub_coset = Self::new(self.shift().exp_power_of_2(folds), log_period).unwrap();
+        sub_coset.evaluate_polynomial_at(col, point.exp_power_of_2(folds))
+    }
+
+    /// Evaluate several periodic column polynomials at `point`, sharing one coset
+    /// materialization and batch inversion (via [`Interpolate::interpolate_coset`])
+    /// across all columns of a given period.
+    fn evaluate_periodic_columns_at<Ext: ExtensionField<Val>>(
+        &self,
+        periodic_columns: &[Vec<Val>],
+        point: Ext,
+    ) -> Vec<Ext> {
+        let mut cols_by_period: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (i, col) in periodic_columns.iter().enumerate() {
+            cols_by_period.entry(col.len()).or_default().push(i);
+        }
+
+        let mut result = Ext::zero_vec(periodic_columns.len());
+        for (period, indices) in cols_by_period {
+            let log_period = log2_strict_usize(period);
+            let folds = self.log_size() - log_period;
+            let sub_shift = self.shift().exp_power_of_2(folds);
+            let sub_point = point.exp_power_of_2(folds);
+
+            // Interleave the columns sharing this period into one row-major matrix
+            // so `interpolate_coset` can evaluate all of them with a single batch
+            // inversion.
+            let k = indices.len();
+            let mut values = Val::zero_vec(period * k);
+            for (col_pos, &orig_idx) in indices.iter().enumerate() {
+                for (row, &v) in periodic_columns[orig_idx].iter().enumerate() {
+                    values[row * k + col_pos] = v;
+                }
+            }
+
+            let evals = RowMajorMatrix::new(values, k).interpolate_coset(sub_shift, sub_point);
+            for (col_pos, &orig_idx) in indices.iter().enumerate() {
+                result[orig_idx] = evals[col_pos];
+            }
+        }
+
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use p3_baby_bear::BabyBear;
+    use p3_field::PrimeCharacteristicRing;
+
+    use super::*;
+
+    type F = BabyBear;
+
+    #[test]
+    fn evaluate_periodic_columns_at_matches_per_column_eval() {
+        let domain = TwoAdicMultiplicativeCoset::<F>::new(F::GENERATOR, 4).unwrap();
+        let point = F::from_u32(12345);
+
+        // Two columns of period 4 (sharing a period class with >1 member) plus one
+        // of period 2, to exercise both the grouping and the interleaving.
+        let columns: Vec<Vec<F>> = vec![
+            (0..4).map(F::from_u32).collect(),
+            (0..2).map(|x| F::from_u32(x + 10)).collect(),
+            (0..4).map(|x| F::from_u32(x + 100)).collect(),
+        ];
+
+        let expected: Vec<F> = columns
+            .iter()
+            .map(|col| domain.evaluate_periodic_column_at(col, point))
+            .collect();
+        let actual = domain.evaluate_periodic_columns_at(&columns, point);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn evaluate_periodic_columns_at_empty() {
+        let domain = TwoAdicMultiplicativeCoset::<F>::new(F::GENERATOR, 4).unwrap();
+        let point = F::from_u32(7);
+        let columns: Vec<Vec<F>> = vec![];
+
+        assert_eq!(
+            domain.evaluate_periodic_columns_at(&columns, point),
+            Vec::<F>::new()
+        );
+    }
+}

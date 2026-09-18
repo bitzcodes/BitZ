@@ -1,0 +1,622 @@
+//! Shared utilities for Goldilocks NEON assembly.
+
+use core::arch::asm;
+
+use super::packing::PackedGoldilocksNeon;
+use crate::{Goldilocks, P};
+
+pub(super) const EPSILON: u64 = P.wrapping_neg(); // 2^32 - 1
+
+// ---------------------------------------------------------------------------
+// Scalar field arithmetic (inline assembly)
+// ---------------------------------------------------------------------------
+
+/// Multiply two Goldilocks elements using inline assembly.
+///
+/// Computes `a * b mod P` where P = 2^64 - 2^32 + 1. The reduction
+/// uses the identity `2^64 = 2^32 - 1 (mod P)` (i.e. EPSILON) to fold
+/// the 128-bit product back into a single limb.
+#[inline(always)]
+pub(super) unsafe fn mul_asm(a: u64, b: u64) -> u64 {
+    let _lo: u64;
+    let _hi: u64;
+    let _t0: u64;
+    let _t1: u64;
+    let _t2: u64;
+    let result: u64;
+
+    unsafe {
+        asm!(
+            // Compute 128-bit product: hi:lo = a * b
+            "mul   {lo}, {a}, {b}",
+            "umulh {hi}, {a}, {b}",
+
+            // Reduce: result = lo - hi_hi + hi_lo * EPSILON
+            // where hi = hi_hi * 2^32 + hi_lo
+
+            // t0 = lo - (hi >> 32), with borrow detection
+            "lsr   {t0}, {hi}, #32",          // t0 = hi >> 32
+            "subs  {t1}, {lo}, {t0}",         // t1 = lo - t0, set flags
+            "csetm {t2:w}, cc",               // t2 = -1 if borrow, 0 otherwise
+            "sub   {t1}, {t1}, {t2}",         // Adjust for borrow (subtract EPSILON)
+
+            // t0 = (hi & EPSILON) * EPSILON
+            "and   {t0}, {hi}, {epsilon}",    // t0 = hi & EPSILON
+            "mul   {t0}, {t0}, {epsilon}",    // t0 = t0 * EPSILON
+
+            // result = t1 + t0, with overflow detection
+            "adds  {result}, {t1}, {t0}",     // result = t1 + t0, set flags
+            "csetm {t2:w}, cs",               // t2 = -1 if carry, 0 otherwise
+            "add   {result}, {result}, {t2}", // Add EPSILON on overflow
+
+            a = in(reg) a,
+            b = in(reg) b,
+            epsilon = in(reg) EPSILON,
+            lo = out(reg) _lo,
+            hi = out(reg) _hi,
+            t0 = out(reg) _t0,
+            t1 = out(reg) _t1,
+            t2 = out(reg) _t2,
+            result = out(reg) result,
+            options(pure, nomem, nostack),
+        );
+    }
+
+    result
+}
+
+/// Compute `a * b + c` in the Goldilocks field using inline assembly.
+///
+/// Fused multiply-add: forms the 128-bit product `a * b`, adds `c` into
+/// the low limb (with carry propagation), then reduces modulo P.
+#[inline(always)]
+pub(super) unsafe fn mul_add_asm(a: u64, b: u64, c: u64) -> u64 {
+    let _lo: u64;
+    let _hi: u64;
+    let _t0: u64;
+    let _t1: u64;
+    let _t2: u64;
+    let result: u64;
+
+    unsafe {
+        asm!(
+            // Compute 128-bit product: hi:lo = a * b
+            "mul   {lo}, {a}, {b}",
+            "umulh {hi}, {a}, {b}",
+
+            // Accumulate c into the 128-bit product: hi:lo = hi:lo + c
+            "adds  {lo}, {lo}, {c}",
+            "adc   {hi}, {hi}, xzr",
+
+            // Reduce: result = lo - hi_hi + hi_lo * EPSILON
+            // where hi = hi_hi * 2^32 + hi_lo
+
+            // t0 = lo - (hi >> 32), with borrow detection
+            "lsr   {t0}, {hi}, #32",          // t0 = hi >> 32
+            "subs  {t1}, {lo}, {t0}",         // t1 = lo - t0, set flags
+            "csetm {t2:w}, cc",               // t2 = -1 if borrow, 0 otherwise
+            "sub   {t1}, {t1}, {t2}",         // Adjust for borrow (subtract EPSILON)
+
+            // t0 = (hi & EPSILON) * EPSILON
+            "and   {t0}, {hi}, {epsilon}",    // t0 = hi & EPSILON
+            "mul   {t0}, {t0}, {epsilon}",    // t0 = t0 * EPSILON
+
+            // result = t1 + t0, with overflow detection
+            "adds  {result}, {t1}, {t0}",     // result = t1 + t0, set flags
+            "csetm {t2:w}, cs",               // t2 = -1 if carry, 0 otherwise
+            "add   {result}, {result}, {t2}", // Add EPSILON on overflow
+
+            a = in(reg) a,
+            b = in(reg) b,
+            c = in(reg) c,
+            epsilon = in(reg) EPSILON,
+            lo = out(reg) _lo,
+            hi = out(reg) _hi,
+            t0 = out(reg) _t0,
+            t1 = out(reg) _t1,
+            t2 = out(reg) _t2,
+            result = out(reg) result,
+            options(pure, nomem, nostack),
+        );
+    }
+
+    result
+}
+
+/// Add two Goldilocks elements with overflow handling using inline assembly.
+///
+/// Computes `a + b mod P`, accepting non-canonical inputs.
+#[inline(always)]
+pub(super) unsafe fn add_asm(a: u64, b: u64) -> u64 {
+    let result: u64;
+    let _t0: u64;
+    let _t1: u64;
+    let _adj: u64;
+
+    unsafe {
+        asm!(
+            // Canonicalize one input: if b >= P, subtract P.
+            "subs  {t0}, {b}, {p}",
+            "csel  {b_canon}, {t0}, {b}, cs",
+
+            // Add, folding 2^64 overflow via EPSILON.
+            "adds  {result}, {a}, {b_canon}",
+            "csetm {adj:w}, cs",
+            "add   {result}, {result}, {adj}",
+
+            // Final reduction: if result >= P, subtract P.
+            "subs  {t1}, {result}, {p}",
+            "csel  {result}, {t1}, {result}, cs",
+            a = in(reg) a,
+            b = in(reg) b,
+            b_canon = out(reg) _,
+            p = in(reg) P,
+            result = out(reg) result,
+            t0 = out(reg) _t0,
+            t1 = out(reg) _t1,
+            adj = out(reg) _adj,
+            options(pure, nomem, nostack),
+        );
+    }
+
+    result
+}
+
+/// Add two Goldilocks elements where `b` is already canonical (`b < P`).
+///
+/// Drops the leading `subs/csel` canonicalize-b pair from `add_asm`,
+/// saving 2 ALU instructions per call. Caller is responsible for the
+/// `b < P` precondition; checked in debug builds via `debug_assert!`,
+/// in release builds misuse silently produces a non-canonical output
+/// that may corrupt downstream proofs.
+///
+/// Safe call sites are those where `b` is provably canonical:
+/// - the output of `add_asm` / `sub_asm` / `mul_asm` / `mul_add_asm`
+///   (each performs a final `subs/csel` reduction to `[0, P)`);
+/// - an RC stored on `Poseidon2GoldilocksFused`, canonicalized at
+///   construction time by `to_canonical_u64`.
+#[inline(always)]
+pub(super) unsafe fn add_canonical_asm(a: u64, b: u64) -> u64 {
+    debug_assert!(
+        b < P,
+        "add_canonical_asm precondition violated: b = {b} >= P"
+    );
+
+    let result: u64;
+    let _t1: u64;
+    let _adj: u64;
+
+    unsafe {
+        asm!(
+            // Add, folding 2^64 overflow via EPSILON.
+            // (b is canonical by precondition; canonicalize-b pair dropped.)
+            "adds  {result}, {a}, {b}",
+            "csetm {adj:w}, cs",
+            "add   {result}, {result}, {adj}",
+
+            // Final reduction: if result >= P, subtract P.
+            "subs  {t1}, {result}, {p}",
+            "csel  {result}, {t1}, {result}, cs",
+            a = in(reg) a,
+            b = in(reg) b,
+            p = in(reg) P,
+            result = out(reg) result,
+            t1 = out(reg) _t1,
+            adj = out(reg) _adj,
+            options(pure, nomem, nostack),
+        );
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Lane conversion (packed NEON <-> raw u64 arrays)
+// ---------------------------------------------------------------------------
+
+/// Unpack a packed NEON state into two raw `u64` lane arrays.
+///
+/// Each packed slot contains two Goldilocks elements (lane 0, lane 1).
+/// This function extracts the internal `u64` representation of each
+/// element into two separate arrays, one per lane.
+///
+/// # Layout
+///
+/// ```text
+///     packed[i] = (field_elem_a, field_elem_b)
+///
+///     lane0[i] = field_elem_a.value    (raw u64)
+///     lane1[i] = field_elem_b.value    (raw u64)
+/// ```
+#[inline]
+pub(super) fn unpack_lanes<const WIDTH: usize>(
+    state: &[PackedGoldilocksNeon; WIDTH],
+) -> ([u64; WIDTH], [u64; WIDTH]) {
+    // Extract the raw u64 representation from each packed slot.
+    let lane0: [u64; WIDTH] = core::array::from_fn(|i| state[i].0[0].value);
+    let lane1: [u64; WIDTH] = core::array::from_fn(|i| state[i].0[1].value);
+    (lane0, lane1)
+}
+
+/// Pack two raw `u64` lane arrays back into a packed NEON state.
+///
+/// Each raw value is wrapped into a Goldilocks field element with no reduction performed
+/// (Goldilocks accepts any `u64` as a non-canonical internal representation) and paired
+/// into a packed slot.
+///
+/// # Layout
+///
+/// ```text
+///     lane0[i], lane1[i]  ->  packed[i] = (Goldilocks(lane0[i]), Goldilocks(lane1[i]))
+/// ```
+#[inline]
+pub(super) fn pack_lanes<const WIDTH: usize>(
+    state: &mut [PackedGoldilocksNeon; WIDTH],
+    lane0: &[u64; WIDTH],
+    lane1: &[u64; WIDTH],
+) {
+    for i in 0..WIDTH {
+        // Wrap each raw u64 into a field element and pair them.
+        state[i] = PackedGoldilocksNeon([Goldilocks::new(lane0[i]), Goldilocks::new(lane1[i])]);
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use alloc::vec::Vec;
+
+    use p3_field::{PrimeCharacteristicRing, PrimeField64};
+    use proptest::prelude::*;
+
+    use super::*;
+
+    type F = Goldilocks;
+
+    /// Reduce a raw `u64` to its canonical Goldilocks representative.
+    fn canon(x: u64) -> u64 {
+        F::new(x).as_canonical_u64()
+    }
+
+    /// Raw operand patterns stressing every wraparound correction: field
+    /// extremes, the epsilon window, and non-canonical values up to
+    /// `u64::MAX`. The ops probed with these accept any u64 residue.
+    pub const EDGE: [u64; 8] = [0, 1, (1 << 32) - 1, 1 << 32, 1 << 63, P - 1, P, u64::MAX];
+
+    /// Boundary u64s probed against every scalar ASM op.
+    pub const EDGE_VALUES: &[u64] = &[
+        0,
+        1,
+        2,
+        EPSILON - 1,
+        EPSILON,
+        EPSILON + 1,
+        1u64 << 31,
+        (1u64 << 32) + 1,
+        1u64 << 33,
+        1u64 << 63,
+        P - 2,
+        P - 1, // largest canonical
+        P,     // smallest non-canonical (= 0 mod P)
+        P + 1,
+        P + 2,
+        18_446_744_069_605_983_184, // PR #1580 regression input a
+        18_446_744_073_709_551_599, // PR #1580 regression input b
+        u64::MAX - 1,
+        u64::MAX, // largest non-canonical
+    ];
+
+    /// Strategy biased toward the non-canonical band.
+    pub fn danger_u64() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            prop::sample::select(EDGE_VALUES.to_vec()),
+            P..u64::MAX,
+            P..=P.saturating_add(EPSILON - 1),
+            any::<u64>(),
+        ]
+    }
+
+    /// Length-`WIDTH` array of danger-band u64s.
+    pub fn danger_array<const WIDTH: usize>() -> impl Strategy<Value = [u64; WIDTH]> {
+        prop::collection::vec(danger_u64(), WIDTH).prop_map(|v: Vec<u64>| {
+            v.try_into()
+                .expect("prop::collection::vec produces exactly WIDTH elements")
+        })
+    }
+
+    #[test]
+    fn test_add_asm_large_values() {
+        let a: u64 = 18_446_744_069_605_983_184; // = p + 191_398_863
+        let b: u64 = 18_446_744_073_709_551_599; // = p + 4_294_967_278
+        // (a + b) mod p == 4_486_366_141
+        let expected = 4_486_366_141u64;
+
+        let got = canon(unsafe { add_asm(a, b) });
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_add_asm_edge_pairs() {
+        for &a in EDGE_VALUES {
+            for &b in EDGE_VALUES {
+                let expected = (F::new(a) + F::new(b)).as_canonical_u64();
+                let got = canon(unsafe { add_asm(a, b) });
+                assert_eq!(got, expected, "add({a}, {b})");
+            }
+        }
+    }
+
+    /// Variant of `test_add_asm_edge_pairs` filtered to canonical `b`
+    /// (the precondition of `add_canonical_asm`).
+    #[test]
+    fn test_add_canonical_asm_edge_pairs() {
+        for &a in EDGE_VALUES {
+            for &b in EDGE_VALUES {
+                if b >= P {
+                    continue;
+                }
+                let expected = (F::new(a) + F::new(b)).as_canonical_u64();
+                let got = canon(unsafe { add_canonical_asm(a, b) });
+                assert_eq!(got, expected, "add_canonical({a}, {b})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mul_asm_edge_pairs() {
+        for &a in EDGE_VALUES {
+            for &b in EDGE_VALUES {
+                let expected = (F::new(a) * F::new(b)).as_canonical_u64();
+                let got = canon(unsafe { mul_asm(a, b) });
+                assert_eq!(got, expected, "mul({a}, {b})");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mul_add_asm_edge_triples() {
+        for &a in EDGE_VALUES {
+            for &b in EDGE_VALUES {
+                for &c in EDGE_VALUES {
+                    let expected = (F::new(a) * F::new(b) + F::new(c)).as_canonical_u64();
+                    let got = canon(unsafe { mul_add_asm(a, b, c) });
+                    assert_eq!(got, expected, "mul_add({a}, {b}, {c})");
+                }
+            }
+        }
+    }
+
+    /// Repeated accumulation drives intermediate values deep into the non-canonical band.
+    ///
+    /// The canonical end result must still match.
+    #[test]
+    fn test_add_asm_chained_accumulation() {
+        let mut acc_asm: u64 = P - 1;
+        let mut acc_ref = F::new(P - 1);
+        for _ in 0..1000 {
+            acc_asm = unsafe { add_asm(acc_asm, P - 1) };
+            acc_ref += F::new(P - 1);
+        }
+        assert_eq!(canon(acc_asm), acc_ref.as_canonical_u64());
+    }
+
+    proptest! {
+        // ----------------------------------------------------------------
+        // Scalar field arithmetic
+        // ----------------------------------------------------------------
+
+        /// Verify ASM addition against field addition.
+        #[test]
+        fn test_add_asm(a: u64, b: u64) {
+            let expected = (F::new(a) + F::new(b)).as_canonical_u64();
+            let got = canon(unsafe { add_asm(a, b) });
+            prop_assert_eq!(got, expected);
+        }
+
+        /// Verify ASM canonical-b addition against field addition.
+        /// `b` is constrained to `[0, P)` per the precondition.
+        #[test]
+        fn test_add_canonical_asm(a: u64, b in 0u64..P) {
+            let expected = (F::new(a) + F::new(b)).as_canonical_u64();
+            let got = canon(unsafe { add_canonical_asm(a, b) });
+            prop_assert_eq!(got, expected);
+        }
+
+        /// Verify ASM multiplication against field multiplication.
+        #[test]
+        fn test_mul_asm(a: u64, b: u64) {
+            let expected = (F::new(a) * F::new(b)).as_canonical_u64();
+            let got = canon(unsafe { mul_asm(a, b) });
+            prop_assert_eq!(got, expected);
+        }
+
+        /// Verify ASM fused multiply-add against field multiply-add.
+        #[test]
+        fn test_mul_add_asm(a: u64, b: u64, c: u64) {
+            let expected = (F::new(a) * F::new(b) + F::new(c)).as_canonical_u64();
+            let got = canon(unsafe { mul_add_asm(a, b, c) });
+            prop_assert_eq!(got, expected);
+        }
+
+        /// Same checks, biased toward the non-canonical band.
+        #[test]
+        fn test_add_asm_danger(a in danger_u64(), b in danger_u64()) {
+            let expected = (F::new(a) + F::new(b)).as_canonical_u64();
+            let got = canon(unsafe { add_asm(a, b) });
+            prop_assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn test_mul_asm_danger(a in danger_u64(), b in danger_u64()) {
+            let expected = (F::new(a) * F::new(b)).as_canonical_u64();
+            let got = canon(unsafe { mul_asm(a, b) });
+            prop_assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn test_mul_add_asm_danger(
+            a in danger_u64(),
+            b in danger_u64(),
+            c in danger_u64(),
+        ) {
+            let expected = (F::new(a) * F::new(b) + F::new(c)).as_canonical_u64();
+            let got = canon(unsafe { mul_add_asm(a, b, c) });
+            prop_assert_eq!(got, expected);
+        }
+
+        // ----------------------------------------------------------------
+        // Unpack: packed state -> two raw u64 lane arrays
+        // ----------------------------------------------------------------
+
+        #[test]
+        fn test_unpack_lanes_w8(
+            lane_a in prop::array::uniform8(any::<u64>()),
+            lane_b in prop::array::uniform8(any::<u64>()),
+        ) {
+            // Build a packed state from two independent lane arrays.
+            let packed: [PackedGoldilocksNeon; 8] =
+                core::array::from_fn(|i| PackedGoldilocksNeon([F::new(lane_a[i]), F::new(lane_b[i])]));
+
+            // Unpack into raw u64 lane arrays.
+            let (got0, got1) = unpack_lanes(&packed);
+
+            // Each raw value must be the internal representation of the field element.
+            for i in 0..8 {
+                prop_assert_eq!(got0[i], F::new(lane_a[i]).value);
+                prop_assert_eq!(got1[i], F::new(lane_b[i]).value);
+            }
+        }
+
+        #[test]
+        fn test_unpack_lanes_w12(
+            lane_a in prop::array::uniform12(any::<u64>()),
+            lane_b in prop::array::uniform12(any::<u64>()),
+        ) {
+            // Same verification, width 12.
+            let packed: [PackedGoldilocksNeon; 12] =
+                core::array::from_fn(|i| PackedGoldilocksNeon([F::new(lane_a[i]), F::new(lane_b[i])]));
+
+            let (got0, got1) = unpack_lanes(&packed);
+
+            for i in 0..12 {
+                prop_assert_eq!(got0[i], F::new(lane_a[i]).value);
+                prop_assert_eq!(got1[i], F::new(lane_b[i]).value);
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Pack: two raw u64 lane arrays -> packed state
+        // ----------------------------------------------------------------
+
+        #[test]
+        fn test_pack_lanes_w8(
+            lane_a in prop::array::uniform8(any::<u64>()),
+            lane_b in prop::array::uniform8(any::<u64>()),
+        ) {
+            // Pack two raw lane arrays into packed state.
+            let mut packed = [PackedGoldilocksNeon([F::ZERO; 2]); 8];
+            pack_lanes(&mut packed, &lane_a, &lane_b);
+
+            // Each packed element must hold the two corresponding field elements.
+            for i in 0..8 {
+                prop_assert_eq!(packed[i].0[0], F::new(lane_a[i]));
+                prop_assert_eq!(packed[i].0[1], F::new(lane_b[i]));
+            }
+        }
+
+        #[test]
+        fn test_pack_lanes_w12(
+            lane_a in prop::array::uniform12(any::<u64>()),
+            lane_b in prop::array::uniform12(any::<u64>()),
+        ) {
+            // Same verification, width 12.
+            let mut packed = [PackedGoldilocksNeon([F::ZERO; 2]); 12];
+            pack_lanes(&mut packed, &lane_a, &lane_b);
+
+            for i in 0..12 {
+                prop_assert_eq!(packed[i].0[0], F::new(lane_a[i]));
+                prop_assert_eq!(packed[i].0[1], F::new(lane_b[i]));
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Roundtrip: pack then unpack recovers canonical values
+        // ----------------------------------------------------------------
+
+        #[test]
+        fn test_roundtrip_pack_unpack_w8(
+            lane_a in prop::array::uniform8(any::<u64>()),
+            lane_b in prop::array::uniform8(any::<u64>()),
+        ) {
+            // Pack two lane arrays, then unpack them.
+            let mut packed = [PackedGoldilocksNeon([F::ZERO; 2]); 8];
+            pack_lanes(&mut packed, &lane_a, &lane_b);
+            let (out0, out1) = unpack_lanes(&packed);
+
+            // The canonical form of the recovered values must match.
+            for i in 0..8 {
+                prop_assert_eq!(F::new(out0[i]).as_canonical_u64(), F::new(lane_a[i]).as_canonical_u64());
+                prop_assert_eq!(F::new(out1[i]).as_canonical_u64(), F::new(lane_b[i]).as_canonical_u64());
+            }
+        }
+
+        #[test]
+        fn test_roundtrip_pack_unpack_w12(
+            lane_a in prop::array::uniform12(any::<u64>()),
+            lane_b in prop::array::uniform12(any::<u64>()),
+        ) {
+            // Same roundtrip, width 12.
+            let mut packed = [PackedGoldilocksNeon([F::ZERO; 2]); 12];
+            pack_lanes(&mut packed, &lane_a, &lane_b);
+            let (out0, out1) = unpack_lanes(&packed);
+
+            for i in 0..12 {
+                prop_assert_eq!(F::new(out0[i]).as_canonical_u64(), F::new(lane_a[i]).as_canonical_u64());
+                prop_assert_eq!(F::new(out1[i]).as_canonical_u64(), F::new(lane_b[i]).as_canonical_u64());
+            }
+        }
+
+        // ----------------------------------------------------------------
+        // Roundtrip: unpack then pack preserves packed state
+        // ----------------------------------------------------------------
+
+        #[test]
+        fn test_roundtrip_unpack_pack_w8(
+            lane_a in prop::array::uniform8(any::<u64>()),
+            lane_b in prop::array::uniform8(any::<u64>()),
+        ) {
+            // Start from a packed state.
+            let original: [PackedGoldilocksNeon; 8] =
+                core::array::from_fn(|i| PackedGoldilocksNeon([F::new(lane_a[i]), F::new(lane_b[i])]));
+
+            // Unpack into raw lanes, then pack back.
+            let (raw0, raw1) = unpack_lanes(&original);
+            let mut restored = [PackedGoldilocksNeon([F::ZERO; 2]); 8];
+            pack_lanes(&mut restored, &raw0, &raw1);
+
+            // The restored packed state must equal the original.
+            for i in 0..8 {
+                prop_assert_eq!(restored[i].0[0], original[i].0[0]);
+                prop_assert_eq!(restored[i].0[1], original[i].0[1]);
+            }
+        }
+
+        #[test]
+        fn test_roundtrip_unpack_pack_w12(
+            lane_a in prop::array::uniform12(any::<u64>()),
+            lane_b in prop::array::uniform12(any::<u64>()),
+        ) {
+            // Same reverse roundtrip, width 12.
+            let original: [PackedGoldilocksNeon; 12] =
+                core::array::from_fn(|i| PackedGoldilocksNeon([F::new(lane_a[i]), F::new(lane_b[i])]));
+
+            let (raw0, raw1) = unpack_lanes(&original);
+            let mut restored = [PackedGoldilocksNeon([F::ZERO; 2]); 12];
+            pack_lanes(&mut restored, &raw0, &raw1);
+
+            for i in 0..12 {
+                prop_assert_eq!(restored[i].0[0], original[i].0[0]);
+                prop_assert_eq!(restored[i].0[1], original[i].0[1]);
+            }
+        }
+    }
+}

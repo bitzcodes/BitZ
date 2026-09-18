@@ -1,0 +1,621 @@
+//! Degree-5 extension field using the trinomial `X^5 + X^2 - 1`.
+//!
+//! This extension requires that `X^5 + X^2 - 1` is irreducible over the base field.
+//! Currently used for KoalaBear where irreducibility has been verified.
+//!
+//! Reduction identity: `X^5 = 1 - X^2`
+
+use alloc::format;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::array;
+use core::fmt::{self, Display, Formatter};
+use core::iter::{Product, Sum};
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+
+use itertools::Itertools;
+use num_bigint::BigUint;
+use p3_util::{as_base_slice, as_base_slice_mut, reconstitute_from_base};
+
+use super::packed_quintic_extension::PackedQuinticTrinomialExtensionField;
+use super::{ExtField, HasFrobenius, HasTwoAdicQuinticExtension};
+use crate::extension::{ExtensionAlgebra, QuinticTrinomial, QuinticTrinomialExtendable};
+use crate::field::Field;
+use crate::{
+    Algebra, ExtensionField, PackedFieldExtension, PrimeCharacteristicRing, RawDataSerializable,
+    TwoAdicField, field_to_array,
+};
+
+/// A degree-5 extension field using the trinomial `X^5 + X^2 - 1`.
+///
+/// Elements are represented as `a_0 + a_1*X + a_2*X^2 + a_3*X^3 + a_4*X^4`.
+///
+/// Type alias for the unified [`ExtField`] with `Shape = QuinticTrinomial`.
+pub type QuinticTrinomialExtensionField<F, A = F> = ExtField<F, 5, QuinticTrinomial, A>;
+
+impl<F: Copy> QuinticTrinomialExtensionField<F, F> {
+    /// Convert a `[[F; 5]; N]` array to an array of extension field elements.
+    ///
+    /// # Panics
+    /// Panics if `N == 0`.
+    #[inline]
+    pub const fn new_array<const N: usize>(input: [[F; 5]; N]) -> [Self; N] {
+        const { assert!(N > 0) }
+        let mut output = [Self::new(input[0]); N];
+        let mut i = 1;
+        while i < N {
+            output[i] = Self::new(input[i]);
+            i += 1;
+        }
+        output
+    }
+}
+
+impl<F: QuinticTrinomialExtendable> ExtensionField<F> for QuinticTrinomialExtensionField<F>
+where
+    PackedQuinticTrinomialExtensionField<F, F::Packing>: PackedFieldExtension<F, Self>,
+{
+    type ExtensionPacking = PackedQuinticTrinomialExtensionField<F, F::Packing>;
+
+    #[inline]
+    fn is_in_basefield(&self) -> bool {
+        self.value[1..].iter().all(F::is_zero)
+    }
+
+    #[inline]
+    fn as_base(&self) -> Option<F> {
+        <Self as ExtensionField<F>>::is_in_basefield(self).then(|| self.value[0])
+    }
+}
+
+impl<F: QuinticTrinomialExtendable> HasFrobenius<F> for QuinticTrinomialExtensionField<F> {
+    #[inline]
+    fn frobenius(&self) -> Self {
+        let a = &self.value;
+        let fc = &F::FROBENIUS_COEFFS;
+
+        // φ(a) = a_0 + Σ_{k=1}^{4} a_k * X^{k*p} where X^{k*p} = fc[k-1]
+        let a_tail = &[a[1], a[2], a[3], a[4]];
+        let c0 = a[0] + F::dot_product::<4>(a_tail, &[fc[0][0], fc[1][0], fc[2][0], fc[3][0]]);
+        let c1 = F::dot_product::<4>(a_tail, &[fc[0][1], fc[1][1], fc[2][1], fc[3][1]]);
+        let c2 = F::dot_product::<4>(a_tail, &[fc[0][2], fc[1][2], fc[2][2], fc[3][2]]);
+        let c3 = F::dot_product::<4>(a_tail, &[fc[0][3], fc[1][3], fc[2][3], fc[3][3]]);
+        let c4 = F::dot_product::<4>(a_tail, &[fc[0][4], fc[1][4], fc[2][4], fc[3][4]]);
+
+        Self::new([c0, c1, c2, c3, c4])
+    }
+
+    /// Apply Frobenius `count` times: `x → x^{p^count}`.
+    #[inline]
+    fn repeated_frobenius(&self, count: usize) -> Self {
+        match count % 5 {
+            0 => *self,
+            _ => {
+                let mut result = *self;
+                for _ in 0..(count % 5) {
+                    result = result.frobenius();
+                }
+                result
+            }
+        }
+    }
+
+    /// Compute pseudo-inverse using Frobenius automorphism.
+    ///
+    /// Returns `0` if `self == 0`, and `1/self` otherwise.
+    ///
+    /// Uses the identity: `a^{-1} = ProdConj(a) * Norm(a)^{-1}` where
+    /// - `ProdConj(a) = a^{p^4 + p^3 + p^2 + p}`,
+    /// - `Norm(a) = a * ProdConj(a)` is in the base field.
+    #[inline]
+    fn pseudo_inv(&self) -> Self {
+        if self.is_zero() {
+            return Self::ZERO;
+        }
+
+        // Compute ProdConj(a) = a^{p^4 + p^3 + p^2 + p} efficiently:
+        // a^{p + p^2} = (a * a^p)^p, then a^{p + p^2 + p^3 + p^4} = (a^{p+p^2}) * (a^{p+p^2})^{p^2}
+        let a_exp_p = self.frobenius();
+        let a_exp_p_plus_p2 = (*self * a_exp_p).frobenius();
+        let prod_conj = a_exp_p_plus_p2 * a_exp_p_plus_p2.repeated_frobenius(2);
+
+        // Norm(a) = a * ProdConj(a) lies in the base field.
+        // Compute only the constant coefficient.
+        let norm = self.compute_norm_with_prod_conj(&prod_conj);
+        debug_assert_eq!(Self::from(norm), *self * prod_conj);
+
+        prod_conj * norm.inverse()
+    }
+}
+
+impl<F: QuinticTrinomialExtendable> QuinticTrinomialExtensionField<F> {
+    /// Compute the norm given pre-computed product of conjugates.
+    ///
+    /// The norm `Norm(a) = a * prod_conj` lies in the base field.
+    /// This computes only the constant coefficient for efficiency.
+    #[inline]
+    fn compute_norm_with_prod_conj(&self, prod_conj: &Self) -> F {
+        let a = &self.value;
+        let b = &prod_conj.value;
+
+        // For trinomial X^5 + X^2 - 1, the constant term of a*b is:
+        // c_0 + c_5 - c_8 where c_k = Σ_{i+j=k} a_i*b_j
+        let c0 = a[0] * b[0];
+        let c5 = F::dot_product::<4>(&[a[1], a[2], a[3], a[4]], &[b[4], b[3], b[2], b[1]]);
+        let c8 = a[4] * b[4];
+
+        c0 + c5 - c8
+    }
+}
+
+impl<F, A> PrimeCharacteristicRing for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial> + Copy,
+{
+    type PrimeSubfield = <A as PrimeCharacteristicRing>::PrimeSubfield;
+
+    const ZERO: Self = Self::new([A::ZERO; 5]);
+    const ONE: Self = Self::new(field_to_array(A::ONE));
+    const TWO: Self = Self::new(field_to_array(A::TWO));
+    const NEG_ONE: Self = Self::new(field_to_array(A::NEG_ONE));
+
+    #[inline]
+    fn from_prime_subfield(f: Self::PrimeSubfield) -> Self {
+        <A as PrimeCharacteristicRing>::from_prime_subfield(f).into()
+    }
+
+    #[inline]
+    fn halve(&self) -> Self {
+        Self::new(array::from_fn(|i| self.value[i].halve()))
+    }
+
+    #[inline(always)]
+    fn square(&self) -> Self {
+        let mut res = Self::default();
+        <A as ExtensionAlgebra<F, 5, QuinticTrinomial>>::ext_square(&self.value, &mut res.value);
+        res
+    }
+
+    #[inline]
+    fn mul_2exp_u64(&self, exp: u64) -> Self {
+        Self::new(array::from_fn(|i| self.value[i].mul_2exp_u64(exp)))
+    }
+
+    #[inline]
+    fn div_2exp_u64(&self, exp: u64) -> Self {
+        Self::new(array::from_fn(|i| self.value[i].div_2exp_u64(exp)))
+    }
+
+    #[inline]
+    fn zero_vec(len: usize) -> Vec<Self> {
+        // SAFETY: `Self` is `repr(transparent)` over `[A; 5]`.
+        unsafe { reconstitute_from_base(A::zero_vec(len * 5)) }
+    }
+}
+
+impl<F: QuinticTrinomialExtendable> Algebra<F> for QuinticTrinomialExtensionField<F> {}
+
+impl<F: QuinticTrinomialExtendable> RawDataSerializable for QuinticTrinomialExtensionField<F> {
+    const NUM_BYTES: usize = F::NUM_BYTES * 5;
+
+    #[inline]
+    fn into_bytes(self) -> impl IntoIterator<Item = u8> {
+        self.value.into_iter().flat_map(|x| x.into_bytes())
+    }
+
+    #[inline]
+    fn into_byte_stream(input: impl IntoIterator<Item = Self>) -> impl IntoIterator<Item = u8> {
+        F::into_byte_stream(input.into_iter().flat_map(|x| x.value))
+    }
+
+    #[inline]
+    fn into_u32_stream(input: impl IntoIterator<Item = Self>) -> impl IntoIterator<Item = u32> {
+        F::into_u32_stream(input.into_iter().flat_map(|x| x.value))
+    }
+
+    #[inline]
+    fn into_u64_stream(input: impl IntoIterator<Item = Self>) -> impl IntoIterator<Item = u64> {
+        F::into_u64_stream(input.into_iter().flat_map(|x| x.value))
+    }
+
+    #[inline]
+    fn into_parallel_byte_streams<const N: usize>(
+        input: impl IntoIterator<Item = [Self; N]>,
+    ) -> impl IntoIterator<Item = [u8; N]> {
+        F::into_parallel_byte_streams(
+            input
+                .into_iter()
+                .flat_map(|x| (0..5).map(move |i| array::from_fn(|j| x[j].value[i]))),
+        )
+    }
+
+    #[inline]
+    fn into_parallel_u32_streams<const N: usize>(
+        input: impl IntoIterator<Item = [Self; N]>,
+    ) -> impl IntoIterator<Item = [u32; N]> {
+        F::into_parallel_u32_streams(
+            input
+                .into_iter()
+                .flat_map(|x| (0..5).map(move |i| array::from_fn(|j| x[j].value[i]))),
+        )
+    }
+
+    #[inline]
+    fn into_parallel_u64_streams<const N: usize>(
+        input: impl IntoIterator<Item = [Self; N]>,
+    ) -> impl IntoIterator<Item = [u64; N]> {
+        F::into_parallel_u64_streams(
+            input
+                .into_iter()
+                .flat_map(|x| (0..5).map(move |i| array::from_fn(|j| x[j].value[i]))),
+        )
+    }
+}
+
+impl<F: QuinticTrinomialExtendable> Field for QuinticTrinomialExtensionField<F> {
+    type Packing = Self;
+
+    const GENERATOR: Self = Self::new(F::EXT_GENERATOR);
+
+    fn try_inverse(&self) -> Option<Self> {
+        if self.is_zero() {
+            return None;
+        }
+        Some(self.pseudo_inv())
+    }
+
+    #[inline]
+    fn add_slices(slice_1: &mut [Self], slice_2: &[Self]) {
+        // SAFETY: `Self` is `repr(transparent)` over `[F; 5]`.
+        // Addition is F-linear, so we can operate on base field slices.
+        unsafe {
+            let base_slice_1 = as_base_slice_mut(slice_1);
+            let base_slice_2 = as_base_slice(slice_2);
+            F::add_slices(base_slice_1, base_slice_2);
+        }
+    }
+
+    #[inline]
+    fn order() -> BigUint {
+        F::order().pow(5)
+    }
+}
+
+impl<F: QuinticTrinomialExtendable> Display for QuinticTrinomialExtensionField<F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if self.is_zero() {
+            write!(f, "0")
+        } else {
+            let str = self
+                .value
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| !x.is_zero())
+                .map(|(i, x)| match (i, x.is_one()) {
+                    (0, _) => format!("{x}"),
+                    (1, true) => "X".to_string(),
+                    (1, false) => format!("{x} X"),
+                    (_, true) => format!("X^{i}"),
+                    (_, false) => format!("{x} X^{i}"),
+                })
+                .join(" + ");
+            write!(f, "{str}")
+        }
+    }
+}
+
+impl<F, A> Neg for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: Algebra<F>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self {
+        Self::new(self.value.map(A::neg))
+    }
+}
+
+impl<F, A> Add for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        Self::new(<A as ExtensionAlgebra<F, 5, QuinticTrinomial>>::ext_add(
+            &self.value,
+            &rhs.value,
+        ))
+    }
+}
+
+impl<F, A> Add<A> for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: Algebra<F>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn add(mut self, rhs: A) -> Self {
+        self.value[0] += rhs;
+        self
+    }
+}
+
+impl<F, A> AddAssign for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    #[inline]
+    fn add_assign(&mut self, rhs: Self) {
+        self.value =
+            <A as ExtensionAlgebra<F, 5, QuinticTrinomial>>::ext_add(&self.value, &rhs.value);
+    }
+}
+
+impl<F, A> AddAssign<A> for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: Algebra<F>,
+{
+    #[inline]
+    fn add_assign(&mut self, rhs: A) {
+        self.value[0] += rhs;
+    }
+}
+
+impl<F, A> Sum for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial> + Copy,
+{
+    #[inline]
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.reduce(|acc, x| acc + x).unwrap_or(Self::ZERO)
+    }
+}
+
+impl<F, A> Sub for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
+        Self::new(<A as ExtensionAlgebra<F, 5, QuinticTrinomial>>::ext_sub(
+            &self.value,
+            &rhs.value,
+        ))
+    }
+}
+
+impl<F, A> Sub<A> for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: Algebra<F>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: A) -> Self {
+        let mut res = self.value;
+        res[0] -= rhs;
+        Self::new(res)
+    }
+}
+
+impl<F, A> SubAssign for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    #[inline]
+    fn sub_assign(&mut self, rhs: Self) {
+        self.value =
+            <A as ExtensionAlgebra<F, 5, QuinticTrinomial>>::ext_sub(&self.value, &rhs.value);
+    }
+}
+
+impl<F, A> SubAssign<A> for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: Algebra<F>,
+{
+    #[inline]
+    fn sub_assign(&mut self, rhs: A) {
+        self.value[0] -= rhs;
+    }
+}
+
+impl<F, A> Mul for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        let mut res = Self::default();
+        <A as ExtensionAlgebra<F, 5, QuinticTrinomial>>::ext_mul(
+            &self.value,
+            &rhs.value,
+            &mut res.value,
+        );
+        res
+    }
+}
+
+impl<F, A> Mul<A> for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: A) -> Self {
+        Self::new(<A as ExtensionAlgebra<F, 5, QuinticTrinomial>>::ext_base_mul(self.value, rhs))
+    }
+}
+
+impl<F, A> MulAssign for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    #[inline]
+    fn mul_assign(&mut self, rhs: Self) {
+        *self = self.clone() * rhs;
+    }
+}
+
+impl<F, A> MulAssign<A> for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial>,
+{
+    #[inline]
+    fn mul_assign(&mut self, rhs: A) {
+        *self = self.clone() * rhs;
+    }
+}
+
+impl<F, A> Product for QuinticTrinomialExtensionField<F, A>
+where
+    F: QuinticTrinomialExtendable,
+    A: ExtensionAlgebra<F, 5, QuinticTrinomial> + Copy,
+{
+    #[inline]
+    fn product<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.reduce(|acc, x| acc * x).unwrap_or(Self::ONE)
+    }
+}
+
+impl<F> Div for QuinticTrinomialExtensionField<F>
+where
+    F: QuinticTrinomialExtendable,
+{
+    type Output = Self;
+
+    #[allow(clippy::suspicious_arithmetic_impl)]
+    #[inline]
+    fn div(self, rhs: Self) -> Self::Output {
+        self * rhs.inverse()
+    }
+}
+
+impl<F> DivAssign for QuinticTrinomialExtensionField<F>
+where
+    F: QuinticTrinomialExtendable,
+{
+    #[inline]
+    fn div_assign(&mut self, rhs: Self) {
+        *self = *self / rhs;
+    }
+}
+
+impl<F: QuinticTrinomialExtendable + HasTwoAdicQuinticExtension> TwoAdicField
+    for QuinticTrinomialExtensionField<F>
+{
+    const TWO_ADICITY: usize = F::EXT_TWO_ADICITY;
+
+    #[inline]
+    fn two_adic_generator(bits: usize) -> Self {
+        Self::new(F::ext_two_adic_generator(bits))
+    }
+}
+
+/// Multiply two elements in the quintic trinomial extension field (X^5 + X^2 - 1).
+#[inline]
+pub fn trinomial_quintic_mul<R: PrimeCharacteristicRing>(a: &[R; 5], b: &[R; 5], res: &mut [R; 5]) {
+    // Compute convolution coefficients c_k = Σ_{i+j=k} a_i * b_j using dot products
+    let c0 = a[0].dup() * b[0].dup();
+    let c1 = R::dot_product::<2>(&[a[0].dup(), a[1].dup()], &[b[1].dup(), b[0].dup()]);
+    let c2 = R::dot_product::<3>(
+        &[a[0].dup(), a[1].dup(), a[2].dup()],
+        &[b[2].dup(), b[1].dup(), b[0].dup()],
+    );
+    let c3 = R::dot_product::<4>(
+        &[a[0].dup(), a[1].dup(), a[2].dup(), a[3].dup()],
+        &[b[3].dup(), b[2].dup(), b[1].dup(), b[0].dup()],
+    );
+    let c4 = R::dot_product::<5>(
+        a,
+        &[b[4].dup(), b[3].dup(), b[2].dup(), b[1].dup(), b[0].dup()],
+    );
+
+    // High-degree coefficients
+    let c5 = R::dot_product::<4>(
+        &[a[1].dup(), a[2].dup(), a[3].dup(), a[4].dup()],
+        &[b[4].dup(), b[3].dup(), b[2].dup(), b[1].dup()],
+    );
+    let c6 = R::dot_product::<3>(
+        &[a[2].dup(), a[3].dup(), a[4].dup()],
+        &[b[4].dup(), b[3].dup(), b[2].dup()],
+    );
+    let c7 = R::dot_product::<2>(&[a[3].dup(), a[4].dup()], &[b[4].dup(), b[3].dup()]);
+    let c8 = a[4].dup() * b[4].dup();
+
+    // Pre-compute c5 - c8 to save an operation
+    let c5_minus_c8 = c5 - c8.dup();
+
+    // Apply reduction: X^5 = 1 - X^2, X^6 = X - X^3, X^7 = X^2 - X^4, X^8 = X^3 + X^2 - 1
+    res[0] = c0 + c5_minus_c8.dup();
+    res[1] = c1 + c6.dup();
+    res[2] = c2 - c5_minus_c8 + c7.dup();
+    res[3] = c3 - c6 + c8;
+    res[4] = c4 - c7;
+}
+
+/// Square an element in the quintic extension field.
+#[inline]
+pub fn quintic_square<R: PrimeCharacteristicRing>(a: &[R; 5], res: &mut [R; 5]) {
+    // Precompute doubled coefficients for cross terms
+    let a0_2 = a[0].double();
+    let a1_2 = a[1].double();
+    let a2_2 = a[2].double();
+    let a3_2 = a[3].double();
+
+    // Compute convolution coefficients using dot products
+    // c0 = a0^2
+    let c0 = a[0].square();
+    // c1 = 2*a0*a1
+    let c1 = a0_2.dup() * a[1].dup();
+    // c2 = 2*a0*a2 + a1^2
+    let c2 = R::dot_product::<2>(&[a0_2.dup(), a[1].dup()], &[a[2].dup(), a[1].dup()]);
+    // c3 = 2*a0*a3 + 2*a1*a2
+    let c3 = R::dot_product::<2>(&[a0_2.dup(), a1_2.dup()], &[a[3].dup(), a[2].dup()]);
+    // c4 = 2*a0*a4 + 2*a1*a3 + a2^2
+    let c4 = R::dot_product::<3>(
+        &[a0_2, a1_2.dup(), a[2].dup()],
+        &[a[4].dup(), a[3].dup(), a[2].dup()],
+    );
+    // c5 = 2*a1*a4 + 2*a2*a3
+    let c5 = R::dot_product::<2>(&[a1_2, a2_2.dup()], &[a[4].dup(), a[3].dup()]);
+    // c6 = 2*a2*a4 + a3^2
+    let c6 = R::dot_product::<2>(&[a2_2, a[3].dup()], &[a[4].dup(), a[3].dup()]);
+    // c7 = 2*a3*a4
+    let c7 = a3_2 * a[4].dup();
+    // c8 = a4^2
+    let c8 = a[4].square();
+
+    // Pre-compute c5 - c8 to save an operation
+    let c5_minus_c8 = c5 - c8.dup();
+
+    // Apply reduction: X^5 = 1 - X^2, X^6 = X - X^3, X^7 = X^2 - X^4, X^8 = X^3 + X^2 - 1
+    res[0] = c0 + c5_minus_c8.dup();
+    res[1] = c1 + c6.dup();
+    res[2] = c2 - c5_minus_c8 + c7.dup();
+    res[3] = c3 - c6 + c8;
+    res[4] = c4 - c7;
+}

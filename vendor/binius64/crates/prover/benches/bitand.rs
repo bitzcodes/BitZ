@@ -1,0 +1,157 @@
+// Copyright 2025 Irreducible Inc.
+use std::iter::repeat_with;
+
+use binius_compute::{BufferPool, GlobalAllocator};
+use binius_core::word::Word;
+use binius_field::{Field, Random};
+use binius_ip_prover::sumcheck::{common::MleCheckProver, quadratic_mlecheck_prover};
+use binius_math::{BinarySubspace, univariate::EvaluationDomain};
+use binius_prover::{
+	OptimalPackedB128,
+	fold_word::BitAxisFolder,
+	protocols::bitand::{
+		NTTLookup, sumcheck_round_messages::univariate_round_message_extension_domain,
+	},
+};
+use binius_verifier::{
+	config::{B128, PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES},
+	protocols::bitand::{ROWS_PER_HYPERCUBE_VERTEX, SKIPPED_VARS},
+};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+use rand::prelude::*;
+
+fn bench(c: &mut Criterion) {
+	let mut rng = rand::rng();
+
+	let log_words = 21;
+	let big_field_zerocheck_challenges =
+		vec![B128::random(&mut rng); log_words - PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES.len()];
+
+	let a_words: Vec<Word> = repeat_with(|| Word(rng.random()))
+		.take(1 << log_words)
+		.collect();
+	let b_words: Vec<Word> = repeat_with(|| Word(rng.random()))
+		.take(1 << log_words)
+		.collect();
+
+	let prover_message_domain = BinarySubspace::with_dim(SKIPPED_VARS + 1);
+
+	let univariate_domain: BinarySubspace<B128> = prover_message_domain
+		.reduce_dim(prover_message_domain.dim() - 1)
+		.isomorphic();
+
+	let mut group = c.benchmark_group("evaluate");
+	group.bench_function("NTT lookup precompute", |bench| {
+		bench.iter(|| NTTLookup::new(&prover_message_domain));
+	});
+
+	group.throughput(Throughput::Elements(1 << log_words));
+	group.bench_function(format!("univariate_round_message 2^{log_words}"), |bench| {
+		bench.iter(|| {
+			univariate_round_message_extension_domain::<B128>(
+				log_words,
+				&a_words,
+				&b_words,
+				&big_field_zerocheck_challenges,
+				&prover_message_domain,
+			)
+		});
+	});
+
+	// Padded shape: rounding a non-power-of-two AND count up to a power of two leaves a zero
+	// suffix. Keccak and SHA-256 batches carry such a suffix; here it is 2/5 of the words.
+	// Keep the first 3/5 populated and zero the rest.
+	let padded_real = (1usize << log_words) * 3 / 5;
+	let mut a_words_padded = a_words.clone();
+	let mut b_words_padded = b_words.clone();
+	a_words_padded[padded_real..].fill(Word::ZERO);
+	b_words_padded[padded_real..].fill(Word::ZERO);
+
+	group.bench_function(
+		format!("univariate_round_message 2^{log_words} (40% zero padding)"),
+		|bench| {
+			bench.iter(|| {
+				univariate_round_message_extension_domain::<B128>(
+					log_words,
+					&a_words_padded,
+					&b_words_padded,
+					&big_field_zerocheck_challenges,
+					&prover_message_domain,
+				)
+			});
+		},
+	);
+
+	let urm = univariate_round_message_extension_domain::<B128>(
+		log_words,
+		&a_words,
+		&b_words,
+		&big_field_zerocheck_challenges,
+		&prover_message_domain,
+	);
+	let univariate_challenge = B128::random(&mut rng);
+
+	group.bench_function(format!("univariate fold 2^{log_words}"), |bench| {
+		bench.iter(|| {
+			let lagrange_evals = univariate_domain.lagrange_evals(&univariate_challenge);
+			let folder = BitAxisFolder::new(&lagrange_evals);
+			folder.fold_bitand_operands::<OptimalPackedB128, _>(
+				&GlobalAllocator,
+				&a_words,
+				&b_words,
+			)
+		});
+	});
+
+	let lagrange_evals = univariate_domain.lagrange_evals(&univariate_challenge);
+	let folder = BitAxisFolder::new(&lagrange_evals);
+
+	let mut univariate_message_coeffs = vec![B128::ZERO; 2 * ROWS_PER_HYPERCUBE_VERTEX];
+	univariate_message_coeffs[ROWS_PER_HYPERCUBE_VERTEX..2 * ROWS_PER_HYPERCUBE_VERTEX]
+		.copy_from_slice(&urm);
+
+	let next_round_claim = prover_message_domain
+		.clone()
+		.isomorphic::<B128>()
+		.extrapolate(&univariate_message_coeffs, &univariate_challenge);
+
+	let pool = BufferPool::new();
+
+	let alloc = &pool;
+	// Fold the operands once; each iteration clones the result from the pool.
+	let proving_polys =
+		folder.fold_bitand_operands::<OptimalPackedB128, _>(&alloc, &a_words, &b_words);
+	group.bench_function(format!("remaining zerocheck 2^{log_words}"), |bench| {
+		bench.iter_batched(
+			|| proving_polys.clone(),
+			|proving_polys| {
+				let multilinear_zerocheck_challenges: Vec<_> =
+					PROVER_SMALL_FIELD_ZEROCHECK_CHALLENGES
+						.into_iter()
+						.map(B128::from)
+						.chain(big_field_zerocheck_challenges.iter().copied())
+						.collect();
+
+				let mut prover = quadratic_mlecheck_prover(
+					&alloc,
+					proving_polys,
+					|[a, b, c]| a * b - c,
+					|[a, b, _]| a * b,
+					multilinear_zerocheck_challenges,
+					next_round_claim,
+				);
+
+				for _ in 0..log_words {
+					let _ = prover.execute();
+					prover.fold(B128::random(&mut rng));
+				}
+
+				prover.finish()
+			},
+			BatchSize::SmallInput,
+		);
+	});
+}
+
+criterion_group!(univariate_round, bench);
+criterion_main!(univariate_round);

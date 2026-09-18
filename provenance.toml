@@ -1,0 +1,72 @@
+# Reconstructed from verified public dependency pins; no Mac snapshot equivalence is claimed.
+# Bundle paths are relative to the separately distributed artifact directory.
+
+[release]
+source_basis = "published-dependency-pins-and-root-tracked-overlay"
+root_base_commit = "8446d64fc011b4b10b6ae852621fd1be4461afaa"
+packaging_intent_commit = "02701f81117ded7a07e2b6135107800d52857c77"
+anonymous_identity = "bitzcodes <bitzcodes@fastmail.com>"
+upstream_policy = "Preserve trees, topology, messages and other contributor metadata. Normalize verified targeted author/committer identities; remove signatures invalidated by that rewrite."
+previous_snapshots_compared = false
+
+[limber]
+path = "vendor/limber"
+git = "https://github.com/lucasxia01/limber-impl.git"
+original_upstream_commit = "959575409f38a0894dab2f2a7b7125c8aa424b78"
+upstream_commit = "cee4ecec8b455c58e492b709e1d101e04804b0b7"
+snapshot_commit = "1eeb0035bce27e89f0c266d9ed382f18ca707161"
+snapshot_tree = "08f06b571d64904f716abf9a6d00da30d139f2fc"
+patch = "patches/limber.patch"
+patch_sha256 = "20c124b122ad5d4b19ab61a6ccee3b8d71b4b0f5f4d38e44d4bded9d934976ff"
+bundle = "vendor-history/limber.bundle"
+bundle_sha256 = "66da3ce9a8b5941c8c16e65ca0889202dc18c9dc288eff9c7f4467a6b0455cd1"
+upstream_commits = 322
+changes = "Published benchmark instrumentation and matched MultiSwap/security parameters. Matched digest domains and lockfile packaging. The historical executable remains in every upstream tree and is removed only in this customization commit."
+
+[plonky3]
+path = "vendor/plonky3"
+git = "https://github.com/Plonky3/Plonky3.git"
+original_upstream_commit = "59be31386d5ab81b87dbceb0b83bf797f9eefaec"
+upstream_commit = "59be31386d5ab81b87dbceb0b83bf797f9eefaec"
+snapshot_commit = "38e4e66be0a8f8348f6ccc4f32711443e835c9d9"
+snapshot_tree = "49a96b650b02f23279048f12cd2f4092bd7b7e6d"
+patch = "patches/plonky3.patch"
+patch_sha256 = "abb2e2808510b414b4002a45086beb06c506968f428f6f6f8f2bf2a9bcf2669a"
+bundle = "vendor-history/plonky3.bundle"
+bundle_sha256 = "a3b2643c2cd6914571429b7c0b3daaef8e5fdce2372486b0f3a6eabcbd73cef2"
+upstream_commits = 1813
+changes = "Published multiplication and hash benchmarks with phase instrumentation. Lockfile packaging; omit the external zkhash development dependency and its BN254 Poseidon2 reference-comparison test."
+
+[binius64]
+path = "vendor/binius64"
+git = "https://github.com/binius-zk/binius64.git"
+original_upstream_commit = "c28940ae693c3999fd225cc6142f43d07d1100bb"
+upstream_commit = "c28940ae693c3999fd225cc6142f43d07d1100bb"
+snapshot_commit = "b44a51e746d5098a665bdbc8d85688ae51c12664"
+snapshot_tree = "6b3abfb63a2ba9fad34929d3a1d395c8e6df4c6d"
+patch = "patches/binius64.patch"
+patch_sha256 = "dedaf62473cd02e4e4a608b83182c251bf7c23cf276ff931b60a34e661f24d5b"
+bundle = "vendor-history/binius64.bundle"
+bundle_sha256 = "125e50e4badd23469b6cc32a2b50a400048996080f1668fcfafc9edb2c0f27c8"
+upstream_commits = 1868
+changes = "Published matched SHA-chain/P-256 benchmarks, configurable verification security and phase instrumentation. Lockfile packaging and incidental example attribution cleanup; copyright notices retained."
+
+[flock-mod]
+path = "vendor/flock-mod"
+git = "https://github.com/succinctlabs/flock.git"
+original_upstream_commit = "e636760f8dae78306f804554fb4244993758b011"
+upstream_commit = "e636760f8dae78306f804554fb4244993758b011"
+snapshot_commit = "a0242d9debb2a82977e40c4fcb9f4bb1b4ab7ee8"
+snapshot_tree = "26242f1e660c8a0c620050d76d95928c8cf967dc"
+patch = "patches/flock-mod.patch"
+patch_sha256 = "3aee203e3db7e6cec922126d8ae2a2c52e95a180bb393b27967901546fa9a09c"
+bundle = "vendor-history/flock-mod.bundle"
+bundle_sha256 = "c4fe381af669950c631572dde808321b5cfb37fbd66e8a4c0c79d3167fe1b4c8"
+upstream_commits = 26
+changes = "Published Ligerito profiles plus the root-tracked interleaved-oracle and shared-field integration. Retain library source, licenses and upstream README; omit standalone upstream benchmarks, CUDA sources and development targets. Local field dependency and lockfile packaging."
+root_overlay_base = "8446d64fc011b4b10b6ae852621fd1be4461afaa"
+
+[halo2curves]
+git = "https://github.com/privacy-ethereum/halo2curves.git"
+upstream_commit = "02c235f0bb52800c28d9c3370400b5435dbe2220"
+changes = "Unmodified official upstream dependency fetched by Cargo for Limber curve arithmetic and mixed-add API."

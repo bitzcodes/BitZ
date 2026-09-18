@@ -1,0 +1,1592 @@
+[
+  {
+    "assignment_digest_blake3": "d51ea96d4c5aa05e30caa13faafe28a1b9ee1bd82a8a956399d32be865090ecc",
+    "backend": "bitz-ligerito",
+    "batch_count": 1,
+    "security": {
+      "achieved_bits": 114.0,
+      "binding_term": "step5_3:ligerito-tracked",
+      "commitment_field": "GF(2^128)",
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "ligerito_config_digest": "9ca0da03137b18a45436fac9ec86d81e6945240d024cadda72e382b82a7b04c1",
+      "ligerito_fold_grinding": [
+        2,
+        0,
+        0,
+        0
+      ],
+      "ligerito_log_inv_rates": [
+        3,
+        4,
+        5,
+        6
+      ],
+      "ligerito_queries": [
+        138,
+        125,
+        120,
+        118
+      ],
+      "ligerito_query_grinding": [
+        0,
+        0,
+        0,
+        0
+      ],
+      "ligerito_target_bits": 114,
+      "model": "per-check-round-minimum/v1",
+      "profile": "limber114",
+      "reduction_grinding_bits": 10,
+      "reduction_max": "10384593717069655257060992658440191",
+      "reduction_min": "5192296858534827628530496329220096",
+      "reduction_prime_bits": 113,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.07489034740448,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step2:projection-draw"
+        },
+        {
+          "bits": 123.09310940439148,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:tau-draw"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:piop-round"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step4:terminal-draw"
+        },
+        {
+          "bits": 114.25208329395548,
+          "floor": false,
+          "grinding_bits": 10,
+          "name": "step5_0:reduction-draw"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_2:gkr-round"
+        },
+        {
+          "bits": 128.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ring-switch"
+        },
+        {
+          "bits": 114.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ligerito-tracked"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": true,
+          "grinding_bits": 0,
+          "name": "step5_3:gf128-floor-untracked"
+        }
+      ],
+      "transcript_hash": "BLAKE3",
+      "verifier_randomness": "native Fiat-Shamir transcript"
+    },
+    "statement_contract": {
+      "batch_count": 1,
+      "constant": 1,
+      "digest_blake3": "2dd1c523415ccb5d33d8c72de4257496e08d09a9d16ae1374c45b907c07b6306",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 6204,
+      "live_rows": 6209,
+      "padded_columns": 8192,
+      "padded_rows": 8192,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "b57b8e3182cde28f95ddcd74009165c94ab619fbcb4c40e772319d93667ef4c4",
+    "backend": "bitz-ligerito",
+    "batch_count": 2,
+    "security": {
+      "achieved_bits": 114.0,
+      "binding_term": "step5_3:ligerito-tracked",
+      "commitment_field": "GF(2^128)",
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "ligerito_config_digest": "534ab57107e0e048097135b67b4e93d93921542d5b1aad89211652a6f4f32644",
+      "ligerito_fold_grinding": [
+        3,
+        1,
+        0,
+        0,
+        0
+      ],
+      "ligerito_log_inv_rates": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "ligerito_queries": [
+        138,
+        125,
+        120,
+        117,
+        116
+      ],
+      "ligerito_query_grinding": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "ligerito_target_bits": 114,
+      "model": "per-check-round-minimum/v1",
+      "profile": "limber114",
+      "reduction_grinding_bits": 10,
+      "reduction_max": "10384593717069655257060992658440191",
+      "reduction_min": "5192296858534827628530496329220096",
+      "reduction_prime_bits": 113,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.07489034740448,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step2:projection-draw"
+        },
+        {
+          "bits": 123.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:tau-draw"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:piop-round"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step4:terminal-draw"
+        },
+        {
+          "bits": 114.25208329395548,
+          "floor": false,
+          "grinding_bits": 10,
+          "name": "step5_0:reduction-draw"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_2:gkr-round"
+        },
+        {
+          "bits": 128.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ring-switch"
+        },
+        {
+          "bits": 114.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ligerito-tracked"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": true,
+          "grinding_bits": 0,
+          "name": "step5_3:gf128-floor-untracked"
+        }
+      ],
+      "transcript_hash": "BLAKE3",
+      "verifier_randomness": "native Fiat-Shamir transcript"
+    },
+    "statement_contract": {
+      "batch_count": 2,
+      "constant": 1,
+      "digest_blake3": "b7dc7d45bb3c383d2dc236aeed92d88956c6a7de20053aee78f62c892fb2cadd",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 12408,
+      "live_rows": 12418,
+      "padded_columns": 16384,
+      "padded_rows": 16384,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "5de736c7977db4745b941c9d715f236da595c1fa554ad38ddd4d4d35e1b2dae7",
+    "backend": "bitz-ligerito",
+    "batch_count": 4,
+    "security": {
+      "achieved_bits": 114.0,
+      "binding_term": "step5_3:ligerito-tracked",
+      "commitment_field": "GF(2^128)",
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "ligerito_config_digest": "649151bb1c1c5c0d56908dfa7defdbfa0548d6d8d3fcbaa2ef4a405c8f53efc6",
+      "ligerito_fold_grinding": [
+        4,
+        2,
+        0,
+        0,
+        0
+      ],
+      "ligerito_log_inv_rates": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "ligerito_queries": [
+        138,
+        125,
+        120,
+        117,
+        116
+      ],
+      "ligerito_query_grinding": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "ligerito_target_bits": 114,
+      "model": "per-check-round-minimum/v1",
+      "profile": "limber114",
+      "reduction_grinding_bits": 10,
+      "reduction_max": "10384593717069655257060992658440191",
+      "reduction_min": "5192296858534827628530496329220096",
+      "reduction_prime_bits": 113,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.07489034740448,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step2:projection-draw"
+        },
+        {
+          "bits": 122.91253715874966,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:tau-draw"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:piop-round"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step4:terminal-draw"
+        },
+        {
+          "bits": 114.25208329395548,
+          "floor": false,
+          "grinding_bits": 10,
+          "name": "step5_0:reduction-draw"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_2:gkr-round"
+        },
+        {
+          "bits": 128.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ring-switch"
+        },
+        {
+          "bits": 114.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ligerito-tracked"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": true,
+          "grinding_bits": 0,
+          "name": "step5_3:gf128-floor-untracked"
+        }
+      ],
+      "transcript_hash": "BLAKE3",
+      "verifier_randomness": "native Fiat-Shamir transcript"
+    },
+    "statement_contract": {
+      "batch_count": 4,
+      "constant": 1,
+      "digest_blake3": "a6f5a7971bfed019b2b294a936fe32cc27b75356134376a857eb15ca0c985b38",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 24816,
+      "live_rows": 24836,
+      "padded_columns": 32768,
+      "padded_rows": 32768,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "0d3730e680e818e67abaa9147614fbdc9056db15679c98bb03332f9ee8490964",
+    "backend": "bitz-ligerito",
+    "batch_count": 8,
+    "security": {
+      "achieved_bits": 114.0,
+      "binding_term": "step5_3:ligerito-tracked",
+      "commitment_field": "GF(2^128)",
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "ligerito_config_digest": "85bff15e1cf8c85cc4951ff0db72d3ba64abadb91c88afafd2538259d1cbb7da",
+      "ligerito_fold_grinding": [
+        5,
+        3,
+        1,
+        0,
+        0
+      ],
+      "ligerito_log_inv_rates": [
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "ligerito_queries": [
+        138,
+        125,
+        120,
+        117,
+        116
+      ],
+      "ligerito_query_grinding": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "ligerito_target_bits": 114,
+      "model": "per-check-round-minimum/v1",
+      "profile": "limber114",
+      "reduction_grinding_bits": 10,
+      "reduction_max": "10384593717069655257060992658440191",
+      "reduction_min": "5192296858534827628530496329220096",
+      "reduction_prime_bits": 113,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.07489034740448,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step2:projection-draw"
+        },
+        {
+          "bits": 122.83007499855769,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:tau-draw"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:piop-round"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step4:terminal-draw"
+        },
+        {
+          "bits": 114.25208329395548,
+          "floor": false,
+          "grinding_bits": 10,
+          "name": "step5_0:reduction-draw"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_2:gkr-round"
+        },
+        {
+          "bits": 128.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ring-switch"
+        },
+        {
+          "bits": 114.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ligerito-tracked"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": true,
+          "grinding_bits": 0,
+          "name": "step5_3:gf128-floor-untracked"
+        }
+      ],
+      "transcript_hash": "BLAKE3",
+      "verifier_randomness": "native Fiat-Shamir transcript"
+    },
+    "statement_contract": {
+      "batch_count": 8,
+      "constant": 1,
+      "digest_blake3": "305b98c072c05428a645e7892077812436acbd66b846b044646b0b8b4caeff32",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 49632,
+      "live_rows": 49672,
+      "padded_columns": 65536,
+      "padded_rows": 65536,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "da273d9a6c7d274301c279f77ead9a6aa25131fe546d9e6e21a238b683a5f8ca",
+    "backend": "bitz-ligerito",
+    "batch_count": 16,
+    "security": {
+      "achieved_bits": 114.0,
+      "binding_term": "step5_3:ligerito-tracked",
+      "commitment_field": "GF(2^128)",
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "ligerito_config_digest": "c47c767c72691b16464117285a22e378ae3132078b537db74bdce561aa210af5",
+      "ligerito_fold_grinding": [
+        6,
+        4,
+        2,
+        0,
+        0,
+        0
+      ],
+      "ligerito_log_inv_rates": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "ligerito_queries": [
+        138,
+        125,
+        120,
+        117,
+        116,
+        115
+      ],
+      "ligerito_query_grinding": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "ligerito_target_bits": 114,
+      "model": "per-check-round-minimum/v1",
+      "profile": "limber114",
+      "reduction_grinding_bits": 10,
+      "reduction_max": "10384593717069655257060992658440191",
+      "reduction_min": "5192296858534827628530496329220096",
+      "reduction_prime_bits": 113,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.07489034740448,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step2:projection-draw"
+        },
+        {
+          "bits": 122.75207248655641,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:tau-draw"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step3:piop-round"
+        },
+        {
+          "bits": 125.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step4:terminal-draw"
+        },
+        {
+          "bits": 114.25208329395548,
+          "floor": false,
+          "grinding_bits": 10,
+          "name": "step5_0:reduction-draw"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_2:gkr-round"
+        },
+        {
+          "bits": 128.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ring-switch"
+        },
+        {
+          "bits": 114.0,
+          "floor": false,
+          "grinding_bits": 0,
+          "name": "step5_3:ligerito-tracked"
+        },
+        {
+          "bits": 126.41503749927884,
+          "floor": true,
+          "grinding_bits": 0,
+          "name": "step5_3:gf128-floor-untracked"
+        }
+      ],
+      "transcript_hash": "BLAKE3",
+      "verifier_randomness": "native Fiat-Shamir transcript"
+    },
+    "statement_contract": {
+      "batch_count": 16,
+      "constant": 1,
+      "digest_blake3": "e410f1ec74638699d73734a199472c7f0adaf8cce2dd7945acb70644f8a00317",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 99264,
+      "live_rows": 99344,
+      "padded_columns": 131072,
+      "padded_rows": 131072,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "d51ea96d4c5aa05e30caa13faafe28a1b9ee1bd82a8a956399d32be865090ecc",
+    "backend": "limber-hyrax",
+    "batch_count": 1,
+    "security": {
+      "achieved_bits": 114.0846956579401,
+      "brakedown_configuration": null,
+      "brakedown_target_bits": null,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 9,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 20,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "20417871872",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 16,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 123.1926450779424,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 131.50967541040148,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 246.83007499855768,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 128.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 220.75088191662195,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 220.75088654728626,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 1,
+      "constant": 1,
+      "digest_blake3": "2dd1c523415ccb5d33d8c72de4257496e08d09a9d16ae1374c45b907c07b6306",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 6204,
+      "live_rows": 6209,
+      "padded_columns": 8192,
+      "padded_rows": 8192,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "b57b8e3182cde28f95ddcd74009165c94ab619fbcb4c40e772319d93667ef4c4",
+    "backend": "limber-hyrax",
+    "batch_count": 2,
+    "security": {
+      "achieved_bits": 114.0846956579401,
+      "brakedown_configuration": null,
+      "brakedown_target_bits": null,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 9,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 20,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "42983227392",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 16,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 123.09310940439148,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 130.29424569843889,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 246.75207248655641,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 128.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 219.6769430400006,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 219.67694523965835,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 2,
+      "constant": 1,
+      "digest_blake3": "b7dc7d45bb3c383d2dc236aeed92d88956c6a7de20053aee78f62c892fb2cadd",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 12408,
+      "live_rows": 12418,
+      "padded_columns": 16384,
+      "padded_rows": 16384,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "5de736c7977db4745b941c9d715f236da595c1fa554ad38ddd4d4d35e1b2dae7",
+    "backend": "limber-hyrax",
+    "batch_count": 4,
+    "security": {
+      "achieved_bits": 114.0846956579401,
+      "brakedown_configuration": null,
+      "brakedown_target_bits": null,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 9,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 20,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "90261422080",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 16,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 123.0,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 129.13962526940207,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 246.67807190511263,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 128.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 218.60660849506058,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 218.60660954255601,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 4,
+      "constant": 1,
+      "digest_blake3": "a6f5a7971bfed019b2b294a936fe32cc27b75356134376a857eb15ca0c985b38",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 24816,
+      "live_rows": 24836,
+      "padded_columns": 32768,
+      "padded_rows": 32768,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "0d3730e680e818e67abaa9147614fbdc9056db15679c98bb03332f9ee8490964",
+    "backend": "limber-hyrax",
+    "batch_count": 8,
+    "security": {
+      "achieved_bits": 114.0846956579401,
+      "brakedown_configuration": null,
+      "brakedown_target_bits": null,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 9,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 20,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "189112778752",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 16,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 122.91253715874966,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 128.04001823689347,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 246.60768257722123,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 128.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 217.53954360373237,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 217.53954410369036,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 8,
+      "constant": 1,
+      "digest_blake3": "305b98c072c05428a645e7892077812436acbd66b846b044646b0b8b4caeff32",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 49632,
+      "live_rows": 49672,
+      "padded_columns": 65536,
+      "padded_rows": 65536,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "da273d9a6c7d274301c279f77ead9a6aa25131fe546d9e6e21a238b683a5f8ca",
+    "backend": "limber-hyrax",
+    "batch_count": 16,
+    "security": {
+      "achieved_bits": 114.0846956579401,
+      "brakedown_configuration": null,
+      "brakedown_target_bits": null,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 9,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 20,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "420101488640",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 17,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 122.83007499855769,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 134.92732102523578,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 246.45310554011238,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 128.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 216.38805283311905,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 216.38805305818002,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 16,
+      "constant": 1,
+      "digest_blake3": "e410f1ec74638699d73734a199472c7f0adaf8cce2dd7945acb70644f8a00317",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 99264,
+      "live_rows": 99344,
+      "padded_columns": 131072,
+      "padded_rows": 131072,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "d51ea96d4c5aa05e30caa13faafe28a1b9ee1bd82a8a956399d32be865090ecc",
+    "backend": "limber-brakedown",
+    "batch_count": 1,
+    "security": {
+      "achieved_bits": 114.0,
+      "brakedown_configuration": [
+        114,
+        4,
+        32768,
+        65536
+      ],
+      "brakedown_target_bits": 114,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 11,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 16,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "39543898112",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 31,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 123.1926450779424,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 129.89509534567398,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 245.87587868817081,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 114.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 219.79726156577706,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 219.79726395674982,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 1,
+      "constant": 1,
+      "digest_blake3": "2dd1c523415ccb5d33d8c72de4257496e08d09a9d16ae1374c45b907c07b6306",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 6204,
+      "live_rows": 6209,
+      "padded_columns": 8192,
+      "padded_rows": 8192,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "b57b8e3182cde28f95ddcd74009165c94ab619fbcb4c40e772319d93667ef4c4",
+    "backend": "limber-brakedown",
+    "batch_count": 2,
+    "security": {
+      "achieved_bits": 114.0,
+      "brakedown_configuration": [
+        114,
+        4,
+        32768,
+        65536
+      ],
+      "brakedown_target_bits": 114,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 11,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 16,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "85932900352",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 32,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 123.09310940439148,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 131.65440028773833,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 245.75207248655641,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 114.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 218.67750736214379,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 218.67750846240253,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 2,
+      "constant": 1,
+      "digest_blake3": "b7dc7d45bb3c383d2dc236aeed92d88956c6a7de20053aee78f62c892fb2cadd",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 12408,
+      "live_rows": 12418,
+      "padded_columns": 16384,
+      "padded_rows": 16384,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "5de736c7977db4745b941c9d715f236da595c1fa554ad38ddd4d4d35e1b2dae7",
+    "backend": "limber-brakedown",
+    "batch_count": 4,
+    "security": {
+      "achieved_bits": 114.0,
+      "brakedown_configuration": [
+        114,
+        4,
+        32768,
+        65536
+      ],
+      "brakedown_target_bits": 114,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 11,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 16,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "180455735296",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 32,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 123.0,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 129.34515942966465,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 245.67807190511263,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 114.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 217.60714543618454,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 217.60714596012713,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 4,
+      "constant": 1,
+      "digest_blake3": "a6f5a7971bfed019b2b294a936fe32cc27b75356134376a857eb15ca0c985b38",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 24816,
+      "live_rows": 24836,
+      "padded_columns": 32768,
+      "padded_rows": 32768,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "0d3730e680e818e67abaa9147614fbdc9056db15679c98bb03332f9ee8490964",
+    "backend": "limber-brakedown",
+    "batch_count": 8,
+    "security": {
+      "achieved_bits": 114.0,
+      "brakedown_configuration": [
+        114,
+        4,
+        32768,
+        65536
+      ],
+      "brakedown_target_bits": 114,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 11,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 16,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "389902499840",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 33,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 122.91253715874966,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 131.11925615729268,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 245.5632884578628,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 114.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 216.49567730921555,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 216.4956775517081,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 8,
+      "constant": 1,
+      "digest_blake3": "305b98c072c05428a645e7892077812436acbd66b846b044646b0b8b4caeff32",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 49632,
+      "live_rows": 49672,
+      "padded_columns": 65536,
+      "padded_rows": 65536,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  },
+  {
+    "assignment_digest_blake3": "da273d9a6c7d274301c279f77ead9a6aa25131fe546d9e6e21a238b683a5f8ca",
+    "backend": "limber-brakedown",
+    "batch_count": 16,
+    "security": {
+      "achieved_bits": 114.0,
+      "brakedown_configuration": [
+        114,
+        4,
+        32768,
+        65536
+      ],
+      "brakedown_target_bits": 114,
+      "challenge_bits": 128,
+      "fingerprint_max": "340282366920938463463374607431768211455",
+      "fingerprint_min": "170141183460469231731687303715884105728",
+      "fingerprint_prime_bits": 128,
+      "int_k": 11,
+      "integer_challenge_target_bits": 117,
+      "integer_target_bits": 128,
+      "key_format_version": 2,
+      "log_p": 16,
+      "log_q": 256,
+      "log_t": 64,
+      "log_t_f": 2048,
+      "model": "per-check-round-minimum/v1",
+      "numlimb_var": 5,
+      "profile": "limber114",
+      "range_slot_bound": "815238479872",
+      "runtime_prime_policy": "verifier-sampled from Fiat-Shamir after W/Q commitments",
+      "small_primes": 33,
+      "target_bits": 114,
+      "terms": [
+        {
+          "bits": 114.0846956579401,
+          "name": "fingerprint"
+        },
+        {
+          "bits": 125.41503749927884,
+          "name": "spartan-round"
+        },
+        {
+          "bits": 122.83007499855769,
+          "name": "spartan-batching"
+        },
+        {
+          "bits": 128.95445935739292,
+          "name": "integer-crt"
+        },
+        {
+          "bits": 245.49617426200425,
+          "name": "integer-challenges"
+        },
+        {
+          "bits": 114.0,
+          "name": "commitment-opening"
+        },
+        {
+          "bits": 215.4315686908561,
+          "name": "range-lookup"
+        },
+        {
+          "bits": 252.41503749927884,
+          "name": "range-gkr-round"
+        },
+        {
+          "bits": 215.43156880683253,
+          "name": "range-batching"
+        }
+      ],
+      "transcript_hash": "Keccak-256"
+    },
+    "statement_contract": {
+      "batch_count": 16,
+      "constant": 1,
+      "digest_blake3": "e410f1ec74638699d73734a199472c7f0adaf8cce2dd7945acb70644f8a00317",
+      "domain": "bitz-limber/multiswap-statement/v2",
+      "integer_domain": "unsigned",
+      "live_columns": 99264,
+      "live_rows": 99344,
+      "padded_columns": 131072,
+      "padded_rows": 131072,
+      "padding": "zero-witness,zero-quotients,modulus-two",
+      "private_roles": [
+        "witness",
+        "quotients"
+      ],
+      "public_input_count": 0,
+      "public_inputs": [],
+      "public_roles": [
+        "matrices",
+        "moduli"
+      ],
+      "value_bits": 2048
+    }
+  }
+]
